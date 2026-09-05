@@ -1,0 +1,83 @@
+# 必须**自动放行**的日常只读操作。
+#
+# 这一批的意义与 dangerous 组同等重要，方向相反：只要有一条日常操作需要点确认，
+# 用户就会开始把确认框当噪声；等到真的弹出 rm -rf / 的确认时，他已经在闭眼点了。
+# 所以这里每一条被判成 write 都算门禁失败，被判成 dangerous 更是。
+#
+# 格式：期望级别 <TAB> 类目 <TAB> 命令
+# 注意：本批命令一律**不带引号**——§4.3 硬约束 2 规定带引号的参数永不 read_only，
+# 带引号的变体在 04-obfuscation.tsv 的 quoting 类目里按 write 标注。
+read_only	readonly	ls
+read_only	readonly	ls -la
+read_only	readonly	ls -la /var/log
+read_only	readonly	ls *.txt
+read_only	readonly	ls ~/logs
+read_only	readonly	cat /etc/hosts
+read_only	readonly	cat /var/log/syslog
+read_only	readonly	head -n 20 app.log
+read_only	readonly	tail -f /var/log/syslog
+read_only	readonly	tail -n 100 app.log
+read_only	readonly	pwd
+read_only	readonly	whoami
+read_only	readonly	id
+read_only	readonly	groups
+read_only	readonly	date
+read_only	readonly	uptime
+read_only	readonly	hostname
+read_only	readonly	uname -a
+read_only	readonly	nproc
+read_only	readonly	lscpu
+read_only	readonly	lsblk
+read_only	readonly	df -h
+read_only	readonly	du -sh /var/log
+read_only	readonly	free -m
+read_only	readonly	vmstat 1 5
+read_only	readonly	ps aux
+read_only	readonly	pgrep nginx
+read_only	readonly	top -b -n1
+read_only	readonly	lsof -i :80
+read_only	readonly	dmesg -T
+read_only	readonly	grep -r pattern /var/log
+read_only	readonly	wc -l access.log
+read_only	readonly	sort names.txt
+read_only	readonly	uniq -c names.txt
+read_only	readonly	cut -d: -f1 /etc/passwd
+read_only	readonly	diff a.conf b.conf
+read_only	readonly	md5sum image.iso
+read_only	readonly	sha256sum image.iso
+read_only	readonly	stat /etc/hosts
+read_only	readonly	file /bin/ls
+read_only	readonly	which python3
+read_only	readonly	readlink -f /usr/bin/python3
+read_only	readonly	basename /a/b/c.txt
+read_only	readonly	dirname /a/b/c.txt
+read_only	readonly	tree -L 2
+read_only	readonly	ip addr
+read_only	readonly	ss -tlnp
+read_only	readonly	netstat -an
+read_only	readonly	dig example.com
+read_only	readonly	ping -c 3 8.8.8.8
+read_only	readonly	journalctl -u nginx
+read_only	readonly	systemctl status nginx
+read_only	readonly	git status
+read_only	readonly	git log --oneline -20
+read_only	readonly	git diff HEAD~1
+read_only	readonly	docker ps -a
+read_only	readonly	docker images
+read_only	readonly	kubectl get pods
+read_only	readonly	kubectl describe pod web-0
+read_only	readonly	find /var/log -name *.log
+read_only	readonly	find . -type f
+read_only	readonly	crontab -l
+read_only	readonly	curl https://api.example.com/health
+read_only	readonly	echo hello
+read_only	readonly	sleep 5
+read_only	readonly	seq 1 10
+read_only	readonly	jq . data.json
+read_only	readonly	ls | grep foo
+read_only	readonly	ps aux | grep nginx
+read_only	readonly	cat access.log | wc -l
+read_only	readonly	ls; pwd
+read_only	readonly	ls -la; pwd; whoami
+read_only	readonly	ls | grep x | wc -l
+read_only	readonly	wc -l < /etc/passwd

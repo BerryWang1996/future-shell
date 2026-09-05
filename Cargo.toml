@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/vault", "crates/connmgr", "crates/sshengine", "crates/terminal",
+  "crates/policy", "crates/ai", "crates/mcpbridge", "crates/audit",
+  "crates/serial",
+  # RDP helper 的消息协议。**只有它**在主工作区，RDP 引擎本体在
+  # `rdp-helper/`（单独工作区、单独 Cargo.lock）——IronRDP 与 russh 的依赖树
+  # 不能相遇（curve25519-dalek 的 5.0.0 与 5.0.0-rc.1 冲突），
+  # 见 `crates/rdpproto/src/lib.rs` 模块头。
+  "crates/rdpproto",
+  "crates/itest",
+  "app",
+]
+# RDP helper 是**另一个工作区**（自己的 Cargo.lock），必须排除。
+# 理由见 `rdp-helper/Cargo.toml` 与 `crates/rdpproto/src/lib.rs` 模块头：
+# IronRDP 与 russh 的依赖树不能出现在同一个 lockfile 里。
+#
+# 不写 exclude 的话 Cargo 会报「文件夹里有个包既不在 members 也不在 exclude」。
+exclude = ["rdp-helper"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.94"   # 依赖图 MSRV 底线：sqlx 0.9.0（高于 keyring 4.1.5 的 1.88 与 russh 0.62.4 的 1.85）；edition 保持 2021 不动
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "=1.9", features = ["zeroize_derive"] }
+aes-gcm = "=0.11"
+argon2 = { version = "=0.5.3", features = ["password-hash"] }
+keyring = { version = "=4.1.5" }   # 默认特性（v1）自带三平台原生凭据库。测试 mock 走 dev-dep keyring-core 的进程内 store（见 Task 4）
+keyring-core = "1.0"
+sqlx = { version = "=0.9.0", features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate", "uuid"] }   # =0.9.0 精确钉（R46）：安全邻接 + 上游不再跟踪 Cargo.lock；sqlite-bundled 展开与 0.8 的 sqlite 逐字等价，且不含 sqlite-load-extension 的 unsafe 原语
+russh = "=0.62.4"
+russh-sftp = "=2.3.0"
+vt100 = "=0.16.2"
+dirs = "6"
+# M7.4 非 UTF-8 终端编码（GBK/GB18030/Big5…）。WHATWG 编码标准的 Rust 实现，Firefox 在用；
+# 增量解码器能跨读块保住半个多字节字符——串口/SSH 的一次 read 恰好切在 GBK 双字节中间是常态。
+encoding_rs = "0.8"

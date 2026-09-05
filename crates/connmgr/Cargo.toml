@@ -1,0 +1,22 @@
+[package]
+name = "fs_connmgr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# audit 表的哈希链（总设计 §6.2）。触发器挡不住直接改 SQLite 文件，
+# 哈希链让篡改可被发现——对审计记录来说「能证明没被改过」正是它的全部价值。
+# 版本与 sshengine/itest 一致，避免双版本编译。
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

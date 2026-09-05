@@ -1,0 +1,24 @@
+[package]
+name = "fs_serial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+# 串口传输层（M7.4）。serialport 是 Rust 生态的事实标准（MPL-2.0，已在 deny 白名单内），
+# tokio-serial 在它之上提供 AsyncRead/AsyncWrite——那正是接进现有 SessionPipe 所需的形状。
+#
+# `default-features = false` 关掉 libudev：开着的话 Linux 构建需要系统装 libudev-dev，
+# 而本仓的 Linux 预检镜像与 CI 都没有它（枚举退化为扫 sysfs，串口名与波特率照常可用）。
+tokio-serial = { version = "5.4", default-features = false }
+
+[dev-dependencies]
+serde_json.workspace = true
+# pty.rs 那组集成测试要把串口字节喂进真实的终端管道（GBK 解码那一条）。
+fs_terminal = { path = "../terminal" }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

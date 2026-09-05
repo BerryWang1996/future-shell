@@ -1,0 +1,53 @@
+[package]
+name = "future-shell-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }   # 与 tauri 2.11.5 成对（tauri 2.11.5 自身 [build-dependencies] 声明的配套对，防 range 漂移）
+
+[dependencies]
+# 2026-07 基线 = 2.11.5：下限须 ≥2.11.1（修 CVE-2026-42184 / GHSA-7gmj-67g7-phm9），且不得停 2.11.4（其将 time 钉死 <0.3.52，2.11.5 才解钉）
+tauri = { version = "2.11.5", features = [] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 只用一件事：取当前本地时区偏移（计划任务 tz_follows_dst，M4a）。
+# chrono 已在 Cargo.lock 里（russh-sftp/russh-util/serde_with 传递引入），此处提成
+# 直接依赖 = 0 个新 crate、0 个新审计面——把一份已付费的能力显式化。
+# default-features 关掉：不需要 oldtime/serde/wasm 等一大串。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+russh.workspace = true
+sqlx.workspace = true
+zeroize.workspace = true
+arboard = "3"      # Task 20 vault_copy_to_clipboard：系统剪贴板（明文只在 core 侧，spec §3.2）
+sha2 = "0.10"      # Task 20 vault_copy_to_clipboard：剪贴板内容哈希比对（定时清除，总设计 §3.2）
+futures = "0.3"
+async-trait = "0.1"
+tauri-plugin-opener = "2.5.4"
+fs_vault = { path = "../crates/vault" }
+fs_connmgr = { path = "../crates/connmgr" }
+# RDP：主程序侧会话装配（rdp.rs）说 fs_rdpproto——两进程共享的协议类型。
+fs_rdpproto = { path = "../crates/rdpproto" }
+fs_sshengine = { path = "../crates/sshengine" }
+fs_terminal = { path = "../crates/terminal" }
+fs_serial = { path = "../crates/serial" }
+# M2：策略闸门与 AI 层。fs_policy 是纯逻辑；fs_ai 是出站面唯一开口子的 crate
+# （见 frontend/src/lib/egress-contract.test.ts 的 HTTP_ALLOWED 与 README「出站面」节）。
+fs_policy = { path = "../crates/policy" }
+fs_ai = { path = "../crates/ai" }
+# M3：MCP 双向。Server（对外 stdio）+ Client（挂载外部工具）的策略核心与传输。
+# 出站面：它自身只有 stdio（无监听地址），传递依赖同 fs_ai 的说明。
+fs_mcpbridge = { path = "../crates/mcpbridge" }
+
+[dev-dependencies]
+tempfile = "3"     # Task 21 sftp_cmd 单测：浏览根逃逸覆盖（ensure_within），与 opener_cmd scheme 白名单单测同层先例对齐

@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口最小权限集（S255/R119：不授 opener:*，外链一律经 Rust open_external 白名单）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-set-fullscreen"
+  ]
+}

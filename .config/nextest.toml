@@ -1,0 +1,15 @@
+# nextest 配置（Task 16 起，计划注 23 承载）：
+# 1) fail-fast = false —— 本项目纪律「全量跑完、截断即死」（注 24⑦ 探针事故后确立）；
+#    门禁脚本另有 --no-fail-fast 显式传参，此处为未带旗标入口的兜底。
+# 2) fs_terminal 包级 slow-timeout 30 s × 1 —— Task 16 非空证明 M-DJ（删背压 while
+#    循环）实证：背压缺失时 backpressure_pauses_source_read 的写侧 select! 500 ms 逃生
+#    永不触发、测试无穷挂死，不终止即「缺背压」这一失效形态不可观测为红（nextest 无
+#    硬 timeout 键——0.9.140 实测 overrides.timeout 报 unknown 被忽略；slow-timeout
+#    period × terminate-after=1 即 30 s 终止）。itest 侧容器冷启动可超 30 s，故仅圈
+#    terminal 包、不波及 --workspace 全跑。
+[profile.default]
+fail-fast = false
+
+[[profile.default.overrides]]
+filter = 'package(fs_terminal)'
+slow-timeout = { period = '30s', terminate-after = 1 }

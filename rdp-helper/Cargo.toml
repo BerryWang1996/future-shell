@@ -1,0 +1,90 @@
+# RDP helper —— **一个独立的工作区**，不是主工作区的成员。
+#
+# ## 为什么必须独立
+#
+# IronRDP（经 picky）钉死 `curve25519-dalek =5.0.0-rc.1`，russh 0.62.4 要 `^5`
+# （解到 5.0.0）。两者同属 5.x 兼容区间，Cargo 必须统一成一个版本而谁也不接受
+# 对方——**这两棵依赖树不能出现在同一个 Cargo.lock 里**。
+# 独立工作区 = 独立 lockfile = 两棵树永不相遇。
+#
+# （picky rc.26 已修掉这个钉子，但 IronRDP 连 master 都还钉着 rc.25。
+#  上游放开之后本工作区可以合回去，但**没有必要**——见下面「进程隔离」。）
+#
+# ## 进程隔离本身就值得
+#
+# 就算上游明天修好，这个拆分也该保留：RDP 是一个很大的解析面，
+# 而 helper 是解析**远端不可信字节**的那一侧。它跑在独立进程里意味着
+# 内存安全问题波及不到主程序，也碰不到 Vault。
+#
+# ## 零网络出口
+#
+# 本 crate **不得**出现任何网络依赖。传输在主程序那一侧，RDP 的线上字节经
+# stdio 管道进出（`fs_rdpproto::ToHelper::NetIn` / `FromHelper::NetOut`）。
+# `frontend/src/lib/egress-contract.test.ts` 扫描本文件——它是主工作区的
+# 出货清单推导看不到的地方，那个洞由那条守卫补上。
+[workspace]
+members = ["."]
+
+[package]
+name = "fs-rdp-helper"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+
+[[bin]]
+name = "fs-rdp-helper"
+path = "src/main.rs"
+
+[dependencies]
+# 与主程序共享的消息协议。它只依赖 serde，不碰 russh 也不碰 ironrdp——
+# 那正是它能被两个工作区同时 path 依赖的原因。
+fs_rdpproto = { path = "../crates/rdpproto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+tracing = "0.1"
+# 口令用完即清零（`ConnectParams::password` 的文档写明了这条义务）。
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# 证书指纹（SHA-256）与 X.509 解析（subject/issuer/SPKI）。
+# 两者都已在 ironrdp-tls 的依赖树里（x509-cert 0.2.5），不扩大编译面。
+sha2 = "0.10"
+x509-cert = "0.2"
+
+# ── IronRDP ────────────────────────────────────────────────────────────
+#
+# **`reqwest` feature 一律不开。** `ironrdp-tokio` 的那个可选 feature 只服务于
+# Kerberos 的 KDC-proxy over HTTP；本仓裁定 RDP 只做 NTLM/口令认证，
+# 于是不开它 = 依赖图里零 HTTP 客户端（实测 665 行依赖树零命中）。
+# 将来要加 Kerberos，那是一次需要显式扩大出站面的决定，
+# 不该由某个人顺手打开一个 feature 完成。
+ironrdp-core = "0.2"
+ironrdp-connector = "0.10"
+ironrdp-session = "0.11"
+ironrdp-pdu = "0.9"
+ironrdp-graphics = "0.9"
+# 批量解压器（RDP4/5/6/6.1）。**只为重激活**：Deactivation-Reactivation 之后
+# fastpath 处理器只能整体重建（上游字段私有），而重建必须把解压器一并带上——
+# 丢了它，之后所有压缩帧都解不开（表现为花屏）。已在依赖树里（ironrdp-session
+# 的传递依赖），这里只是显式化，不扩大编译面；纯压缩算法，零网络。
+ironrdp-bulk = "0.1"
+ironrdp-input = "0.7"
+ironrdp-svc = "0.8"
+ironrdp-tokio = { version = "0.10", default-features = false }
+# rustls 而不是 native-tls：不引 schannel/openssl 的原生依赖链。
+# （stub feature 下 upgrade 是空实现；rustls 是真握手。）
+ironrdp-tls = { version = "0.2", default-features = false, features = ["rustls"] }
+# 阶段 2：动态分辨率（DISPLAYCONTROL 经 drdynvc 动态虚拟通道）。
+ironrdp-dvc = "0.8"
+ironrdp-displaycontrol = "0.8"
+# 阶段 2：剪贴板双向同步（CLIPRDR 静态虚拟通道）。
+ironrdp-cliprdr = "0.7"
+# 阶段 3：音频重定向（RDPSND 静态虚拟通道）。
+# **不开 native feature**：那会引 cpal/ALSA（helper 不碰设备，PCM 经管道上行）。
+ironrdp-rdpsnd = { version = "0.9", default-features = false }
+# RDPDR（驱动器重定向批）：backend trait + PDU。文件 IO 在主程序，
+# 这里只做 IRP ↔ 语义形状（FsOp）的翻译。
+ironrdp-rdpdr = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

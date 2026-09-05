@@ -1,0 +1,34 @@
+# 包装器剥离、提权、重定向。
+#
+# 包装器是最便宜的绕过手段：只看首词的引擎面对 `sudo rm -rf /` 看到的是 `sudo`，
+# 而 sudo 不在任何危险名单里，于是这条命令落到兜底的 write。
+# `timeout 5 …`、`xargs …`、`env A=1 …`、`nohup …` 同理。
+dangerous	privilege	sudo rm -rf /
+dangerous	privilege	doas rm -rf /
+dangerous	privilege	pkexec bash -c 'rm -rf /'
+dangerous	privilege	su -c 'rm -rf /'
+dangerous	privilege	sudo sh -c 'echo k >> ~/.ssh/authorized_keys'
+dangerous	privilege	sudo dd if=/dev/zero of=/dev/sda
+write	privilege	sudo apt-get update
+write	privilege	sudo -u root cat /etc/shadow
+write	privilege	sudo systemctl restart nginx
+dangerous	wrapper	timeout 5 rm -rf /
+dangerous	wrapper	nohup rm -rf /
+dangerous	wrapper	xargs rm -rf /
+dangerous	wrapper	env A=1 rm -rf /
+dangerous	wrapper	nice -n 10 rm -rf /
+dangerous	wrapper	setsid rm -rf /
+dangerous	wrapper	stdbuf -o0 rm -rf /
+dangerous	wrapper	/usr/bin/env rm -rf /
+read_only	wrapper	env ls
+write	wrapper	timeout 5 npm test
+write	redirect	echo x > /tmp/out.txt
+write	redirect	echo x >> /tmp/out.txt
+write	redirect	ls -la > /tmp/listing
+read_only	redirect	ls > /dev/null
+read_only	redirect	ls 2> /dev/null
+dangerous	redirect	echo pwned > /etc/passwd
+dangerous	redirect	cat /dev/zero > /dev/sda
+dangerous	redirect	echo x > /boot/grub/grub.cfg
+dangerous	redirect	> /etc/passwd
+dangerous	redirect	echo k >> $HOME/.ssh/authorized_keys

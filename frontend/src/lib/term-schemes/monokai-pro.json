@@ -1,0 +1,8 @@
+{
+  "id": "monokai-pro", "name": "Monokai Pro", "dark": true,
+  "background": "#2d2a2e", "foreground": "#fcfcfa",
+  "cursor": "#fcfcfa", "selection": "#403e41",
+  "ansi": ["#19181a","#ff6188","#a9dc76","#ffd866","#fc9867","#ab9df2","#78dce8","#fcfcfa",
+           "#727072","#ff6188","#a9dc76","#ffd866","#fc9867","#ab9df2","#78dce8","#fcfcfa"],
+  "boldBright": true
+}

@@ -1,0 +1,107 @@
+[licenses]
+# S250：+"Apache-2.0 WITH LLVM-exception"——target-lexicon 0.12.16（Tauri Linux 链 build-dep）持该表达式；
+# 宽松许可（Apache-2.0 加 LLVM 例外，同 LLVM 项目本体），无 copyleft 传染，入全局白名单。
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "MPL-2.0", "Unicode-3.0", "Zlib", "ISC", "Apache-2.0 WITH LLVM-exception"]
+# russh 0.62.4 默认特性 aws-lc-rs → aws-lc-sys：静态链入的 AWS-LC C 实现，
+# SPDX 含 ISC 项（BSD 风格许可，非 GPL 系）。ISC 已加入全局白名单。
+# 若未来 aws-lc-sys 版本恢复 OpenSSL SPDX 项，可按 crate 定向放行：
+# exceptions = [{ name = "aws-lc-sys", allow = ["OpenSSL"] }]
+
+# Task 20｜arboard = "3"（vault_copy_to_clipboard 系统剪贴板）的 Windows 后端依赖
+# clipboard-win / error-code 持 BSL-1.0（Boost Software License 1.0）。BSL-1.0 为
+# OSI 批准 + FSF Free/Libre 的宽松许可（Boost 系，BSD/MIT 同档，非 GPL 系、无 copyleft 传染），
+# 但不在全局白名单内，故按 crate 定向放行（不放宽全局白名单）。仅 Windows 目标编译。
+exceptions = [
+    { name = "clipboard-win", allow = ["BSL-1.0"] },
+    { name = "error-code", allow = ["BSL-1.0"] },
+]
+confidence-threshold = 0.9
+
+[advisories]
+# cargo-deny ≥0.16 已弃用 advisories.version 键，故不写 version = 2（写入会触发配置告警）
+
+# ── 已评估并接受的风险（每条须写明「为何不能修 / 为何风险可接受 / 何时复查」）──
+ignore = [
+    # RUSTSEC-2023-0089｜atomic-polyfill unmaintained。**只出现在 RDP helper 工作区。**
+    # 引入路径：ironrdp-connector → sspi 0.21.3 →（智能卡）winscard → iso7816 → heapless 0.7
+    # → atomic-polyfill。
+    #
+    # 【为何不能修】链上每一环都是 IronRDP 的传递依赖，本项目改不动；
+    # sspi 的智能卡支持没有可关的特性开关（ironrdp-connector 的 features 只有
+    # `qoi`/`qoiz` 两个，与此无关）。
+    #
+    # 【为何风险可接受】**它根本不在我们的构建图里。** heapless 0.7 只在
+    # 「没有原子 CAS 指令的目标」（thumbv6m 之类）上才用这个 polyfill，
+    # 桌面三平台一律直接用 core 的原子。已逐目标核实：
+    #
+    #   cd rdp-helper && cargo tree -i atomic-polyfill --target <T>
+    #
+    # 对 x86_64-pc-windows-msvc / x86_64-apple-darwin / aarch64-apple-darwin /
+    # x86_64-unknown-linux-gnu 四个出货目标**全部返回 "nothing to print"**
+    # （2026-08-26 实测）。也就是说这个 crate 一行代码都不会进任何一个安装包。
+    # 它之所以被 cargo-deny 看见，是因为 deny 默认按 `--target all` 解图。
+    #
+    # 【何时复查】上面那条命令是本条豁免的**可复核判据**——任何一个目标开始命中，
+    # 这条豁免立刻失效，必须重新评估。sspi 换掉 heapless 0.7（或 heapless 升到
+    # 0.8+，那一版已去掉 atomic-polyfill）后删除本条。**复查期限：2027-02-01**。
+    { id = "RUSTSEC-2023-0089", reason = "仅 RDP helper 工作区；heapless 0.7 的 polyfill 只在无原子 CAS 的目标上启用，四个出货目标实测 cargo tree 均无命中，不进任何安装包" },
+
+    # RUSTSEC-2023-0071｜Marvin Attack：rsa crate 私钥运算非常量时间（CVSS 5.9 MEDIUM，
+    # AV:N/AC:H/PR:N/C:H/I:N/A:N）。引入路径：russh 0.62.4 →（默认特性 `rsa`）→ rsa 0.10.0-rc.18，
+    # 以及 ssh-key 0.7.0-rc.11 → rsa。
+    #
+    # 【为何不能修】上游至今无修复版本（advisory 原文 "No safe upgrade is available!"，
+    # RustCrypto/RSA#626 常量时间重写仍在进行中）。唯一的依赖侧消除手段是
+    # `russh = { default-features = false }` 关掉 `rsa` 特性——但那会同时废掉
+    # ssh-rsa / rsa-sha2-256 / rsa-sha2-512 的**主机密钥验证**与 **id_rsa 客户端公钥认证**。
+    # 绝大多数发行版 OpenSSH 仍默认生成并提供 ssh_host_rsa_key，存量 id_rsa 私钥同样普遍；
+    # 关掉即等于「连不上多数真实服务器」，与本项目「对标并超越 Xshell/Xftp 完全体」的定位直接冲突。
+    #
+    # 【为何风险可接受】Marvin 是针对 RSA **解密**（PKCS#1 v1.5 填充预言机）的计时侧信道，
+    # 而 SSH 协议里 RSA 只用于**签名**，不存在 RSA 解密路径（密钥交换走 curve25519/ECDH/DH）：
+    #   · 主机密钥验证 = 用**公钥**验签 —— 全程不触及任何私钥，不受影响；
+    #   · 客户端公钥认证 = 用**本机私钥**签名 —— 唯一的理论暴露面，且每次连接仅签一次，
+    #     攻击者无法诱导海量重复签名，AC:H（高攻击复杂度）在此场景下进一步放大。
+    # 补偿措施：产品内密钥生成默认 Ed25519（spec §2.1），仅在用户已有 RSA 私钥时才走该路径。
+    #
+    # 【何时复查】rsa 发布常量时间实现（≥0.10.0 正式版或 advisory 标注 patched）后立即删除本条并重跑门禁；
+    # 每次 russh 升级时一并复查引入路径是否已变。**复查期限：2027-02-01**（逾期未消除即重新评估接受决定，见 .github/workflows/advisory-recheck.yml 每周自动复查）。
+    { id = "RUSTSEC-2023-0071", reason = "SSH 无 RSA 解密路径，仅客户端签名一次/连接；上游无修复版，关闭 rsa 特性会废掉 ssh-rsa 主机密钥与 id_rsa 认证" },
+
+    # S250｜RUSTSEC-2024-0411…0420（gtk-rs GTK3 全家，10 条）：gtk/atk/gdk/gdk-sys/gdkx11/gdkx11-sys/
+    # gdkwayland-sys/gtk-sys/gtk3-macros 均 unmaintained（gtk3-rs 已归档）。
+    # 引入路径：tauri 2.11.5 / tauri-runtime-wry / wry / muda → gtk 0.18（仅 Linux 目标编译）。
+    # 【为何不能修】gtk4 迁移由 Tauri 上游决定，本项目无法单方面升级；advisory 均标 "No safe upgrade is available!"。
+    # 【为何风险可接受】unmaintained 类（无已知 CVE 利用）；且本项目主目标 Windows 根本不编译 GTK3 链（win/mac 走 webview2/objc）。
+    # 【何时复查】Tauri 上游 Linux 后端切 gtk4 或大版本升级移除 gtk 0.18 时整组删除并重跑门禁。**复查期限：2027-02-01**。
+    { id = "RUSTSEC-2024-0411", reason = "gtk3-rs 归档；仅 Linux 链编译，Windows 主目标不触及；修复待 Tauri 上游 gtk4 迁移" },
+    { id = "RUSTSEC-2024-0412", reason = "同 RUSTSEC-2024-0411 组（gdk）" },
+    { id = "RUSTSEC-2024-0413", reason = "同 RUSTSEC-2024-0411 组（atk）" },
+    { id = "RUSTSEC-2024-0414", reason = "同 RUSTSEC-2024-0411 组（gdkx11-sys）" },
+    { id = "RUSTSEC-2024-0415", reason = "同 RUSTSEC-2024-0411 组（gtk）" },
+    { id = "RUSTSEC-2024-0416", reason = "同 RUSTSEC-2024-0411 组（atk-sys）" },
+    { id = "RUSTSEC-2024-0417", reason = "同 RUSTSEC-2024-0411 组（gdkx11）" },
+    { id = "RUSTSEC-2024-0418", reason = "同 RUSTSEC-2024-0411 组（gdk-sys）" },
+    { id = "RUSTSEC-2024-0419", reason = "同 RUSTSEC-2024-0411 组（gtk3-macros）" },
+    { id = "RUSTSEC-2024-0420", reason = "同 RUSTSEC-2024-0411 组（gtk-sys）" },
+
+    # S250｜RUSTSEC-2024-0370：proc-macro-error unmaintained。引入路径：glib-macros/gtk3-macros → proc-macro-error，
+    # 纯编译期 proc-macro，仅 Linux GTK3 构建链展开；不进运行期产物，无已知 CVE。上游无继任版本；待 Tauri/glib 升级移除。**复查期限：2027-02-01**。
+    { id = "RUSTSEC-2024-0370", reason = "编译期宏且仅 Linux GTK3 链；unmaintained 无 CVE；待上游 glib-macros 替换" },
+
+    # S250｜RUSTSEC-2025-0075/0080/0081/0098/0100（open-i18n rust-unic 全家，5 条）：
+    # unic-char-range/unic-common/unic-char-property/unic-ucd-ident/unic-ucd-version 均 unmaintained。
+    # 引入路径：tauri-utils 2.9.3 → urlpattern 0.3.0 → unic-ucd-ident（全平台 build/运行链均含，含 Windows）。
+    # 【为何不能修】urlpattern 无替换实现，tauri-utils 上游同款依赖；advisory 均 "No safe upgrade is available!"。
+    # 【为何风险可接受】unmaintained 类非漏洞类；unic 为静态 Unicode 数据表查询，功能冻结即风险冻结；
+    # 攻击面 = 解析 URL pattern 的标识符分类，输入由 Tauri 内部能力清单提供，非用户可控。
+    # 【何时复查】tauri-utils 升级到移除 unic 的版本（或 urlpattern 换实现）时整组删除并重跑门禁。**复查期限：2027-02-01**。
+    { id = "RUSTSEC-2025-0075", reason = "rust-unic 归档；静态 Unicode 表无漏洞类 advisory；待 tauri-utils 上游替换" },
+    { id = "RUSTSEC-2025-0080", reason = "同 RUSTSEC-2025-0075 组（unic-common）" },
+    { id = "RUSTSEC-2025-0081", reason = "同 RUSTSEC-2025-0075 组（unic-char-property）" },
+    { id = "RUSTSEC-2025-0098", reason = "同 RUSTSEC-2025-0075 组（unic-ucd-version）" },
+    { id = "RUSTSEC-2025-0100", reason = "同 RUSTSEC-2025-0075 组（unic-ucd-ident）" },
+]
+
+[bans]
+multiple-versions = "warn"

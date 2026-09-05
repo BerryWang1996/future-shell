@@ -1,0 +1,23 @@
+//! fs_sshengine — russh：SSH 会话、主机密钥验证、PTY、SFTP、跳板、保活（spec §2.1/§2.3）。
+pub mod agent;
+pub mod auth;
+pub mod connect;
+pub mod editsync;
+pub mod error;
+pub mod events;
+pub mod fileops;
+pub mod filter;
+pub mod hostkey;
+pub mod keyinfo;
+pub mod monitor;
+pub mod packages;
+pub mod procs;
+pub mod sandbox;
+pub mod secrets;
+pub mod services;
+pub mod sftp;
+pub mod timeouts;
+pub mod transfer;
+pub mod tunnel;
+pub mod verify;
+pub use error::Error;

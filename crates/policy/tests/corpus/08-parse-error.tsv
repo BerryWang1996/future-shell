@@ -1,0 +1,13 @@
+# 解析失败 → dangerous（M2 出口原文）。
+#
+# 「看不懂」和「安全」是两件完全不同的事。解析器对这些输入没有把握，
+# 于是它明确报错而不是尽力猜一个结构出来——猜错的后果是把一条危险命令
+# 当成无害的放行，而那正是最坏的失败形态。
+dangerous	parse-error	echo 'unterminated
+dangerous	parse-error	echo "unterminated
+dangerous	parse-error	ls $(echo
+dangerous	parse-error	ls ${x
+dangerous	parse-error	echo `x
+dangerous	parse-error	echo x\
+dangerous	parse-error	cat <<EOF<NL>no terminator here
+dangerous	parse-error	$($($($($($($($($($(echo))))))))))

@@ -1,0 +1,37 @@
+# 直接破坏：删根、格化设备、写块设备、递归改系统权限、fork 炸弹。
+#
+# 这些是「不需要绕过技巧就已经很危险」的一类。任何一条被判成 read_only 都是
+# 零漏放门禁的硬失败；被判成 write 会吃掉 dangerous 召回率的额度。
+dangerous	destructive	rm -rf /
+dangerous	destructive	rm -rf /*
+dangerous	destructive	rm -rf ~
+dangerous	destructive	rm -rf $HOME
+dangerous	destructive	rm -rf ${HOME}
+dangerous	destructive	rm -rf /etc
+dangerous	destructive	rm -rf /boot
+dangerous	destructive	rm -rf /usr/bin
+dangerous	destructive	rm -f /etc/passwd
+dangerous	destructive	rm -rf /var/lib/../../
+dangerous	destructive	/bin/rm -rf /
+dangerous	destructive	rm -rf *
+dangerous	destructive	shred -u /etc/shadow
+dangerous	destructive	mkfs.ext4 /dev/sda1
+dangerous	destructive	mkfs -t xfs /dev/sdb
+dangerous	destructive	dd if=/dev/zero of=/dev/sda
+dangerous	destructive	dd if=/dev/urandom of=/dev/sdb bs=1M
+dangerous	destructive	wipefs -a /dev/sda
+dangerous	destructive	blkdiscard /dev/nvme0n1
+dangerous	destructive	chmod -R 777 /
+dangerous	destructive	chown -R nobody /etc
+dangerous	destructive	chmod -R 000 /usr/bin
+dangerous	destructive	:(){ :|:& };:
+dangerous	destructive	mv /etc/passwd /tmp/p
+dangerous	destructive	rm -rf $TARGET
+dangerous	destructive	rm -rf $(cat targets.txt)
+dangerous	destructive	find / -name *.conf -delete
+dangerous	destructive	find /etc -type f -delete
+dangerous	destructive	find . -name *.tmp -exec rm -rf / \;
+dangerous	destructive	truncate -s 0 /etc/passwd
+dangerous	destructive	del /s /q C:\
+dangerous	destructive	vssadmin delete shadows /all
+dangerous	destructive	format C:

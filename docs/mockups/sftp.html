@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="obsidian">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FutureShell — SFTP 视图原型</title>
+<style>
+:root[data-theme="obsidian"]{
+  --fs-bg-app:#0b0d11; --fs-bg-panel:#12151c; --fs-bg-elevated:#1a1f29; --fs-bg-input:#0e1117;
+  --fs-bg-tab-active:#0f1115; --fs-bg-tab-inactive:#161a22; --fs-bg-hover:#1e2430;
+  --fs-fg-primary:#d7dbe2; --fs-fg-secondary:#8b93a3; --fs-fg-disabled:#545b68;
+  --fs-border:#262c38; --fs-border-strong:#39414f;
+  --fs-accent:#4f8cff; --fs-accent-hover:#6b9eff; --fs-accent-fg:#ffffff; --fs-accent-dim:rgba(79,140,255,.14);
+  --fs-ok:#3fd68c; --fs-warn:#ffd166; --fs-danger:#ff5f56; --fs-info:#56d4dd;
+  --fs-term-bg:#0f1115; --fs-radius:4px; --fs-shadow:0 8px 28px rgba(0,0,0,.5);
+}
+:root[data-theme="daylight"]{
+  --fs-bg-app:#eef0f4; --fs-bg-panel:#ffffff; --fs-bg-elevated:#ffffff; --fs-bg-input:#ffffff;
+  --fs-bg-tab-active:#ffffff; --fs-bg-tab-inactive:#e9ebef; --fs-bg-hover:#e4e8ef;
+  --fs-fg-primary:#1d2433; --fs-fg-secondary:#5a6474; --fs-fg-disabled:#a2aab8;
+  --fs-border:#d6dae2; --fs-border-strong:#bcc2cd;
+  --fs-accent:#2563eb; --fs-accent-hover:#3b82f6; --fs-accent-fg:#ffffff; --fs-accent-dim:rgba(37,99,235,.10);
+  --fs-ok:#16a34a; --fs-warn:#d97706; --fs-danger:#dc2626; --fs-info:#0891b2;
+  --fs-term-bg:#10141c; --fs-radius:4px; --fs-shadow:0 8px 28px rgba(15,23,42,.18);
+}
+:root[data-theme="slate"]{
+  --fs-bg-app:#0c1220; --fs-bg-panel:#131a2b; --fs-bg-elevated:#1a2338; --fs-bg-input:#0e1526;
+  --fs-bg-tab-active:#101828; --fs-bg-tab-inactive:#172034; --fs-bg-hover:#212c46;
+  --fs-fg-primary:#dbe4f5; --fs-fg-secondary:#8494b3; --fs-fg-disabled:#4e5c78;
+  --fs-border:#243049; --fs-border-strong:#354463;
+  --fs-accent:#22d3ee; --fs-accent-hover:#4ddff2; --fs-accent-fg:#06283a; --fs-accent-dim:rgba(34,211,238,.12);
+  --fs-ok:#34d399; --fs-warn:#fbbf24; --fs-danger:#fb7185; --fs-info:#38bdf8;
+  --fs-term-bg:#101828; --fs-radius:4px; --fs-shadow:0 8px 28px rgba(0,0,0,.55);
+}
+:root[data-theme="hc"]{
+  --fs-bg-app:#000000; --fs-bg-panel:#000000; --fs-bg-elevated:#0a0a0a; --fs-bg-input:#000000;
+  --fs-bg-tab-active:#000000; --fs-bg-tab-inactive:#000000; --fs-bg-hover:#1c1c1c;
+  --fs-fg-primary:#ffffff; --fs-fg-secondary:#d0d0d0; --fs-fg-disabled:#8a8a8a;
+  --fs-border:#6e6e6e; --fs-border-strong:#a8a8a8;
+  --fs-accent:#ffd400; --fs-accent-hover:#ffe14d; --fs-accent-fg:#000000; --fs-accent-dim:rgba(255,212,0,.16);
+  --fs-ok:#4dff88; --fs-warn:#ffd400; --fs-danger:#ff6b61; --fs-info:#61d5ff;
+  --fs-term-bg:#000000; --fs-radius:2px; --fs-shadow:0 8px 28px rgba(0,0,0,.9);
+}
+:root{ --t-bg:var(--fs-term-bg); --t-fg:#d7dbe2; --t-dim:#57606f; --t-green:#3fd68c;
+  --t-cyan:#56d4dd; --t-blue:#4f8cff; --t-yellow:#ffd166; --t-cursor:#4f8cff; }
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:"Segoe UI Variable","Segoe UI","PingFang SC","Microsoft YaHei UI",system-ui,sans-serif;
+  font-size:12.5px;color:var(--fs-fg-primary);background:var(--fs-bg-app);
+  display:flex;flex-direction:column;overflow:hidden;user-select:none}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+
+.titlebar{height:30px;display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--fs-bg-panel);border-bottom:1px solid var(--fs-border);flex:none}
+.logo{width:15px;height:15px;border-radius:4px;background:linear-gradient(135deg,var(--fs-accent),var(--t-cyan));flex:none}
+.titlebar .t{color:var(--fs-fg-secondary);font-size:12px}
+.titlebar .win{margin-left:auto;display:flex;gap:2px}
+.titlebar .win b{width:34px;height:22px;display:grid;place-items:center;color:var(--fs-fg-secondary);font-weight:400;border-radius:3px}
+
+.menubar{height:28px;display:flex;align-items:center;gap:1px;padding:0 6px;background:var(--fs-bg-panel);border-bottom:1px solid var(--fs-border);flex:none}
+.menubar span{padding:3px 9px;border-radius:3px}
+.menubar span:hover{background:var(--fs-bg-hover)}
+
+.toolbar{height:38px;display:flex;align-items:center;gap:2px;padding:0 8px;background:var(--fs-bg-panel);border-bottom:1px solid var(--fs-border);flex:none}
+.tbtn{height:28px;min-width:30px;padding:0 8px;display:inline-flex;align-items:center;gap:6px;border-radius:var(--fs-radius);color:var(--fs-fg-secondary);white-space:nowrap;text-decoration:none}
+.tbtn:hover{background:var(--fs-bg-hover);color:var(--fs-fg-primary)}
+.tbtn.primary{background:var(--fs-accent);color:var(--fs-accent-fg)}
+.tbtn.primary:hover{background:var(--fs-accent-hover);color:var(--fs-accent-fg)}
+.tsep{width:1px;height:20px;background:var(--fs-border);margin:0 6px;flex:none}
+.spacer{flex:1}
+.skinbox{display:flex;align-items:center;gap:6px;padding:0 8px;height:28px;color:var(--fs-fg-secondary)}
+.skinbox select{background:var(--fs-bg-input);color:var(--fs-fg-primary);border:1px solid var(--fs-border);border-radius:3px;height:22px;font-size:12px;padding:0 4px}
+
+.body{flex:1;display:flex;flex-direction:column;min-height:0}
+
+/* 标签栏 */
+.tabbar{height:34px;display:flex;align-items:stretch;background:var(--fs-bg-app);border-bottom:1px solid var(--fs-border);flex:none}
+.tab{display:flex;align-items:center;gap:7px;padding:0 14px;background:var(--fs-bg-tab-inactive);color:var(--fs-fg-secondary);border-right:1px solid var(--fs-border);position:relative}
+.tab.active{background:var(--fs-bg-tab-active);color:var(--fs-fg-primary)}
+.tab.active::before{content:"";position:absolute;left:0;top:0;right:0;height:2px;background:var(--fs-accent)}
+.tab .dot{width:7px;height:7px;border-radius:50%;background:var(--fs-ok);box-shadow:0 0 5px var(--fs-ok);flex:none}
+.tab .x{margin-left:4px;color:var(--fs-fg-disabled)}
+
+/* 标签内模式切换：终端|文件|分屏 */
+.modes{display:flex;align-items:center;gap:2px;margin-left:auto;padding:0 10px}
+.modes button{height:24px;padding:0 10px;border-radius:var(--fs-radius);color:var(--fs-fg-secondary)}
+.modes button:hover{background:var(--fs-bg-hover);color:var(--fs-fg-primary)}
+.modes button.on{background:var(--fs-accent-dim);color:var(--fs-accent);font-weight:600}
+
+/* 分屏主体 */
+.split{flex:1;display:flex;min-height:0}
+.pane-term{width:42%;min-width:200px;display:flex;flex-direction:column;min-height:0}
+.gutter{width:5px;background:var(--fs-border);cursor:col-resize;flex:none}
+.gutter:hover{background:var(--fs-accent)}
+.pane-sftp{flex:1;display:flex;flex-direction:column;min-width:0}
+
+.term-wrap{flex:1;background:var(--t-bg);padding:10px 12px;overflow:hidden;min-height:0}
+.term{font-family:"Cascadia Code","JetBrains Mono","Sarasa Mono SC",Consolas,monospace;font-size:12.5px;line-height:1.45;white-space:pre-wrap;color:var(--t-fg)}
+.term .dim{color:var(--t-dim)} .term .green{color:var(--t-green)} .term .cyan{color:var(--t-cyan)} .term .blue{color:var(--t-blue)}
+.cursor{display:inline-block;width:7px;height:14px;background:var(--t-cursor);vertical-align:-2px;animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+
+/* SFTP 双栏 */
+.sftp-cols{flex:1;display:flex;min-height:0}
+.col{flex:1;display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--fs-border)}
+.col:last-child{border-right:none}
+.col-head{height:30px;display:flex;align-items:center;gap:6px;padding:0 8px;background:var(--fs-bg-panel);border-bottom:1px solid var(--fs-border);flex:none}
+.col-head .tag{font-size:11px;padding:1px 7px;border-radius:10px;background:var(--fs-accent-dim);color:var(--fs-accent);font-weight:600;flex:none}
+.crumb{flex:1;display:flex;align-items:center;gap:2px;background:var(--fs-bg-input);border:1px solid var(--fs-border);border-radius:var(--fs-radius);height:22px;padding:0 8px;font-size:11.5px;color:var(--fs-fg-secondary);overflow:hidden;white-space:nowrap;font-family:"Cascadia Code",Consolas,monospace}
+.crumb b{color:var(--fs-fg-primary);font-weight:500}
+.mini{width:22px;height:22px;border-radius:3px;color:var(--fs-fg-secondary);display:grid;place-items:center;flex:none}
+.mini:hover{background:var(--fs-bg-hover);color:var(--fs-fg-primary)}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{position:sticky;top:0;background:var(--fs-bg-panel);color:var(--fs-fg-secondary);font-weight:500;text-align:left;
+  padding:5px 8px;border-bottom:1px solid var(--fs-border);white-space:nowrap;z-index:1}
+tbody td{padding:4px 8px;border-bottom:1px solid color-mix(in srgb, var(--fs-border) 50%, transparent);white-space:nowrap;color:var(--fs-fg-primary)}
+tbody tr:hover td{background:var(--fs-bg-hover)}
+tbody tr.sel td{background:var(--fs-accent-dim)}
+.fname{display:flex;align-items:center;gap:7px}
+.fname .fi{flex:none;font-size:13px}
+.size,.mtime{color:var(--fs-fg-secondary);font-family:"Cascadia Code",Consolas,monospace;font-size:11.5px}
+.tscroll{flex:1;overflow-y:auto;min-height:0}
+
+/* 传输队列抽屉 */
+.queue{height:150px;flex:none;background:var(--fs-bg-panel);border-top:1px solid var(--fs-border);display:flex;flex-direction:column}
+.q-head{height:28px;display:flex;align-items:center;gap:10px;padding:0 10px;border-bottom:1px solid var(--fs-border);font-size:12px;flex:none}
+.q-head b{font-weight:600}
+.q-head .cnt{color:var(--fs-accent)}
+.q-head .rate{color:var(--fs-fg-secondary);font-family:"Cascadia Code",Consolas,monospace}
+.q-head .right{margin-left:auto;display:flex;gap:2px}
+.q-list{flex:1;overflow-y:auto}
+.q-row{display:grid;grid-template-columns:22px 1fr 200px 90px 70px;gap:10px;align-items:center;padding:5px 10px;border-bottom:1px solid color-mix(in srgb, var(--fs-border) 50%, transparent);font-size:12px}
+.q-row .fn{display:flex;align-items:center;gap:7px;overflow:hidden}
+.q-row .fn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:"Cascadia Code",Consolas,monospace;font-size:11.5px}
+.q-row .fn small{color:var(--fs-fg-disabled);flex:none}
+.bar{height:8px;border-radius:4px;background:var(--fs-bg-input);overflow:hidden;border:1px solid var(--fs-border)}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--fs-accent),var(--t-cyan));border-radius:4px}
+.bar i.done{background:var(--fs-ok)} .bar i.fail{background:var(--fs-danger)}
+.pct{font-family:"Cascadia Code",Consolas,monospace;font-size:11.5px;color:var(--fs-fg-secondary);text-align:right}
+.pct.ok{color:var(--fs-ok)} .pct.fail{color:var(--fs-danger)}
+.st{font-size:11.5px;text-align:center}
+.st.up{color:var(--fs-info)} .st.ok{color:var(--fs-ok)} .st.fail{color:var(--fs-danger)}
+
+.statusbar{height:24px;display:flex;align-items:center;padding:0 8px;font-size:11.5px;color:var(--fs-fg-secondary);background:var(--fs-bg-panel);border-top:1px solid var(--fs-border);flex:none}
+.statusbar .seg{padding:0 10px;border-right:1px solid var(--fs-border);display:flex;align-items:center;gap:5px;height:100%}
+.statusbar .seg:last-child{border-right:none;margin-left:auto}
+.statusbar .led{width:7px;height:7px;border-radius:50%;background:var(--fs-ok);box-shadow:0 0 4px var(--fs-ok)}
+
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--fs-border-strong);border-radius:5px;border:2px solid transparent;background-clip:content-box}
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <div class="logo"></div>
+  <span class="t">FutureShell — 生产-Web-01 · 文件</span>
+  <div class="win"><b>─</b><b>□</b><b>✕</b></div>
+</div>
+
+<div class="menubar">
+  <span>文件(F)</span><span>编辑(E)</span><span>视图(V)</span><span>传输(T)</span><span>窗口(W)</span><span>帮助(H)</span>
+</div>
+
+<div class="toolbar">
+  <button class="tbtn primary">⬆ 上传</button>
+  <button class="tbtn">⬇ 下载</button>
+  <div class="tsep"></div>
+  <button class="tbtn">🗀 新建目录</button>
+  <button class="tbtn">📄 新建文件</button>
+  <button class="tbtn">✏ 重命名</button>
+  <button class="tbtn" style="color:var(--fs-danger)">🗑 删除</button>
+  <div class="tsep"></div>
+  <button class="tbtn">⟳ 刷新</button>
+  <button class="tbtn">👁 隐藏文件</button>
+  <button class="tbtn">🔗 同步浏览 ✓</button>
+  <div class="spacer"></div>
+  <a class="tbtn" href="index.html">← 终端主视图</a>
+  <div class="skinbox">🎨
+    <select id="theme-select" title="应用主题">
+      <option value="obsidian">Obsidian</option>
+      <option value="daylight">Daylight</option>
+      <option value="slate">Slate Blue</option>
+      <option value="hc">High Contrast</option>
+    </select>
+  </div>
+</div>
+
+<div class="body">
+  <!-- 标签栏 + 模式切换 -->
+  <div class="tabbar">
+    <div class="tab active"><span class="dot"></span>生产-Web-01<span class="x">✕</span></div>
+    <div class="tab"><span class="dot"></span>数据库-02<span class="x">✕</span></div>
+    <div class="modes">
+      <button>终端</button><button>文件</button><button class="on">分屏</button>
+    </div>
+  </div>
+
+  <!-- 分屏：左终端 / 右 SFTP 双栏 -->
+  <div class="split">
+    <div class="pane-term">
+      <div class="term-wrap"><div class="term"><span class="green">user@web-01</span><span class="cyan">:</span><span class="blue">/var/www</span>$ ls -lah
+<span class="dim">total 64K</span>
+drwxr-xr-x  8 root root 4.0K Jul 20 11:02 <span class="blue">site-a</span>
+drwxr-xr-x  6 root root 4.0K Jul 18 09:44 <span class="blue">site-b</span>
+-rw-r--r--  1 root root 2.1K Jul 26 08:15 nginx.conf
+-rw-r--r--  1 root root  18K Jul 25 22:03 access.log
+<span class="green">user@web-01</span><span class="cyan">:</span><span class="blue">/var/www</span>$ <span class="cursor"></span></div></div>
+    </div>
+
+    <div class="gutter"></div>
+
+    <div class="pane-sftp">
+      <div class="sftp-cols">
+        <!-- 本地 -->
+        <div class="col">
+          <div class="col-head">
+            <span class="tag">本地</span>
+            <div class="crumb">📁 <b>D:\</b> › <b>deploy</b> › <b>release-2026-07-26</b></div>
+            <button class="mini" title="上级">⬆</button>
+            <button class="mini" title="返回">←</button>
+            <button class="mini" title="刷新">⟳</button>
+          </div>
+          <div class="tscroll"><table>
+            <thead><tr><th style="width:44%">名称</th><th style="width:26%">大小</th><th>修改时间</th></tr></thead>
+            <tbody>
+              <tr><td><div class="fname"><span class="fi">📁</span>..</div></td><td></td><td></td></tr>
+              <tr><td><div class="fname"><span class="fi">📁</span>config</div></td><td class="size">—</td><td class="mtime">07-25 14:02</td></tr>
+              <tr class="sel"><td><div class="fname"><span class="fi">📦</span>webapp-v3.2.1.tar.gz</div></td><td class="size">48.2 MB</td><td class="mtime">07-26 07:58</td></tr>
+              <tr class="sel"><td><div class="fname"><span class="fi">📦</span>migrations.zip</div></td><td class="size">1.4 MB</td><td class="mtime">07-26 07:59</td></tr>
+              <tr><td><div class="fname"><span class="fi">📄</span>deploy.sh</div></td><td class="size">2.1 KB</td><td class="mtime">07-26 08:01</td></tr>
+              <tr><td><div class="fname"><span class="fi">📄</span>rollback.sh</div></td><td class="size">1.2 KB</td><td class="mtime">07-20 16:30</td></tr>
+              <tr><td><div class="fname"><span class="fi">📄</span>release-notes.md</div></td><td class="size">8.7 KB</td><td class="mtime">07-26 07:45</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+
+        <!-- 远程 -->
+        <div class="col">
+          <div class="col-head">
+            <span class="tag">远程 · Web-01</span>
+            <div class="crumb">🌐 <b>/</b> › <b>var</b> › <b>www</b></div>
+            <button class="mini" title="上级">⬆</button>
+            <button class="mini" title="返回">←</button>
+            <button class="mini" title="刷新">⟳</button>
+          </div>
+          <div class="tscroll"><table>
+            <thead><tr><th style="width:44%">名称</th><th style="width:26%">大小</th><th>修改时间</th></tr></thead>
+            <tbody>
+              <tr><td><div class="fname"><span class="fi">📁</span>..</div></td><td></td><td></td></tr>
+              <tr><td><div class="fname"><span class="fi">📁</span>site-a</div></td><td class="size">—</td><td class="mtime">07-20 11:02</td></tr>
+              <tr><td><div class="fname"><span class="fi">📁</span>site-b</div></td><td class="size">—</td><td class="mtime">07-18 09:44</td></tr>
+              <tr><td><div class="fname"><span class="fi">📁</span>backups</div></td><td class="size">—</td><td class="mtime">07-26 03:00</td></tr>
+              <tr><td><div class="fname"><span class="fi">📄</span>nginx.conf</div></td><td class="size">2.1 KB</td><td class="mtime">07-26 08:15</td></tr>
+              <tr><td><div class="fname"><span class="fi">📄</span>access.log</div></td><td class="size">18.0 KB</td><td class="mtime">07-25 22:03</td></tr>
+              <tr><td><div class="fname"><span class="fi">🔒</span>.env</div></td><td class="size">512 B</td><td class="mtime">07-01 10:20</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 传输队列 -->
+  <div class="queue">
+    <div class="q-head">
+      <b>传输队列</b>
+      <span class="cnt">3 项（1 传输中 · 1 排队 · 1 完成）</span>
+      <span class="rate">总计 6.8 MB/s</span>
+      <div class="right">
+        <button class="mini" title="全部暂停">⏸</button>
+        <button class="mini" title="全部取消">✕</button>
+        <button class="mini" title="清空已完成">🧹</button>
+      </div>
+    </div>
+    <div class="q-list">
+      <div class="q-row">
+        <span class="st up">⬆</span>
+        <div class="fn"><span>webapp-v3.2.1.tar.gz</span><small>D:\deploy\release-2026-07-26 → /var/www/backups</small></div>
+        <div class="bar"><i style="width:64%"></i></div>
+        <div class="pct">30.8 MB / 48.2 MB</div>
+        <div class="st up">6.8 MB/s</div>
+      </div>
+      <div class="q-row">
+        <span class="st" style="color:var(--fs-fg-disabled)">⏳</span>
+        <div class="fn"><span>migrations.zip</span><small>D:\deploy\release-2026-07-26 → /var/www/backups</small></div>
+        <div class="bar"><i style="width:0%"></i></div>
+        <div class="pct">排队中</div>
+        <div class="st" style="color:var(--fs-fg-disabled)">—</div>
+      </div>
+      <div class="q-row">
+        <span class="st ok">✓</span>
+        <div class="fn"><span>release-notes.md</span><small>D:\deploy\release-2026-07-26 → /var/www</small></div>
+        <div class="bar"><i class="done" style="width:100%"></i></div>
+        <div class="pct ok">8.7 KB</div>
+        <div class="st ok">完成</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <div class="seg"><span class="led"></span>SFTP 已连接</div>
+  <div class="seg">sftp://192.168.1.10:22</div>
+  <div class="seg">本地 7 项 · 远程 7 项</div>
+  <div class="seg">UTF-8</div>
+  <div class="seg">🔒 Vault 已锁定</div>
+</div>
+
+<script>
+document.getElementById('theme-select').addEventListener('change', e =>
+  document.documentElement.dataset.theme = e.target.value);
+</script>
+</body>
+</html>

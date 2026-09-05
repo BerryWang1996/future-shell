@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # 供 release.yml 作为发布前置门禁调用（`uses: ./.github/workflows/ci.yml`）。
+  # 门禁只此一份定义，避免「CI 改了、发布流水线没跟上」的漂移。
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 所有第三方 action 一律钉 commit SHA，不用 @v4 这类可变标签：标签可以被重新指向任意
+# commit（仓库所有者或拿到其凭据的人都能做），这正是 action 供应链攻击的标准入口。
+# 钉 SHA 把升级变成一次显式 PR——那点摩擦就是我们要的。
+# 升级方法：`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`，注释里同步写上对应 tag。
+#
+# 所有 cargo 命令都带 --locked：CI 不允许 cargo 顺手更新 Cargo.lock，否则「本机跑过的依赖树」
+# 和「CI 验过的依赖树」不是同一棵，cargo-deny 的结论也就不适用于实际产物。
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 审计2 #4：钉具体镜像版本而非 *-latest——runner 镜像升级（新 SDK/系统库/编译器）
+        # 会让相同源码在不同日期得到不同产物。升级 = 显式 PR 改这里的标签并重跑门禁。
+        os: [windows-2025, macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 分支头（该仓库不发 semver tag）
+        with: { components: "rustfmt,clippy" }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # NASM 是 Windows MSVC 的硬前置：russh 默认 feature aws-lc-rs → aws-lc-sys 的 build script
+      # 在 x86_64-pc-windows-msvc 上必须找到 nasm.exe，否则 panic 中止构建。
+      # windows-latest runner 镜像不自带 NASM。（本机 cargo check 实测取证，非文档推断）
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+        if: runner.os == 'Windows'
+      - name: Install Linux webkit deps
+        if: runner.os == 'Linux'
+        # libdbus-1-dev：tauri 2.11 默认 dbus 特性的系统库兜底（R45）；libxdo-dev / libssl-dev：tauri 官方 CI 前置补齐（R48）
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libdbus-1-dev libxdo-dev libssl-dev
+      # frontend/dist 是 app crate 的编译期前置：tauri::generate_context!() 在 frontendDist
+      # 路径不存在时直接 panic（"The `frontendDist` configuration is set to ... but this path doesn't exist"）
+      - id: has-frontend
+        shell: bash
+        run: |
+          if [ -f frontend/package.json ]; then echo "present=1" >> "$GITHUB_OUTPUT"; else echo "present=0" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.has-frontend.outputs.present == '1'
+        with: { node-version: 24 }
+      - name: Build frontend dist (tauri generate_context! prerequisite)
+        if: steps.has-frontend.outputs.present == '1'
+        run: npm ci && npm run build
+        working-directory: frontend
+      - name: Build RDP helper (tauri externalBin prerequisite)
+        shell: bash
+        run: bash scripts/build-rdp-helper.sh --debug
+      - run: cargo fmt --check
+      - run: cargo fmt --manifest-path rdp-helper/Cargo.toml --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings   # --all-targets 才会 lint 测试代码，勿省
+      - run: cargo clippy --manifest-path rdp-helper/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Install nextest
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with: { tool: "cargo-nextest,cargo-deny" }
+      - run: cargo deny check licenses bans advisories   # advisories = RustSec 漏洞库检查（总设计 §6.2）
+      - run: cargo deny --manifest-path rdp-helper/Cargo.toml check licenses bans advisories
+      - run: cargo test --manifest-path rdp-helper/Cargo.toml --locked
+      - name: Test (Linux — container itest enabled)
+        if: runner.os == 'Linux'
+        run: cargo nextest run --workspace --locked --no-tests pass
+        env:
+          FS_ITEST: "1"
+      - name: Test (Windows/macOS — no Docker, itest gate skipped)
+        if: runner.os != 'Linux'
+        run: cargo nextest run --workspace --locked --no-tests pass
+      # 两条测试入口都要跑（S23）：nextest 每测试一个独立进程，会把「进程全局状态」的竞态
+      # 整个藏住——S16（keyring_core::set_default_store 是进程级全局开关，测试互相换库导致
+      # 静默换钥、先前密文再也解不开）只在「同一二进制多线程单进程」下暴露，而那正是
+      # cargo test 的跑法，也是 Rust 的默认入口。只跑 nextest 等于这一整类缺陷在 CI 上永不可见。
+      # 此处刻意不置 FS_ITEST：容器化 itest 已由上面的 Linux nextest 步骤覆盖，无谓重跑一遍。
+      - name: Test (cargo test — 单进程多线程，另一张网)
+        run: cargo test --workspace --locked
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 文档-代码一致性门禁（M4b 出口第 19 项）。
+  #
+  # 与 check / frontend 分开是刻意的：那两个 job 跑的是「代码对不对」，
+  # 这个跑的是「文档里点名的载体还在不在」。混进 check 会让一次纯文档改动
+  # 拖起整个 Rust 矩阵，而它秒级就能跑完。
+  # ──────────────────────────────────────────────────────────────────────────────
+  docs-gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24 }
+      - name: Release version consistency
+        run: node .github/scripts/check-version-consistency.mjs --selftest && node .github/scripts/check-version-consistency.mjs
+      - name: Documentation links and in-app help destinations
+        run: node scripts/check-doc-links.mjs
+      # M1 出口回归：路线图 M1 出口每条判据点名的测试载体必须还在工作区。
+      # 全量测试绿证不了这件事——载体被删掉之后，全量照样绿，而路线图上的 [x] 还挂着。
+      - name: M1 exit-criteria carriers still exist
+        run: bash scripts/m1-regression.sh
+      # 验收清单分类：每条未落勾项都必须落桶，且人工桶有条数上限（防把所有项塞进人工桶）
+      - name: Acceptance triage
+        run: bash scripts/acceptance-triage.sh
+      # 环境变量文档与真实读取点对齐
+      - name: Env var doc parity
+        run: bash scripts/env-gate-parity.sh
+      # 本地 CI 镜像脚本与 ci.yml 的步骤集不漂
+      - name: ci-local mirrors this workflow
+        run: bash scripts/ci-parity.sh
+
+  frontend:
+    # 审计2 #4：同 check 矩阵，钉版本不跟 latest 漂
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # 存在性门控：frontend/ 骨架在 Task 17 才建立，此前本 job 自动跳过（M0 出口约定，路线图 §1 M0）
+      - id: has-frontend
+        shell: bash
+        run: |
+          if [ -f frontend/package.json ]; then echo "present=1" >> "$GITHUB_OUTPUT"; else echo "present=0" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.has-frontend.outputs.present == '1'
+        with: { node-version: 24 }
+      - if: steps.has-frontend.outputs.present == '1'
+        run: npm ci && npm run check && npm test -- --run && npm run build
+        working-directory: frontend
+      # 审计2 #3：前端依赖漏洞门禁。此前 npm audit 只被人工跑过时点快照，新增已知漏洞的
+      # 依赖可以静默进产物。--omit=dev 与产物同口径（devDependencies 不进 vite build）。
+      # npm audit 的「漏洞」定义依赖 registry 的 advisory 数据，误报时以显式审计级别调低
+      # 或 npm-audit-json 豁免记录为准，不得静默删步。
+      - if: steps.has-frontend.outputs.present == '1'
+        run: npm audit --omit=dev
+        working-directory: frontend
+      - if: steps.has-frontend.outputs.present != '1'
+        run: echo "frontend/ skeleton not built yet (plan Task 17); gate skipped"
