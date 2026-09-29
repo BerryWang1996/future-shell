@@ -57,7 +57,7 @@ COUNT=${#CARRIERS[@]}
 note "路线图 M1 出口点名的测试载体：$COUNT 个"
 
 if [ "$COUNT" -lt "$MIN_CARRIERS" ]; then
-  bad "只解析到 $COUNT 个载体（下限 $MIN_CARRIERS）——多半是段落锚点或正则失效了。"
+  bad "只解析到 $COUNT 个载体（下限 ${MIN_CARRIERS}）——多半是段落锚点或正则失效了。"
   bad "  空集会让下面的存在性检查恒真，那时这个门禁什么也没守。"
   exit 1
 fi

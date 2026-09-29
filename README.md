@@ -57,6 +57,12 @@ cargo tauri dev
 Tauri 配置位于 `app/`；开发命令从仓库根目录运行。RDP helper 属于独立工作区，
 必须先构建并复制到 `app/binaries/`，主工作区不会自动编译它。
 
+## 安装包签名
+
+FutureShell 不使用商业代码签名证书。Windows 首次运行可能出现 SmartScreen「未知发布者」提示，
+macOS 包仅 ad-hoc 签名、未经 Apple 公证。每个 Release 附带 `SHA256SUMS.txt` 与 GitHub 构建来源证明，
+下载后可用 `sha256sum -c SHA256SUMS.txt --ignore-missing` 或 `gh attestation verify <文件> --repo <仓库>` 核对。
+
 ## 数据与便携模式
 
 默认数据目录为系统配置目录下的 `future-shell/`。在可执行文件旁放置空的

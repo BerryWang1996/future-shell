@@ -197,7 +197,8 @@ describe("ScheduleDialog", () => {
     // 最后一次预览请求的偏移应是系统当前值，而不是手输的 0（除非本机恰在 UTC）
     const last = invokeMock.mock.calls.filter((c) => c[0] === "schedule_preview_cron").pop();
     const sent = (last?.[1] as { tzOffsetMinutes: number }).tzOffsetMinutes;
-    expect(sent, "跟随 DST 时预览必须用系统当前偏移").toBe(-new Date().getTimezoneOffset());
+    // `0 - x` 而不是 `-x`：UTC runner 上后者是 -0，而生产代码归一成 +0（见 schedule.test.ts 同款注释）
+    expect(sent, "跟随 DST 时预览必须用系统当前偏移").toBe(0 - new Date().getTimezoneOffset());
     // 手输框禁用（由系统决定，改了也不生效）
     expect((screen.getByTestId("sched-f-offset") as HTMLInputElement).disabled).toBe(true);
   });

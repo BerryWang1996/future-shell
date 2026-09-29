@@ -99,7 +99,16 @@ GUI 性能自查、自动化吞吐与并发测试的区别见 [性能验证](doc
 - `v*.*.*` tag：完整质量门禁、三平台安装包、签名与公证、安装 smoke，通过后创建 draft Release。
 
 Windows 产出 MSI/NSIS，macOS 产出 DMG，Linux 产出 AppImage/deb。
-tag 构建强制验证 Windows Authenticode、macOS 签名与公证；所需 secret 名称见发布工作流顶部。
+tag 构建默认强制 Windows Authenticode、macOS 签名与公证；所需 secret 名称见发布工作流顶部。
+
+本项目不购买商业代码签名证书（维护者裁定，2026-09-29）。发布未签名版本时，在仓库
+Settings → Secrets and variables → Actions → **Variables** 设 `ALLOW_UNSIGNED_RELEASE=true`：
+缺证书的平台改为警告放行，macOS 包打 ad-hoc 签名，draft Release 正文自动写明未签名平台、
+`sha256sum -c` 与 `gh attestation verify` 两种核对方法和 SmartScreen / Gatekeeper 放行步骤。
+变量缺失或不是字面量 `true` 时，tag 构建仍在签名闸失败。
+
+分支约定：发版候选在 `release/<版本>` 分支上准备并经 PR 合入 `main`，`v<版本>` tag 打在合入后的
+`main` 提交上。
 
 所有 Release 附件统一整理到同一层，包括两个 Rust 工作区和前端 SBOM、三份许可材料。
 先生成 SHA-256 校验和，再生成来源证明。审阅 draft、真实安装结果与待验项后才发布。

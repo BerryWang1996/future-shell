@@ -65,11 +65,16 @@ fn start_pty() -> Pty {
         .stderr(Stdio::null())
         .spawn()
         .expect("拉不起 socat（镜像里没装？）");
+    // spawn 之后**立刻**交给 Pty：下面等链接超时会 panic，那条路上子进程若没人
+    // wait 就成了僵尸（clippy::zombie_processes 在 Linux CI 上拦下的正是这一条，
+    // Windows 上本文件整体 cfg(unix) 编译不到，本地 clippy 看不见）。
+    // 交给 Pty 之后，panic 展开时 Drop 负责 kill + wait，所有路径都收尸。
+    let pty = Pty(child);
     // 等两条符号链接出现。socat 建链接要几十毫秒，直接开会撞上 ENOENT。
     for _ in 0..200 {
         if std::path::Path::new(A).exists() && std::path::Path::new(B).exists() {
             std::thread::sleep(Duration::from_millis(30));
-            return Pty(child);
+            return pty;
         }
         std::thread::sleep(Duration::from_millis(20));
     }

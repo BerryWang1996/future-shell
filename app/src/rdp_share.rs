@@ -776,33 +776,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&r2);
     }
 
+    /// 在 `link` 处造一个指向 `target` 目录的链接。
+    ///
+    /// Windows 用 junction（`mklink /J`）：`symlink` 要特权，**junction 不要**——用户的
+    /// 机器上后者恰好也是恶意软件更常用的那种。Unix 用普通符号链接。两者对被测代码
+    /// 是同一件事：路径经链接解析到根外。第一版只写了 `mklink`，Linux CI 镜像当场红
+    /// （测试本身不跨平台，不是被测代码的问题）。
+    fn link_dir(link: &std::path::Path, target: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let st = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .expect("起不了 mklink");
+            assert!(
+                st.status.success(),
+                "mklink 失败：{}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("建符号链接失败");
+    }
+
     /// 符号链接/联接逃逸（D3 变异的守卫）：链接的目标在根外必须拒。
     ///
-    /// Windows 上 `symlink` 要特权，**junction（mklink /J）不要**——用户的机器
-    /// 上后者恰好也是恶意软件更常用的那种。Stat 走「打开后 canonicalize 再验」
-    /// 的路径，恰好覆盖 TOCTOU 窗口外的常态情形。
+    /// Stat 走「打开后 canonicalize 再验」的路径，恰好覆盖 TOCTOU 窗口外的常态情形。
     #[tokio::test]
     async fn junction_escape_is_rejected() {
         let r = root();
         let outside = root(); // 另一个根，作为「根外」目标
         std::fs::write(outside.join("secret.txt"), b"do-not-leak").unwrap();
-        // mklink /J 不需要特权
-        let j = r.join("leap");
-        let st = std::process::Command::new("cmd")
-            .args([
-                "/C",
-                "mklink",
-                "/J",
-                &j.to_string_lossy(),
-                &outside.to_string_lossy(),
-            ])
-            .output()
-            .expect("起不了 mklink");
-        assert!(
-            st.status.success(),
-            "mklink 失败：{}",
-            String::from_utf8_lossy(&st.stderr)
-        );
+        link_dir(&r.join("leap"), &outside);
 
         let t = table().await;
         t.mount(1, "share", r.to_str().unwrap(), true)

@@ -75,17 +75,17 @@ total=$((carrier + manual + todo))
 
 # 做空防护②：总数下限
 [[ $total -ge $MIN_ITEMS ]] ||
-  fail "只解析出 $total 条未落勾项（下限 $MIN_ITEMS）——解析器可能被改坏，这个门禁被做空了"
+  fail "只解析出 $total 条未落勾项（下限 ${MIN_ITEMS}）——解析器可能被改坏，这个门禁被做空了"
 
 # 做空防护①：人工桶上限
 [[ $manual -le $MANUAL_MAX ]] ||
-  fail "人工闸门桶有 $manual 条（上限 $MANUAL_MAX）——新增的未落勾项应优先去建测试载体，\
+  fail "人工闸门桶有 $manual 条（上限 ${MANUAL_MAX}）——新增的未落勾项应优先去建测试载体，\
 不要靠塞进人工桶让门禁变绿。若确实都是人工项，请连同理由一并下调/上调本上限。"
 
 cat <<REPORT
-验收分类（$DOC，未落勾 $total 条）
+验收分类（${DOC}，未落勾 $total 条）
   有载体（点名到测试，只差跑一遍）：$carrier
-  待人工闸门（真机/交互/采购/公证）：$manual  （上限 $MANUAL_MAX）
+  待人工闸门（真机/交互/采购/公证）：$manual  （上限 ${MANUAL_MAX}）
   待建载体（既无测试也非人工）    ：$todo
 REPORT
 

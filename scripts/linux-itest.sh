@@ -64,7 +64,7 @@ main() {
   # 在 CI 机器上把内存吃光。慢是可接受的，OOM 之后那种「随机某条红」不可接受。
   script+="; FS_ITEST=1 cargo test -p fs_itest --locked --no-fail-fast --target-dir /tmp/tgt ${filter} -- --test-threads=1"
 
-  echo "== 在 Linux 容器里跑 fs_itest（挂载源码：$win；Docker socket 直通）=="
+  echo "== 在 Linux 容器里跑 fs_itest（挂载源码：${win}；Docker socket 直通）=="
   MSYS_NO_PATHCONV=1 docker run --rm \
     --network host \
     -v "${win}:/src:ro" \

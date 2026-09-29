@@ -42,7 +42,7 @@ for arg in "$@"; do
   case "$arg" in
     --skip-slow) SKIP_SLOW=1 ;;
     --with-itest) WITH_ITEST=1 ;;
-    *) echo "未知参数：$arg（可用：--skip-slow / --with-itest）" >&2; exit 2 ;;
+    *) echo "未知参数：${arg}（可用：--skip-slow / --with-itest）" >&2; exit 2 ;;
   esac
 done
 
@@ -127,6 +127,8 @@ fi
 run_step "version gate selftest" node .github/scripts/check-version-consistency.mjs --selftest
 run_step "version consistency" node .github/scripts/check-version-consistency.mjs
 run_step "documentation links" node scripts/check-doc-links.mjs
+run_step "shell portability selftest" node scripts/check-shell-portability.mjs --selftest
+run_step "shell portability" node scripts/check-shell-portability.mjs
 
 echo ""
 echo "════════ 结果 ════════"
@@ -139,4 +141,4 @@ if [[ ${#FAILED[@]} -gt 0 ]]; then
   exit 1
 fi
 echo ""
-echo "全部通过。注意：这只覆盖 Windows 一路；Linux 见 scripts/linux-precheck.sh，macOS 无环境。"
+echo "全部通过。注意：这只覆盖 Windows 一路；Linux 见 scripts/linux-ci-mirror.sh（完整 ubuntu check 作业）与 scripts/linux-precheck.sh，macOS 无环境。"

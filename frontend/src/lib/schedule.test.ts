@@ -33,7 +33,24 @@ describe("localTzOffsetMinutes", () => {
 
   it("真实 Date 上取到的值与 getTimezoneOffset 恰好互为相反数", () => {
     const now = new Date();
-    expect(localTzOffsetMinutes(now)).toBe(-now.getTimezoneOffset());
+    // 期望值写成 `0 - x` 而不是 `-x`：UTC 下 `-0` 是 -0，而被测函数刻意归一成 +0，
+    // `toBe` 用 Object.is 比较会把「函数做对了」判成红。1.0.0 候选首次 GitHub CI
+    //（runner 默认 TZ=UTC）正是红在这一行；东八区开发机上永远是绿的。
+    expect(localTzOffsetMinutes(now)).toBe(0 - now.getTimezoneOffset());
+  });
+
+  it("本机就在 UTC 时返回 +0 而不是 -0（CI runner 的默认时区）", () => {
+    // 运行期改 TZ：Node 13+ 会在下一次 Date 调用时重读。这条让 UTC 路径在任何开发机上
+    // 都跑得到，不必等到 CI 才发现——上面那条只在 runner 上才会走到 0 这个分支。
+    const saved = process.env.TZ;
+    process.env.TZ = "UTC";
+    try {
+      const v = localTzOffsetMinutes(new Date());
+      expect(Object.is(v, 0), `实得 ${Object.is(v, -0) ? "-0" : v}`).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
   });
 });
 

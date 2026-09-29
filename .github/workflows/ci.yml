@@ -102,6 +102,9 @@ jobs:
         run: node .github/scripts/check-version-consistency.mjs --selftest && node .github/scripts/check-version-consistency.mjs
       - name: Documentation links and in-app help destinations
         run: node scripts/check-doc-links.mjs
+      # macOS bash 3.2 把 `$VAR` 后紧贴的非 ASCII 字节读进变量名（1.0.0 候选首次 CI 的 mac 红）
+      - name: Shell portability (bash 3.2 variable names)
+        run: node scripts/check-shell-portability.mjs --selftest && node scripts/check-shell-portability.mjs
       # M1 出口回归：路线图 M1 出口每条判据点名的测试载体必须还在工作区。
       # 全量测试绿证不了这件事——载体被删掉之后，全量照样绿，而路线图上的 [x] 还挂着。
       - name: M1 exit-criteria carriers still exist

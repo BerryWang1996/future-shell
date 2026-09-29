@@ -77,14 +77,62 @@ MSI 采用管理提取，在独立便携目录和独立 WebView 数据目录内�
 确认初始化完成后退出、数据库创建成功、再次启动不受上次锁影响；主程序文件版本为 1.0.0。
 本次没有执行 MSI/NSIS 的完整安装卸载，也未覆盖本机既有 0.4.0 安装。
 
+## 2026-09-29 复查
+
+候选分支首次 GitHub CI（2026-09-05，run 33942316287）：windows-2025 全绿，其余三处失败，此后无人处理。
+本次逐条修复并补本地复现手段，另发现两处与 CI 无关的问题。
+
+### 修复
+
+1. **ubuntu clippy**：`crates/serial/tests/pty.rs` 在等待伪终端链接超时 panic 的路径上不回收 socat 子进程
+   （`zombie_processes`）。文件整体 `cfg(unix)`，Windows 本地 clippy 看不到。改为 spawn 后立即交给 Drop 守卫。
+2. **macos-14 构建 helper 即退出**：macOS 自带 bash 3.2 把 `"$PROFILE，"` 后的全角逗号字节读进变量名，
+   `set -u` 下报 unbound variable。全仓脚本与工作流共 18 处同形，改为 `${VAR}`；bash 5（Linux/Git Bash）
+   无法复现，因此新增静态门禁 `scripts/check-shell-portability.mjs`（6 例自检），接入 CI docs-gates、
+   ci-local 与 ci-parity（门禁下限 11→12）。
+3. **frontend**：runner 时区为 UTC，两条测试用 `-getTimezoneOffset()` 作期望值得到 `-0`，而被测函数
+   刻意归一为 `+0`。改为 `0 - x`，并新增运行期切到 UTC 的用例，使该路径在任何开发机上可复现。
+   变异：去掉归一后新用例在东八区本机转红。另把 AiPanel 打开耗时的绝对预算由 150ms 放宽到 1000ms
+   （并行全量实测 189ms 即红；真正守时延的是同文件「全程只一次 IPC」的结构断言）。
+4. **RDP 音频从未可用**：helper 连接参数 `enable_audio_playback: false`（注释写「阶段 3 再开」，阶段 3
+   交付后未翻）。该值使 Client Info PDU 带 INFO_NOAUDIOPLAYBACK，服务器按协议不做音频重定向。已改为 true，
+   新增单测并经变异验证。真 Windows 上的实际出声仍属人工核验 V15-d。
+5. **依赖安全公告**（09-05 后新发布）：rustls < 0.23.45（RUSTSEC-2026-0285，主工作区与 helper 的 RDP TLS
+   均受影响）、cryptoki 0.12.0（RUSTSEC-2026-0286，helper 经 sspi 引入），均以补丁级更新修复；许可材料快照按
+   发布流程重新生成。前端开发依赖 5 条公告（vitest mocker 路径穿越等，不进安装包）以兼容更新修复；
+   `package-lock.json` 的 resolved 地址统一为 registry.npmjs.org（此前指向本机镜像源；npm 默认会把官方地址
+   替换为使用者配置的源，镜像用户不受影响）。
+6. **Linux 专属测试缺陷**：RDPDR 联接逃逸测试调用 Windows 的 `mklink`，Linux 上必红，改为按平台建链接。
+
+### 发布策略
+
+维护者裁定不购买商业代码签名证书。`release.yml` 增加仓库变量 `ALLOW_UNSIGNED_RELEASE=true` 显式放行：
+缺证书的平台在 tag 构建中警告继续，macOS 包打 ad-hoc 签名，draft Release 正文自动写明未签名平台、
+`sha256sum -c` 与 `gh attestation verify` 核对方法和 SmartScreen / Gatekeeper 放行步骤。变量缺失时仍在
+签名闸失败。actionlint 通过。README 增加「安装包签名」一节，CONTRIBUTING 记录开关与分支约定。
+
+候选分支按开源惯例更名为 `release/1.0.0`（全量历史版为 `release/1.0.0-full-history`，仅本地）。
+
+### 验证记录（2026-09-29）
+
+| 项目 | 结果 |
+|---|---|
+| Windows ci-local（20 步，`CARGO_INCREMENTAL=0`） | 全绿；nextest 1,644 通过（5 跳过），cargo test 1,644 通过，helper 48 通过 |
+| 前端 Vitest | 117 文件 1,683 项通过；`TZ=UTC` 下同样全绿 |
+| svelte-check | 0 errors（RDP 画布 2 条既有可访问性提示） |
+| cargo deny 两工作区 / npm audit（生产与开发依赖） | 全部通过 / 0 vulnerabilities |
+| Linux：`scripts/linux-ci-mirror.sh`（新增，按 ci.yml 原顺序在容器里跑 ubuntu check 作业） | 前端 dist、helper、fmt ×2、clippy ×2（含 app crate 与 Tauri Linux 全栈）、helper test、nextest 1,657/1,657、cargo test 全绿 |
+| 真 xrdp itest（音频开关打开后） | 4 项中 3 项通过（连接认证、键盘→重绘、拒证书）；第 4 项两次都卡在测试容器启动时从 deb.debian.org 安装 xrdp（本机实测约 300 kB/s），与改动无关（该用例在 NLA 认证阶段失败，早于携带音频标志的 Client Info PDU），留待 GitHub runner |
+| 版本门禁 / 文档链接 / 验收分类 / CI 对齐 / 性能门禁对齐 | 全部通过 |
+
+macOS 仍无本地替代；macOS 专属代码仅 3 处且均为平台常量分支，其余 Unix 代码已由 Linux 镜像覆盖。
+
 ## 正式发版前仍需完成
 
-- 2026-09-05 推送候选分支前核对：GitHub Actions 已启用，仓库级 Actions secrets 列表为空，
-  远程没有已有的工作流运行记录。Windows/macOS 签名所需凭据尚未配置，不能将本地验证视为正式发布通过。
-- Windows/macOS/Linux GitHub runner 的 CI、bundle 和安装/覆盖安装/卸载 smoke 完整通过。
-- 配置并实际验证 Windows Authenticode、macOS 签名及公证；现有 tag 流程强制要求签名，未放宽。
+- **推送修复**：推送 `release/1.0.0`，以它重开 PR 并关闭 #1。
+- Windows/macOS/Linux GitHub runner 的 CI 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
+- 在仓库 Variables 设 `ALLOW_UNSIGNED_RELEASE=true`，用 `workflow_dispatch` 跑一次 release.yml，
+  确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
-  输入法、音频、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
-- 最后审阅候选包和检查记录，再决定是否打 `v1.0.0` tag。
-
-本地安装包未签名时仅用于验证，不等同于通过仓库签名要求的公开发行产物。
+  输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
+- PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。

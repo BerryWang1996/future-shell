@@ -15,10 +15,19 @@
 #      APPLE_ID / APPLE_PASSWORD    Apple ID 与 **app-specific password**（不是账号密码）
 #      APPLE_TEAM_ID                10 位 Team ID
 #    这些 secret 一个都没有硬编码在本文件里，也不该有。
-#    **审计2 #1：tag 触发的正式构建里，缺失签名 secret 不再是「记一笔 summary」而是直接失败**——
+#    **审计2 #1：tag 触发的正式构建里，缺失签名 secret 默认直接失败**——
 #    未签名产物连 draft release 都进不去，人工想发布也没有可发布的文件。
 #    workflow_dispatch（无 tag 的打包链路验证）仍允许无签名构建，产物只上传为 artifact、
 #    不会自动成为 release。
+#
+#    **未签名发布的显式开关（维护者裁定 2026-09-29）**：本项目是开源项目，不购买商业
+#    代码签名证书。仓库变量（Settings → Secrets and variables → Actions → **Variables**，
+#    不是 Secrets）`ALLOW_UNSIGNED_RELEASE=true` 时，tag 构建在缺证书的平台上改为
+#    警告放行。放行不是静默的：job summary 标「未签名正式发布」，draft release 正文
+#    顶部自动写明哪些平台未签名、如何用 SHA256SUMS 与构建来源证明核对完整性、以及
+#    SmartScreen / Gatekeeper 的放行方法。变量不存在或不是字面量 `true` 时仍按原规则失败。
+#    macOS 无 Apple 证书时打 ad-hoc 签名（`signingIdentity: "-"`）：Apple Silicon 上完全
+#    无签名的可执行文件会被判「已损坏」，ad-hoc 签名至少让用户能按 Gatekeeper 提示放行。
 #
 # 2. SBOM：cargo-cyclonedx 覆盖主工作区与 RDP helper 的全目标依赖，npm sbom 覆盖前端。
 #    notices job 生成三份许可材料，bundle job 下载后随安装包分发。
@@ -218,6 +227,8 @@ jobs:
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      # 只认字面量 true（大小写敏感）：变量写错成 "yes"/"True" 时按未放行处理，宁严勿宽。
+      ALLOW_UNSIGNED: ${{ vars.ALLOW_UNSIGNED_RELEASE == 'true' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -341,7 +352,7 @@ jobs:
             if [ "$t" = "x86_64-pc-windows-msvc" ] || [ "$t" = "x86_64-unknown-linux-gnu" ] || [ "$t" = "x86_64-apple-darwin" ] || [ "$t" = "aarch64-apple-darwin" ]; then
               bash scripts/build-rdp-helper.sh --target "$t"
             else
-              echo "::error::matrix 出现未认识的 rust target：$t（helper 的构建步骤需要同步认识它）"
+              echo "::error::matrix 出现未认识的 rust target：${t}（helper 的构建步骤需要同步认识它）"
               exit 1
             fi
           done
@@ -376,6 +387,12 @@ jobs:
           if [ -n "${WIN_THUMBPRINT:-}" ]; then
             CONFIG=$(printf '{"build":{"beforeBuildCommand":""},"bundle":{"windows":{"certificateThumbprint":"%s","digestAlgorithm":"sha256","timestampUrl":"http://timestamp.digicert.com"}}}' "$WIN_THUMBPRINT")
           fi
+          # 无 Apple 证书时 ad-hoc 签名：Apple Silicon 拒绝运行完全无签名的代码（提示「已损坏」
+          # 且没有放行入口）；ad-hoc 签名不提供身份，但让 Gatekeeper 走「无法验证开发者 →
+          # 仍要打开」那条用户可操作的路径。有证书时 Tauri 用 APPLE_SIGNING_IDENTITY，不经这里。
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            CONFIG='{"build":{"beforeBuildCommand":""},"bundle":{"macOS":{"signingIdentity":"-"}}}'
+          fi
           TARGET_ARG=""
           if [ -n "${{ matrix.tauri_target }}" ]; then
             TARGET_ARG="--target ${{ matrix.tauri_target }}"
@@ -392,15 +409,21 @@ jobs:
         if: env.IS_TAG == 'true'
         shell: bash
         run: |
+          missing=""
           if [ "${{ runner.os }}" = "Windows" ] && [ -z "${WINDOWS_CERTIFICATE:-}" ]; then
-            echo "::error::tag 构建必须签名：WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD 未配置"
-            exit 1
+            missing="WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD"
           fi
           if [ "${{ runner.os }}" = "macOS" ] && [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "::error::tag 构建必须签名：APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY 未配置"
+            missing="APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY"
+          fi
+          if [ -z "$missing" ]; then
+            echo "签名 secret 已配置（${{ runner.os }}）"
+          elif [ "${ALLOW_UNSIGNED:-}" = "true" ]; then
+            echo "::warning::${{ runner.os }} 未签名正式发布：${missing} 未配置，仓库变量 ALLOW_UNSIGNED_RELEASE=true 放行"
+          else
+            echo "::error::tag 构建必须签名：${missing} 未配置。开源项目确认不签名时，设置仓库变量 ALLOW_UNSIGNED_RELEASE=true（Variables，不是 Secrets）"
             exit 1
           fi
-          echo "签名 secret 已配置（${{ runner.os }}）"
 
       # ── 签名验证（审计2 #1 的另一半）───────────────────────────────────────
       # 「已签名」不许再由「secret 存在」推断——secret 在、签名步骤跑挂了、产物裸奔，
@@ -480,11 +503,15 @@ jobs:
               echo "没有它的话，那三段代码第一次运行会是在真正发版的那一刻。"
               echo ""
               echo "正式发版仍须配置 WINDOWS_CERTIFICATE（tag 构建会被签名强制闸拦下）。"
+            elif [ "${IS_TAG:-}" = "true" ]; then
+              echo "**未签名正式发布** — $SCHEME 的 secrets 未配置，"
+              echo "仓库变量 ALLOW_UNSIGNED_RELEASE=true 放行（维护者裁定：开源项目不购买商业证书）。"
+              echo ""
+              echo "draft release 正文会写明未签名平台与完整性核对方法（SHA256SUMS + 构建来源证明）。"
             else
               echo "**本次产物未签名** — $SCHEME 的 secrets 未配置，签名步骤已跳过。"
               echo ""
-              echo "本次是 workflow_dispatch 的打包链路验证（tag 构建会被签名强制闸拦下）。"
-              echo "产物只上传为 artifact，不会成为 release。"
+              echo "本次是 workflow_dispatch 的打包链路验证；产物只上传为 artifact，不会成为 release。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -720,9 +747,39 @@ jobs:
         with:
           subject-path: artifacts/*
 
+      # 未签名说明：哪个平台没签就写哪个，签了就不写——正文只陈述本次产物的事实。
+      - name: Write signing notice for release body
+        env:
+          WIN_SIGNED: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+          MAC_SIGNED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : > release-notice.md
+          if [ "$WIN_SIGNED" != "true" ] || [ "$MAC_SIGNED" != "true" ]; then
+            {
+              echo "## 安装包签名说明"
+              echo ""
+              echo "FutureShell 是开源项目，本版本以下安装包**未使用商业代码签名证书**："
+              [ "$WIN_SIGNED" != "true" ] && echo "- Windows（.msi / .exe）：首次运行时 SmartScreen 可能提示「未知发布者」，点「更多信息 → 仍要运行」。"
+              [ "$MAC_SIGNED" != "true" ] && echo "- macOS（.dmg）：仅 ad-hoc 签名、未经 Apple 公证。首次打开被拦时，到「系统设置 → 隐私与安全性」点「仍要打开」。"
+              echo ""
+              echo "请用以下任一方式核对下载文件未被篡改："
+              echo ""
+              echo '```'
+              echo "sha256sum -c SHA256SUMS.txt --ignore-missing"
+              echo "gh attestation verify <下载的文件> --repo ${REPO}"
+              echo '```'
+              echo ""
+              echo "构建来源证明（SLSA provenance）由本仓库的 GitHub Actions 发布流水线生成，覆盖全部附件。"
+            } > release-notice.md
+          fi
+          cat release-notice.md
+
       - name: Create draft release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          body_path: release-notice.md
           # draft 默认开：发版是不可逆动作（GitHub release 一旦 publish 就会触发订阅者通知、
           # 被镜像站抓取），tag 推错、产物缺一个平台——这些都要留一个人工闸门。
           # 确认无误后在 Web UI 上点 Publish。

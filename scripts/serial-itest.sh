@@ -65,7 +65,7 @@ main() {
   script+=" FS_SERIAL_PTY=1 cargo test -p fs_serial --locked --target-dir /tmp/tgt -- --test-threads=1 --nocapture 2>&1 | tail -60;"
   script+=' rc=${PIPESTATUS[0]}; [ "$rc" = "0" ] || exit "$rc"'
 
-  echo "== 在 Linux 容器里跑串口集成测试（挂载：$win）=="
+  echo "== 在 Linux 容器里跑串口集成测试（挂载：${win}）=="
   MSYS_NO_PATHCONV=1 docker run --rm -v "${win}:/src:ro" "$IMAGE" bash -c "$script"
 
   cat <<'COVERAGE'

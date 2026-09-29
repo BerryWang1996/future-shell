@@ -50,7 +50,7 @@ case "$TRIPLE" in
   *windows*) EXT=".exe" ;;
 esac
 
-echo "── 构建 RDP helper（$PROFILE，$TRIPLE）──"
+echo "── 构建 RDP helper（${PROFILE}，${TRIPLE}）──"
 # shellcheck disable=SC2086  # TARGET_FLAG 按词拆分是有意的
 cargo build --manifest-path rdp-helper/Cargo.toml --locked $CARGO_FLAG $TARGET_FLAG
 

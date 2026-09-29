@@ -949,7 +949,12 @@ fn build_config(p: &ConnectParams) -> Config {
         hardware_id: None,
         request_data: None,
         autologon: false,
-        enable_audio_playback: false, // 阶段 3（RDPSND）再开
+        // 必须为 true：false 会在 Client Info PDU 里置 INFO_NOAUDIOPLAYBACK，按 MS-RDPBCGR
+        // 2.2.1.11.1.1 服务器「MUST NOT」做音频重定向——RDPSND 通道挂着也收不到一个样本。
+        // 这里曾写着 `false, // 阶段 3（RDPSND）再开`：阶段 3 交付了通道与播放，这个开关
+        // 却没人翻，音频在真 Windows 上是哑的（xrdp itest 不覆盖音频，没人撞见）。
+        // 1.0.0 候选复查时发现（2026-09-29）；守卫见本文件 tests 的 audio_is_requested。
+        enable_audio_playback: true,
         performance_flags: Default::default(),
         license_cache: None,
         timezone_info: Default::default(),
@@ -1138,6 +1143,25 @@ fn map_connector_error(e: ironrdp_connector::ConnectorError) -> Fail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 挂了 RDPSND 通道就必须向服务器**要**音频：`enable_audio_playback = false`
+    /// 会置 INFO_NOAUDIOPLAYBACK，服务器据此完全不做音频重定向，播放链路全程空转。
+    #[test]
+    fn audio_is_requested_because_rdpsnd_is_attached() {
+        let cfg = build_config(&ConnectParams {
+            server_name: "h".into(),
+            username: "u".into(),
+            domain: String::new(),
+            password: "p".into(),
+            width: 800,
+            height: 600,
+            keyboard_layout: 0,
+        });
+        assert!(
+            cfg.enable_audio_playback,
+            "RDPSND 已挂载，却告诉服务器不要音频"
+        );
+    }
 
     /// 帧级背压的配额记账（2026-08-27 用户实测：动态画面把界面卡死到
     /// 连关闭连接都点不动，根因是帧流没有任何背压）。

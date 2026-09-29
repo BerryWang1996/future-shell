@@ -77,8 +77,8 @@ while IFS= read -r line; do
 done < "$DOC"
 
 [[ $rows -ge $MIN_ROWS ]] ||
-  fail "只解析出 $rows 行自查线（下限 $MIN_ROWS）——解析器可能被改坏，这个检查被做空了"
+  fail "只解析出 $rows 行自查线（下限 ${MIN_ROWS}）——解析器可能被改坏，这个检查被做空了"
 [[ $checked -ge $MIN_ROWS ]] ||
-  fail "只核对了 $checked 个阈值常量（下限 $MIN_ROWS）——表格里的常量列可能被清空了"
+  fail "只核对了 $checked 个阈值常量（下限 ${MIN_ROWS}）——表格里的常量列可能被清空了"
 
-echo "perf-gate 对齐：$rows 行自查线、$checked 个阈值常量与 $SRC 逐一对上（下限 $MIN_ROWS）"
+echo "perf-gate 对齐：$rows 行自查线、$checked 个阈值常量与 $SRC 逐一对上（下限 ${MIN_ROWS}）"

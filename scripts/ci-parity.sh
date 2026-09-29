@@ -32,9 +32,10 @@ GATES=(
   "cargo test --manifest-path rdp-helper/Cargo.toml"
   "node .github/scripts/check-version-consistency.mjs"
   "node scripts/check-doc-links.mjs"
+  "node scripts/check-shell-portability.mjs"
 )
 # 做空防护：门禁条数不得低于此。加门禁时同步上调，删门禁时会在这里绊一下。
-MIN_GATES=11
+MIN_GATES=12
 
 fail() { echo "CI 对齐失败：$*" >&2; exit 1; }
 
@@ -42,7 +43,7 @@ fail() { echo "CI 对齐失败：$*" >&2; exit 1; }
 [[ -f "$LOCAL" ]] || fail "找不到 $LOCAL"
 
 [[ ${#GATES[@]} -ge $MIN_GATES ]] ||
-  fail "门禁清单只剩 ${#GATES[@]} 条（下限 $MIN_GATES）——这个检查被做空了"
+  fail "门禁清单只剩 ${#GATES[@]} 条（下限 ${MIN_GATES}）——这个检查被做空了"
 
 missing_ci=()
 missing_local=()
@@ -66,4 +67,4 @@ if [[ ${#missing_local[@]} -gt 0 ]]; then
   fail "这些门禁 CI 会跑但 $LOCAL 不跑（本地全绿不再意味着 CI 会绿）：${missing_local[*]}"
 fi
 
-echo "CI 对齐：${#GATES[@]} 条门禁在 $CI 与 $LOCAL 两侧都在（下限 $MIN_GATES）"
+echo "CI 对齐：${#GATES[@]} 条门禁在 $CI 与 $LOCAL 两侧都在（下限 ${MIN_GATES}）"

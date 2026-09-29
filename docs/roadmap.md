@@ -72,7 +72,17 @@
 - **不含**：任何功能代码；前端骨架（属 M1 计划 Task 17）。
 - **出口标准**：
   - [x] `cargo build --workspace` / `cargo nextest run --workspace` / `cargo clippy -- -D warnings` / `cargo fmt --check` / `cargo deny check licenses bans advisories` 全通过（`advisories` = 总设计 §6.2「advisory 漏洞库检查」的门禁载体，与 `deny.toml` 的 `[advisories]` 段对偶）；（判据：2026-08-23 本机全跑——build 绿、nextest 852/852、cargo test 零失败套件、clippy --workspace --all-targets 零问题、fmt 绿、deny advisories/bans/licenses 三项 ok）
-  - [!] CI 在 Windows/macOS/Linux 三 runner 全绿（至少一次真实运行记录；frontend job 因存在性门控跳过、日志可见门控判定）；**（阻塞：需推送 origin。用户已定「仅本地」，`origin/main` 仍停在 e72d906 Initial commit，三 runner 从未对本仓跑过一次。本地替代：`scripts/ci-local.sh` 镜像 check job、`scripts/linux-precheck.sh` 容器内跑 Linux 编译与 clippy——覆盖 26 处生产 cfg 站点中的 16 处，app 的 10 处需 Tauri Linux 全栈，未覆盖。macOS 一路无任何替代。不代签。）**
+  - [!] CI 在 Windows/macOS/Linux 三 runner 全绿（至少一次真实运行记录；frontend job 因存在性门控跳过、日志可见门控判定）；
+        **首次真实运行（2026-09-05，run 33942316287，候选分支）：windows-2025 全绿，另三处红**——
+        ① ubuntu clippy：`crates/serial/tests/pty.rs` 等链接超时 panic 的路径上子进程不回收
+        （`zombie_processes`；文件 `cfg(unix)`，Windows 上不编译）；② macos-14 死在 helper 构建：
+        macOS 自带 bash 3.2 把 `"$PROFILE，"` 的全角逗号读进变量名，`set -u` 当场退出（全仓 18 处同形）；
+        ③ frontend：runner 为 UTC，两条测试把被测函数刻意归一的 +0 与 `-0` 比较。
+        **2026-09-29 已全部修复**，并补两件防再犯：`scripts/check-shell-portability.mjs`（进 CI docs-gates
+        与 ci-local）、`scripts/linux-ci-mirror.sh`（容器里按 ci.yml 原顺序跑 ubuntu check 作业，含 Tauri
+        Linux 全栈与 app crate——补上 linux-precheck 不覆盖的 10 处）。镜像实跑：fmt/clippy 双工作区、
+        nextest 1657/1657、cargo test 全绿；它当场抓到一条只在 Linux 红的测试（RDPDR 联接逃逸测试用了
+        Windows 的 `mklink`），已改为跨平台。**仍 `[!]`**：要等修复推送后三 runner 的真实运行记录。不代签。
   - [x] 8 个 crate 按 §3 命名公约命名（包/lib `fs_<name>` 下划线、目录 `crates/<name>` 无前缀）并与总设计 §1 一一对应（去前缀对应）。（判据：`crates/{vault,connmgr,sshengine,terminal,policy,ai,mcpbridge,audit}` 八目录去前缀与总设计 §1 一一对应，包名逐一为 `fs_<name>`；另有 `crates/itest`（`fs_itest`）属实现计划、不在 §1 八个之列，README 命名公约节已注明）
   - [x] README/CONTRIBUTING/目录说明齐备（与已审定计划 Task 1 Step 6 内容逐项一致：clone 即构建流程与 `cargo nextest`/clippy/deny 命令、依赖前置 Rust stable ≥1.94/Node 24/可选 Docker、`FS_ITEST` 环境闸（仅 Linux runner）与 `FS_PERF` 手动/夜间触发不进 PR 闸的语义说明、8 crate 目录结构与 §3 命名公约说明、三平台 CI 矩阵说明）。（判据：README 覆盖构建流程/前置/命名公约/目录结构，CONTRIBUTING 覆盖门禁命令、许可证白名单、`FS_ITEST` 与性能两条线、三平台矩阵。核验中发现并修正一条虚假环境闸：CONTRIBUTING 原写「性能测试 `FS_PERF` 手动/夜间触发」而全仓零命中——照着跑一条性能测试都不会跑且输出是绿的。现由 `scripts/env-gate-parity.sh` 守着）
 - **风险**：russh 0.62.4 与平台工具链兼容 → M0 末做一次三平台 `cargo check -p fs_sshengine` 冒烟。
@@ -153,7 +163,8 @@
   - [x] Vault：keyring 路径 + Argon2 回退路径、篡改→Integrity、锁定后 secret 不可读；（判据：`crates/vault/tests/store.rs::a_locked_vault_leaves_no_plaintext_secret_on_disk` 磁盘侧 + `vault_cmd.rs` 解锁守卫完备性门禁 IPC 侧）
   - [x] 迁移：user_version 版本闸拒绝高版本库、迁移前自动备份；（判据：`crates/connmgr/tests/db.rs` 版本闸与迁移前备份两例）
   - [x] 断线自动重连（指数退避）+ 未关闭会话启动恢复（仅询问，不自动连）；（判据：`session_cmd.rs::next_reconnect_delay` 序列 1→2→4→8→16→30 两例 + 四条编译期区间断言）
-  - [!] 三平台安装包可构建（release.yml 草稿流程跑通，不发布）；**（阻塞：与 M0「三平台 CI 全绿」同一前置——`release.yml` 只在 push tag 时触发，需推送 origin，用户已定仅本地。本地能证的只有「配置存在且语法正确」，证不了「能构建出包」。不代签。）**
+  - [!] 三平台安装包可构建（release.yml 草稿流程跑通，不发布）；**（本机已构建 Windows MSI/NSIS 并两次提取启动通过（2026-09-05）；
+        三平台要 `workflow_dispatch` 在 GitHub runner 上跑一次。前置同上：修复推送后执行。不代签。）**
   - [x] audit 表迁移落地：字段与总设计 §6.2 对齐，append-only（触发器禁 UPDATE/DELETE）+ hash 链列就位；（判据：`crates/connmgr/tests/db.rs::migrations_create_all_tables_and_audit_triggers` 与 `audit_table_is_append_only`）
   - [x] 输出提醒：会话收到 BEL/`\a` 后标签出现橙色铃铛角标，切回该标签或手动清除后消失（E2E 或单测覆盖）；（判据：`lib/bell-badge.test.ts` 分四跳取证 + `TerminalPane.test.ts` 的 handler→store 那一跳）
   - [x] 组合命令栏当前会话发送（§2.6）：Enter 发送附后缀（CR/LF/CRLF 选择器生效）达活动会话并回显执行、Ctrl+Enter 不附后缀、↑/↓ 走历史、无活动会话出 Toast 且不发 IPC（手工核验留痕，留痕方式同本清单中键条款）；（判据：`ComposeBar.test.ts` 8 例覆盖 Enter/后缀三档/Ctrl+Enter/↑↓ 历史 + `sendCompose` 空目标短路的源码顺序断言）
@@ -947,6 +958,12 @@
         （后者我那份漏了），还附带「豁免项指向的文件必须真的存在」的做空防护。
   - [~] 签名链路：Windows 至少一路在 release.yml 真实签名（CI 内自签证书可接受）并记录步骤；macOS 公证链路在 release.yml 走通 + 成本/周期评估记录入附录
         → 评估结论见本文件 §6.4。
+        **维护者裁定（2026-09-29）：开源项目不购买商业签名证书（Windows 与 Apple 均不买），
+        1.0.0 允许未签名发布。** 实现：仓库变量 `ALLOW_UNSIGNED_RELEASE=true`（Variables，
+        不是 Secrets）时 tag 构建在缺证书平台警告放行，否则仍在签名闸失败；macOS 无证书时
+        打 ad-hoc 签名（Apple Silicon 拒绝运行完全无签名的代码且不给放行入口）；draft Release
+        正文自动写明未签名平台、`sha256sum -c` 与 `gh attestation verify` 两种核对方法和
+        SmartScreen / Gatekeeper 放行步骤。Windows 自签演练链路保持不变（仍在非 tag 构建上跑）。
         **Windows 自签演练已写进 release.yml 并接完**（出口原文：CI 内自签证书可接受）：
         非 tag 且无 secret 时现场 `New-SelfSignedCertificate`，走**完全相同**的链路
         （拼 certificateThumbprint → 打包签名 → signtool /pa 验证）。

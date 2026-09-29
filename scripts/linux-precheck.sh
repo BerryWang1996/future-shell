@@ -96,7 +96,7 @@ main() {
   script+=" echo '== 单元测试（Linux）==';"
   script+=" $(step "cargo test ${CRATES[*]} --target-dir /tmp/tgt")"
 
-  echo "== 在 Linux 容器里预检（挂载：$win）=="
+  echo "== 在 Linux 容器里预检（挂载：${win}）=="
   MSYS_NO_PATHCONV=1 docker run --rm -v "${win}:/src:ro" "$IMAGE" bash -c "$script"
 
   cat <<'COVERAGE'
