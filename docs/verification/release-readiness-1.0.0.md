@@ -163,6 +163,11 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    通过；macOS 两个架构的应用本体编译完成，打包签名时失败：`security import` 报
    SecKeychainItemImport 参数无效。secret 未配置时 `APPLE_CERTIFICATE` 等展开为空串，Tauri 判的是
    「变量存在」而非「非空」，拿空证书去导入钥匙串。PR #4 改为调用前 unset 空值变量，走 ad-hoc 签名。
+5. **run 36697677719**（含 unset 修复）：五个关卡一次全绿，**三平台安装包全部构建成功**；macOS 的
+   DMG 安装、启动、覆盖重装、卸载 smoke 通过。Windows / Linux smoke 失败，同一根因：产物上传了两个
+   路径（msi + nsis、deb + AppImage），下载后按公共父目录保留子目录（`artifacts/msi/…`），smoke 却只在
+   `artifacts/` 根下找。Windows 上拿到空值后 `msiexec /i ""` 静默什么都不装，错误拖到「安装后目录不存在」
+   才冒出。PR #4 改为三平台都递归查找、找不到即报错，并检查 msiexec 的退出码（此前三次调用都不看）。
 
 ## 正式发版前仍需完成
 

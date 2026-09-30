@@ -610,22 +610,32 @@ jobs:
             Write-Host "launch smoke 通过：$($exe.FullName)"
           }
 
-          $msi = Get-ChildItem artifacts -Filter *.msi | Select-Object -First 1
-          $nsis = Get-ChildItem artifacts -Filter *.exe | Select-Object -First 1
+          # 产物按上传时的公共父目录保留子目录（artifacts/msi/…、artifacts/nsis/…），必须递归找。
+          # 不递归时拿到的是空值，msiexec /i "" 静默什么都不装，错误要拖到「目录不存在」才冒出来
+          #（2026-09-30 试跑）。找不到就当场报。
+          $msi = Get-ChildItem artifacts -Filter *.msi -Recurse | Select-Object -First 1
+          $nsis = Get-ChildItem artifacts -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $msi) { throw "artifacts 里找不到 .msi" }
+          if (-not $nsis) { throw "artifacts 里找不到 NSIS 安装器（.exe）" }
+
+          # msiexec 失败不抛异常，只有退出码（3010 = 成功但需重启）
+          function Invoke-Msiexec([string[]] $argv, [string] $log) {
+            $p = Start-Process msiexec -ArgumentList ($argv + @('/qn', '/norestart', '/l*v', $log)) -Wait -PassThru
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "msiexec $($argv[0]) 退出码 $($p.ExitCode)，日志：$log" }
+          }
 
           Write-Host "== MSI 安装 =="
-          $msiLog = Join-Path $env:RUNNER_TEMP 'msi-install.log'
-          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', $msiLog -Wait
+          Invoke-Msiexec @('/i', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-install.log')
           if (-not (Test-Path $installDir)) { throw "MSI 安装后目录不存在" }
           Invoke-SmokeLaunch
 
           Write-Host "== MSI 覆盖重装（同版本 reinstall）=="
-          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-reinstall.log" -Wait
+          Invoke-Msiexec @('/i', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-reinstall.log')
           if (-not (Test-Path $installDir)) { throw "MSI 重装后目录不存在" }
           Invoke-SmokeLaunch
 
           Write-Host "== MSI 卸载 =="
-          Start-Process msiexec -ArgumentList '/x', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-uninstall.log" -Wait
+          Invoke-Msiexec @('/x', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-uninstall.log')
           if (Test-Path $installDir) { throw "MSI 卸载后安装目录仍在" }
 
           Write-Host "== NSIS 静默安装 =="
@@ -646,7 +656,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DMG=$(ls artifacts/*.dmg | head -1)
+          # 递归找并判空，与 Windows / Linux 同口径（产物可能带子目录）
+          DMG=$(find artifacts -type f -name '*.dmg' | head -1)
+          [ -n "${DMG}" ] || { echo "::error::artifacts 里找不到 .dmg"; ls -R artifacts; exit 1; }
           MNT=/tmp/futureshell-smoke
           mkdir -p "$MNT"
           hdiutil attach "$DMG" -nobrowse -mountpoint "$MNT"
@@ -696,7 +708,10 @@ jobs:
             echo "launch smoke 通过：$1"
           }
 
-          DEB=$(ls artifacts/*.deb | head -1)
+          # 产物按上传时的公共父目录保留子目录（artifacts/deb/…、artifacts/appimage/…），必须递归找
+          #（2026-09-30 试跑：`ls artifacts/*.deb` 找不到）。
+          DEB=$(find artifacts -type f -name '*.deb' | head -1)
+          [ -n "${DEB}" ] || { echo "::error::artifacts 里找不到 .deb"; ls -R artifacts; exit 1; }
           PKG=$(dpkg-deb -f "$DEB" Package)
 
           echo "== deb 安装 =="
@@ -716,7 +731,8 @@ jobs:
           [ ! -e "$BIN" ] || { echo "::error::卸载后二进制仍在：$BIN"; exit 1; }
 
           echo "== AppImage（无安装面：extract-and-run 即「安装」，删除即「卸载」）=="
-          APPIMAGE=$(ls artifacts/*.AppImage | head -1)
+          APPIMAGE=$(find artifacts -type f -name '*.AppImage' | head -1)
+          [ -n "${APPIMAGE}" ] || { echo "::error::artifacts 里找不到 .AppImage"; ls -R artifacts; exit 1; }
           chmod +x "$APPIMAGE"
           APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 xvfb-run -a "$APPIMAGE" --smoke-exit-ms 20000
           rm -f "$APPIMAGE"
