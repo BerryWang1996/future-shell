@@ -7,7 +7,8 @@
 
 设置 `FS_ITEST=1` 后，下列测试在 Linux 容器中实际执行：
 
-- `crates/itest/tests/scale.rs`：千级目录、多文件往返、64 MiB 双向传输及合计吞吐 ≥20 MB/s。
+- `crates/itest/tests/scale.rs`：千级目录、多文件往返、64 MiB 双向传输及合计吞吐 ≥20 MB/s
+  （1.0.1 起走产品的传输路径 `TransferManager`，不再测逐块读写调用）。
 - `crates/itest/tests/render_pipeline.rs`：200 MB 数据零丢失、渲染队列水位、
   本地连接到可交互 <2s、100 并发会话后端内存预算和 PTY 全屏 TUI。
 

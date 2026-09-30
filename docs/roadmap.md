@@ -1886,7 +1886,12 @@
     交替 5 轮，8 MiB 窗口在 25 ms 下把下载从 8.2 提到 14.0 MB/s，Nagle 开关则无差别。**未采纳**：russh 的窗口是会话级配置，终端通道会一起变大，
     Ctrl-C 之后要排空的在途输出从 2 MiB 变成 8 MiB；逐通道设置 russh 不支持（补窗目标是会话级
     字段）。可行方向：SFTP 走独立连接，或给 russh 提逐通道窗口。
-- **范围外**：`scale.rs` 的回环门禁不变；延迟对比依赖 netem 与 OpenSSH 客户端，不进 CI。
+  - [x] 回环吞吐门禁改测产品路径。（判据：`scale.rs` 的 `large_file_roundtrip_integrity_and_throughput`
+    改为 `TransferManager` + 生产组装 `TimedSftp(RemoteSftp)`，门槛仍是合计 ≥20 MB/s、仍逐字节比对。
+    旧口径测逐块 `write_at` / `read_range`——1.0.0 时那就是产品的切法，1.0.1 之后不是了。同日 main 上
+    发布试跑里旧口径在 ubuntu runner 测得 19.3 MB/s，压线；新口径本机三次 100.5–113.5 MB/s。
+    门槛临时改成 1000 时用例转红）
+- **范围外**：延迟对比依赖 netem 与 OpenSSH 客户端，不进 CI。
 
 ---
 

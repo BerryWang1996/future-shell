@@ -18,11 +18,18 @@
 //!   ② 分块 256 KiB 被 OpenSSH 的 261 120 字节读写上限切成两个请求，下行每块多一次往返
 //!   （对齐到 255 KiB 后下行 13–15 → 18–20 MB/s）。剩下的差距在每块一次 OPEN/CLOSE 往返，
 //!   要跨块复用句柄，属结构改动，留在 1.0.0 之后。
+//!
+//!   **1.0.1**：跨块复用句柄已做（上传流水线写入器、下载并发窗口 + 读句柄复用），产品的传输
+//!   路径从此是 `TransferManager`，不再是逐块 `write_at` / `read_range`。吞吐用例随之改测
+//!   产品路径（生产组装 `TimedSftp(RemoteSftp)`）。同一天 main 上的发布试跑里，逐块口径在
+//!   ubuntu runner 上测得 19.3 MB/s——恰好压在闸线上，时过时不过。
 //!   其余上限类断言（冷启动、内存）仍留在 perf.rs 的自查线：共享 runner 上测那些只会制造噪声。
 //!
 //! 与 perf.rs 同口径：需 `FS_ITEST=1` + Docker，未设时打印 skip 并返回。
 use fs_itest::sshd::SshdContainer;
 use fs_sshengine::sftp::{Entry, RemoteSftp, SftpOps};
+use fs_sshengine::timeouts::TimedSftp;
+use fs_sshengine::transfer::{Direction, TransferJob, TransferManager, TransferState};
 use russh::client;
 use std::sync::Arc;
 use std::time::Instant;
@@ -130,70 +137,59 @@ async fn three_hundred_small_files_roundtrip_integrity() {
 /// ——出口那半句没有任何断言背书。而且整个计时区间里夹着 256 次 `assert_eq!` 逐块比对，
 /// 算出来的「吞吐」含比对开销，本身也不是可引用的数字。
 ///
-/// 现在分三段：写、读、比对。**只有写与读进计时**，比对挪到计时之外；
-/// 上下行各自算速率并各自设闸——单向瓶颈（比如只有上传走了并发窗口）在合并口径下会被
-/// 另一向的富余掩盖掉。
+/// 现在分三段：上传、下载、比对。**只有两次传输进计时**，比对挪到计时之外。
 ///
-/// 闸值取 20 MB/s（十进制，与出口原文同口径）。这不是拍脑袋的余量：本机
-/// Windows + Docker Desktop（容器网络最慢的一档，Linux 原生 Docker 只会更快）
-/// 实测双向合计 ≈27 MiB/s。闸设在实测值之下但仍是出口要求的那个数——
-/// 若哪天共享 runner 上稳定跑不到，正确的动作是**如实记录并调整出口标准**，
-/// 而不是把闸悄悄降到零。
+/// **测的是产品路径**（1.0.1 起）：`TransferManager` + 生产组装 `TimedSftp(RemoteSftp)`，
+/// 即用户点「上传 / 下载」时走的那一条——临时件、身份记录、提交前落盘与改名全在计时里。
+/// 1.0.0 时这里测逐块 `write_at` / `read_range`，那时它就是产品的切法；1.0.1 之后产品
+/// 改走流水线，再测逐块调用就是「另写一个数」。
+///
+/// 闸值取 20 MB/s（十进制，与出口原文同口径）。若哪天共享 runner 上稳定跑不到，正确的动作
+/// 是**如实记录并调整出口标准**，而不是把闸悄悄降到零。
 #[tokio::test(flavor = "multi_thread")]
 async fn large_file_roundtrip_integrity_and_throughput() {
     if std::env::var("FS_ITEST").is_err() {
         eprintln!("skip: set FS_ITEST=1");
         return;
     }
-    // 与传输引擎同一个分块（255 KiB，见 `fs_sshengine::transfer::CHUNK` 的说明）：
-    // 这条用例是「SFTP ≥20 MB/s」的载体，测的必须是产品实际的切法，而不是另写一个数。
     const CHUNK: usize = fs_sshengine::transfer::CHUNK;
-    const N: u64 = 256; // 64 MiB
+    const N: u64 = 256; // 64 MiB 量级
     const TOTAL: f64 = (CHUNK as u64 * N) as f64;
     /// 出口标准原文的数字（十进制 MB/s）。
     const MIN_MB_PER_SEC: f64 = 20.0;
 
     let (_sshd, sftp) = open_sftp("scale-large").await;
+    let ops: Arc<dyn SftpOps> = Arc::new(TimedSftp::new(Arc::new(sftp)));
+    let mgr = TransferManager::spawn(ops.clone(), 1);
+    let mut ev = mgr.events().await;
+    let dir = tempfile::tempdir().unwrap();
 
     // ⓪ 预热（不计时）：容器刚起来时首批往返要付 sshd 冷启动、SFTP 子系统拉起、
     // 页缓存未命中的账。出口标准问的是稳态吞吐，不是冷启动——把这笔账算进去，
     // 测出来的数字会随宿主当时的调度抖三倍（实测同一台机器 18.5～53.4 MB/s）。
-    for i in 0..8u64 {
-        let data = chunk(0xBEEF, i, CHUNK);
-        sftp.write_at("warmup.bin", i * CHUNK as u64, &data)
-            .await
-            .unwrap();
-        sftp.read_range("warmup.bin", i * CHUNK as u64, CHUNK)
-            .await
-            .unwrap();
-    }
+    let warm: Vec<u8> = (0..8u64).flat_map(|i| chunk(0xBEEF, i, CHUNK)).collect();
+    let warm_src = dir.path().join("warmup.bin");
+    std::fs::write(&warm_src, &warm).unwrap();
+    run(&mgr, &mut ev, job(Direction::Up, warm_src, "warmup.bin")).await;
+    let warm_back = dir.path().join("warm-back").join("warmup.bin");
+    std::fs::create_dir_all(warm_back.parent().unwrap()).unwrap();
+    run(&mgr, &mut ev, job(Direction::Down, warm_back, "warmup.bin")).await;
 
-    // ① 上行：只计传输
-    let t_up = Instant::now();
-    for i in 0..N {
-        let data = chunk(0xC0FFEE, i, CHUNK);
-        sftp.write_at("big.bin", i * CHUNK as u64, &data)
-            .await
-            .unwrap();
-    }
-    let up = t_up.elapsed();
+    let payload: Vec<u8> = (0..N).flat_map(|i| chunk(0xC0FFEE, i, CHUNK)).collect();
+    let src = dir.path().join("big.bin");
+    std::fs::write(&src, &payload).unwrap();
+    let dest = dir.path().join("down").join("big.bin");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
 
-    // ② 下行：只计传输，比对留到计时之外
-    let t_down = Instant::now();
-    let mut got_all = Vec::with_capacity(N as usize);
-    for i in 0..N {
-        got_all.push(
-            sftp.read_range("big.bin", i * CHUNK as u64, CHUNK)
-                .await
-                .unwrap(),
-        );
-    }
-    let down = t_down.elapsed();
+    // ① 上行、② 下行：各自一件完整的传输
+    let up = run(&mgr, &mut ev, job(Direction::Up, src, "big.bin")).await;
+    let down = run(&mgr, &mut ev, job(Direction::Down, dest.clone(), "big.bin")).await;
 
-    // ③ 比对（不计时）：逐块逐字节
-    for (i, got) in got_all.iter().enumerate() {
-        assert_eq!(got.len(), CHUNK, "块 {i} 长度不符");
-        assert_eq!(*got, chunk(0xC0FFEE, i as u64, CHUNK), "块 {i} 内容不符");
+    // ③ 比对（不计时）：下载回来的文件逐字节等于源
+    let got = std::fs::read(&dest).unwrap();
+    assert_eq!(got.len(), payload.len(), "下载回来的长度不符");
+    if let Some(i) = got.iter().zip(&payload).position(|(a, b)| a != b) {
+        panic!("下载回来的内容在偏移 {i} 处与源不符");
     }
 
     let up_mbps = TOTAL / 1e6 / up.as_secs_f64();
@@ -213,7 +209,7 @@ async fn large_file_roundtrip_integrity_and_throughput() {
     assert!(
         total_mbps >= MIN_MB_PER_SEC,
         "SFTP 合计吞吐 {total_mbps:.1} MB/s 低于出口标准 {MIN_MB_PER_SEC} MB/s\
-         （上行 {up:?} / 下行 {down:?}）。定闸时（2026-08-23）本机 24.1–34.4 MB/s；\n         2026-09-30 修掉逐块 fsync 与分块错位后，本机（环境已变慢）17.8–21.9 MB/s。\n         跌破即两种可能：真实回归，或环境比定闸时慢一个档——\n         后者的正确动作是如实记录并重估出口标准，不是把闸调低"
+         （上行 {up:?} / 下行 {down:?}）。1.0.0 的逐块口径在 ubuntu runner 上 19.3–22 MB/s；\n         1.0.1 改测产品路径（流水线）。跌破即两种可能：真实回归，或环境比定闸时慢一个档——\n         后者的正确动作是如实记录并重估出口标准，不是把闸调低"
     );
     // 这里**不再**加单向闸。原本写了一条 5 MB/s 的「病态闸」防「一向塌了、另一向富余」，
     // 变异验证时发现它**永远不可能触发**——合计闸已经蕴含了单向下界：
@@ -222,6 +218,46 @@ async fn large_file_roundtrip_integrity_and_throughput() {
     // 即：任何能过合计闸的跑法，两个方向都已经 ≥10 MB/s。要让单向闸可触发就得把它
     // 抬到 10 以上，那又退回成前面测过的那个抖 2.7 倍的口径。留一条永不可能红的断言，
     // 比没有断言更坏：它会被当成一层防护。
+}
+
+fn job(direction: Direction, local: std::path::PathBuf, remote: &str) -> TransferJob {
+    TransferJob {
+        direction,
+        sandbox_root: match direction {
+            Direction::Up => None,
+            Direction::Down => local.parent().map(|p| p.to_path_buf()),
+        },
+        local,
+        remote: remote.into(),
+        resume: false,
+        target_endpoint: "scale".into(),
+        endpoint_aliases: Vec::new(),
+        verify: None,
+    }
+}
+
+/// 跑一件传输到终态并返回耗时；失败直接 panic（吞吐门禁不吞错）。
+async fn run(
+    mgr: &TransferManager,
+    ev: &mut tokio::sync::mpsc::Receiver<fs_sshengine::transfer::TransferEvent>,
+    job: TransferJob,
+) -> std::time::Duration {
+    let t = Instant::now();
+    let id = mgr.submit(job).await.expect("submit");
+    loop {
+        let e = tokio::time::timeout(std::time::Duration::from_secs(300), ev.recv())
+            .await
+            .expect("300 s 内没等到下一条传输事件")
+            .expect("事件通道关闭");
+        if e.id != id {
+            continue;
+        }
+        match e.state {
+            TransferState::Done => return t.elapsed(),
+            TransferState::Running | TransferState::Retrying { .. } => {}
+            other => panic!("传输未成功：{other:?}"),
+        }
+    }
 }
 
 /// 列表条目的字段完整性抽查：千级目录里随便挑几个，名字/目录位/大小都得对——
