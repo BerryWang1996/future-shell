@@ -1391,13 +1391,12 @@ async fn exec_once(
     cancelled: &AtomicBool,
     offset: &mut u64,
 ) -> Result<Attempt, crate::Error> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    use tokio::io::AsyncSeekExt;
     // 本地句柄在循环**外**开一次并 seek 一次。原实现每 256 KiB 就重开 + 重 seek：
     // 1 GiB 文件 = 4096 次 CreateFileW，Windows 上每次都要过一遍 Defender 过滤驱动（S45）。
     // 且一律走 `tokio::fs`：`std::fs` 的同步 read/write 会阻塞 tokio 工作线程，并发传输
     // 占满工作线程时连 SSH 会话自身的 I/O 任务都会挨饿（keepalive 超时 → 传输中途断线）；
     // 本 crate 其余处（verify.rs）早已是 tokio::fs，此处曾是唯一例外（S44）。
-    let remote_target = remote_part(&job.remote);
     let mut file = match job.direction {
         Direction::Up => tokio::fs::File::open(local).await?,
         Direction::Down => {
@@ -1435,82 +1434,261 @@ async fn exec_once(
         }
     }
     file.seek(std::io::SeekFrom::Start(*offset)).await?;
+    match job.direction {
+        Direction::Up => upload_loop(id, job, local, ops, total, ev, cancelled, offset, file).await,
+        Direction::Down => download_loop(id, job, ops, total, ev, cancelled, offset, file).await,
+    }
+}
+
+/// 取消的收尾（两个方向共用）：本地句柄收好，发 Cancelled 终态。
+///
+/// 临时件**保留**：取消不等于放弃，用户下次带 resume 即从这里续跑；而最终目标
+/// 全程未被触碰，所以「取消」对用户已有的文件零影响。失败路径同理。
+async fn cancel_out(
+    id: TransferId,
+    direction: Direction,
+    file: tokio::fs::File,
+    ev: &mpsc::Sender<TransferEvent>,
+    done: u64,
+    total: u64,
+) -> Result<Attempt, crate::Error> {
+    finish_local_file(file, direction).await?;
+    let _ = ev
+        .send(TransferEvent {
+            id,
+            bytes_done: done,
+            bytes_total: total,
+            state: TransferState::Cancelled,
+        })
+        .await;
+    Ok(Attempt::Cancelled)
+}
+
+/// 上传：一个写入器（同一远端句柄上最多 `sftp::WRITE_PIPELINE` 个写请求在途，1.0.1）。
+///
+/// # 两个游标
+///
+/// - `queued`：已经交给写入器的字节（进度条显示它，也决定下一块从本地哪里读）；
+/// - `*offset`：**已确认**写到服务端的字节下界（写入器的 `confirmed`）。失败重试与续传
+///   只认这一个：拿 `queued` 当断点，失败后就会从服务端其实没收到的位置续写，留下空洞。
+///
+/// 失败时远端可能还落下了一截「已发出、未确认」的数据，这截数据本身是连续的（同一句柄、
+/// 顺序写、服务端按序处理），但为了让远端大小严格等于断点，仍尽力把临时件截回 `*offset`。
+/// 截断失败（多半是连接已断）无妨：同一件传输的重试会从 `*offset` 覆盖写过去，跨进程的
+/// 续传以远端大小为断点，而那仍是一个连续前缀。
+#[allow(clippy::too_many_arguments)]
+async fn upload_loop(
+    id: TransferId,
+    job: &TransferJob,
+    local: &Path,
+    ops: &Arc<dyn SftpOps>,
+    total: u64,
+    ev: &mpsc::Sender<TransferEvent>,
+    cancelled: &AtomicBool,
+    offset: &mut u64,
+    mut file: tokio::fs::File,
+) -> Result<Attempt, crate::Error> {
+    use tokio::io::AsyncReadExt;
+    let remote_target = remote_part(&job.remote);
+    let mut writer: Option<Box<dyn crate::sftp::RemoteWriter + '_>> = None;
+    let mut queued = *offset;
     loop {
-        // 用户单件取消检查（per-id AtomicBool，TransferManager::cancel / cancel_all 置位）：
-        // 命中即发 Cancelled 终态事件并 return
+        // 用户单件取消检查（per-id AtomicBool，TransferManager::cancel / cancel_all 置位）
         if cancelled.load(Ordering::SeqCst) {
-            finish_local_file(file, job.direction).await?;
-            // 临时件**保留**：取消不等于放弃，用户下次带 resume 即从这里续跑；而最终目标
-            // 全程未被触碰，所以「取消」对用户已有的文件零影响。失败路径同理。
-            let _ = ev
-                .send(TransferEvent {
-                    id,
-                    bytes_done: *offset,
-                    bytes_total: total,
-                    state: TransferState::Cancelled,
-                })
-                .await;
-            return Ok(Attempt::Cancelled);
+            if let Some(w) = &writer {
+                *offset = w.confirmed();
+            }
+            drop(writer);
+            return cancel_out(id, job.direction, file, ev, *offset, total).await;
         }
-        // 本轮还该读多少（审计2 #15）。**按 `total - offset` 夹取**，而不是每次都读满 CHUNK。
+        // 本轮还该读多少（审计2 #15）。**按 `total - queued` 夹取**，而不是每次都读满 CHUNK。
         //
         // 不夹取时，源文件在传输途中变长会让循环一路跟着新数据往下跑，直到源停止增长才停；
         // 得到的文件比开工时量到的 `total` 长，进度条冲过 100%，事后校验必然 Mismatch——
-        // 而一个还在被追加的日志/数据库正是最常见的下载对象，这不是边角情况。夹取之后，
+        // 而一个还在被追加的日志/数据库正是最常见的传输对象，这不是边角情况。夹取之后，
         // 传的永远是「开工那一刻的前 total 字节」这样一个定义清晰的快照：长度确定、
         // 与开工时算好的期望哈希对得上、可续传、可复现。
         //
-        // 夹到 0 即「该传的都传完了」，这也顺带成了两个方向唯一的正常完成出口——
-        // 比原先「读到空块 + 事后补判 offset >= total」少一层推断。
-        let want = total.saturating_sub(*offset).min(CHUNK as u64) as usize;
+        // 夹到 0 即「该传的都传完了」，这也是唯一的正常完成出口。
+        let want = total.saturating_sub(queued).min(CHUNK as u64) as usize;
         if want == 0 {
+            if let Some(w) = writer.take() {
+                let floor = w.confirmed();
+                if let Err(e) = w.finish().await {
+                    *offset = floor;
+                    if floor < queued {
+                        let _ = ops.truncate(&remote_target, floor).await;
+                    }
+                    finish_local_file(file, job.direction).await?;
+                    return Err(e);
+                }
+            }
+            *offset = queued; // 写入器已等齐全部确认
             finish_local_file(file, job.direction).await?;
             return Ok(Attempt::Completed);
         }
-        match job.direction {
-            Direction::Up => {
-                // 填满整块再发：`read` 允许短读，逐次短读会把一次 256 KiB 的 SFTP 写
-                // 打散成多次小写，白白多花往返。`filled == 0` 即 EOF。
-                let mut buf = vec![0u8; want];
-                let mut filled = 0usize;
-                while filled < want {
-                    let n = file.read(&mut buf[filled..]).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    filled += n;
-                }
-                if filled == 0 {
-                    finish_local_file(file, job.direction).await?;
-                    // 与下载侧对称（审计 P1-6）：还没读满开工时量到的长度就到了 EOF，说明源文件
-                    // 在传输途中被人改短了。此时提交上去的是个残缺文件，且长度信息已经对不上，
-                    // 续传也修不回来——宁可报错让用户重来。
-                    // （`*offset < total` 在此处必然成立：等于时上面 `want == 0` 已经返回。）
-                    return Err(crate::Error::Transfer(format!(
-                        "本地源文件在传输途中变短：已读 {offset}/{total} 字节（{}）",
-                        local.display()
-                    )));
-                }
-                buf.truncate(filled);
-                ops.write_at(&remote_target, *offset, &buf).await?;
-                *offset += filled as u64;
+        // 填满整块再发：`read` 允许短读，逐次短读会把一次整块的 SFTP 写打散成多次小写，
+        // 白白多花往返。`filled == 0` 即 EOF。
+        let mut buf = vec![0u8; want];
+        let mut filled = 0usize;
+        while filled < want {
+            let n = file.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                break;
             }
-            Direction::Down => {
-                use tokio::io::AsyncWriteExt;
-                let buf = ops.read_range(&job.remote, *offset, want).await?;
-                if buf.is_empty() {
-                    // 走到这里 `*offset < total` 必然成立（等于时 `want == 0` 已经返回），
-                    // 故空块在此一律是异常：服务端半途返回空包（连接半断、文件被别人截短、
-                    // 服务端限流返回 0 长度）。原实现无条件当 EOF，于是一个残缺文件会被判 Done
-                    // 并提交上去，用户毫不知情（审计 P1-6）。
-                    return Err(crate::Error::Transfer(format!(
-                        "远端提前返回空块：已收 {offset}/{total} 字节（{}）——疑似服务端截断或连接半断",
-                        job.remote
-                    )));
-                }
-                file.write_all(&buf).await?;
-                *offset += buf.len() as u64;
+            filled += n;
+        }
+        if filled == 0 {
+            if let Some(w) = &writer {
+                *offset = w.confirmed();
             }
+            drop(writer);
+            finish_local_file(file, job.direction).await?;
+            // 与下载侧对称（审计 P1-6）：还没读满开工时量到的长度就到了 EOF，说明源文件
+            // 在传输途中被人改短了。此时提交上去的是个残缺文件，且长度信息已经对不上，
+            // 续传也修不回来——宁可报错让用户重来。
+            return Err(crate::Error::Transfer(format!(
+                "本地源文件在传输途中变短：已读 {queued}/{total} 字节（{}）",
+                local.display()
+            )));
+        }
+        buf.truncate(filled);
+        if writer.is_none() {
+            writer = Some(ops.open_writer(&remote_target, queued).await?);
+        }
+        let w = writer.as_mut().expect("刚刚打开");
+        if let Err(e) = w.write(&buf).await {
+            *offset = w.confirmed();
+            drop(writer);
+            if *offset < queued {
+                let _ = ops.truncate(&remote_target, *offset).await;
+            }
+            finish_local_file(file, job.direction).await?;
+            return Err(e);
+        }
+        queued += filled as u64;
+        *offset = w.confirmed();
+        let _ = ev
+            .send(TransferEvent {
+                id,
+                bytes_done: queued,
+                bytes_total: total,
+                state: TransferState::Running,
+            })
+            .await;
+    }
+}
+
+/// 下载窗口上限：同时在途的读请求数（1.0.1）。
+pub const READ_WINDOW_MAX: usize = 8;
+/// 一个读请求在这个时间内完成，窗口加一。
+const READ_FAST: std::time::Duration = std::time::Duration::from_secs(1);
+/// 一个读请求用了这么久才完成，窗口减半。
+const READ_SLOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 下载：窗口内并发发出读请求，**按偏移顺序**落盘（1.0.1）。
+///
+/// # 为什么窗口是自适应的
+///
+/// 排在窗口后面的请求要等前面的数据都传完才会被应答，而每次读都受
+/// `timeouts::DATA_TIMEOUT`（120 s）约束。固定 8 个在途的话，链路低于约 17 KB/s
+/// 第八个请求就会超时——那等于把 1.0.0 能用的卫星链路、2G 回落变成传不了。
+/// 所以从 1 起步：请求很快回来（≤ 1 s）就加一，慢了（≥ 5 s）就减半。快而远的链路
+/// 很快涨到上限、把往返时间藏起来；慢链路停在 1–2，行为与 1.0.0 的逐块顺序读相同。
+///
+/// # 读句柄复用
+///
+/// 每个在途的读占用一个读取器（[`SftpOps::open_reader`]），读完归还到空闲池，下一次读
+/// 直接复用：每块只剩一次 READ 往返，而逐块 `read_range` 要先 OPEN 再 READ。读取器在
+/// 请求自己的 future 里按需打开，窗口初次填满时不必串行等 8 次 OPEN；池子大小因此不超过
+/// 窗口达到过的最大值。读失败的读取器随结果一起丢弃，不再归还。
+///
+/// # 断点语义不变
+///
+/// 本地文件由我们按序写，`*offset` 始终是已落盘的连续前缀；某个请求失败时，排在它后面的
+/// 在途请求连同结果一起丢弃。
+#[allow(clippy::too_many_arguments)]
+async fn download_loop(
+    id: TransferId,
+    job: &TransferJob,
+    ops: &Arc<dyn SftpOps>,
+    total: u64,
+    ev: &mpsc::Sender<TransferEvent>,
+    cancelled: &AtomicBool,
+    offset: &mut u64,
+    mut file: tokio::fs::File,
+) -> Result<Attempt, crate::Error> {
+    use futures::stream::{FuturesOrdered, StreamExt};
+    use tokio::io::AsyncWriteExt;
+    // 第三项是这次读的耗时：在请求自己的 future 里量（从首次被轮询到应答），与
+    // `TimedSftp` 超时守卫计时的区间一致；出队时再量会把队头阻塞和本地落盘也算进去。
+    // 第四项是这次读用的读取器，读成功时归还空闲池。
+    type Reader<'r> = Box<dyn crate::sftp::RemoteReader + 'r>;
+    type Read<'r> = (
+        u64,
+        usize,
+        std::time::Duration,
+        Option<Reader<'r>>,
+        Result<Vec<u8>, crate::Error>,
+    );
+    let ops: &dyn SftpOps = ops.as_ref();
+    let path = job.remote.as_str();
+    let mut inflight: FuturesOrdered<futures::future::BoxFuture<'_, Read<'_>>> =
+        FuturesOrdered::new();
+    let mut idle: Vec<Reader<'_>> = Vec::new();
+    let mut window = 1usize;
+    let mut next = *offset;
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            drop(inflight);
+            return cancel_out(id, job.direction, file, ev, *offset, total).await;
+        }
+        // 补满窗口。每块按 `total - next` 夹取（审计2 #15，理由见上传侧同名注释）。
+        while inflight.len() < window && next < total {
+            let want = (total - next).min(CHUNK as u64) as usize;
+            let (reader, at) = (idle.pop(), next);
+            inflight.push_back(Box::pin(async move {
+                // tokio 的 Instant：测试用暂停时钟模拟「慢读」时计时跟着走（std 的不会）
+                let started = tokio::time::Instant::now();
+                let mut reader = match reader {
+                    Some(r) => r,
+                    None => match ops.open_reader(path).await {
+                        Ok(r) => r,
+                        Err(e) => return (at, want, started.elapsed(), None, Err(e)),
+                    },
+                };
+                let r = reader.read_at(at, want).await;
+                (at, want, started.elapsed(), Some(reader), r)
+            }));
+            next += want as u64;
+        }
+        let Some((at, want, took, reader, r)) = inflight.next().await else {
+            // 窗口空、且 `next == total`：该收的都收齐了
+            finish_local_file(file, job.direction).await?;
+            return Ok(Attempt::Completed);
+        };
+        debug_assert_eq!(at, *offset, "按序落盘：出队的块必须正好接在已落盘前缀之后");
+        let buf = r?;
+        idle.extend(reader);
+        // 收到多少先落多少（空块时是空操作），断点因此始终等于已落盘的前缀。
+        file.write_all(&buf).await?;
+        *offset += buf.len() as u64;
+        if buf.len() < want {
+            // 短块（含空块）= 远端在开工量到的长度之前就到了 EOF（`read_range` 只在 EOF 时
+            // 少给）：服务端半途返回空包、文件被别人截短、连接半断。无条件当 EOF 的话，残缺
+            // 文件会被判 Done 并提交上去，用户毫不知情（审计 P1-6）。
+            //
+            // 流水线下还有第二层理由：窗口里排在后面的请求是按整块偏移发出的，此时已与落盘
+            // 位置错开，**不得**再用——源文件若又长回来，它们的数据会落到错误的位置上。
+            return Err(crate::Error::Transfer(format!(
+                "远端提前返回空块：已收 {offset}/{total} 字节（{}）——疑似服务端截断或连接半断",
+                job.remote
+            )));
+        }
+        if took <= READ_FAST {
+            window = (window + 1).min(READ_WINDOW_MAX);
+        } else if took >= READ_SLOW {
+            window = (window / 2).max(1);
         }
         let _ = ev
             .send(TransferEvent {

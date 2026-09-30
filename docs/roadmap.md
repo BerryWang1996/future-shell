@@ -1845,6 +1845,49 @@
 - **执行顺序**：先 M7.2 的确认口径（M7.1/M7.3 都要用），再 M7.1 服务管理与
   补丁盘点，再 M7.3，串口最后（体量最大且独立）。
 
+### 1.0.1 SFTP 高延迟吞吐（2026-09-30 立项）
+
+- **起因**：用户要求复查速度是否达标。CI 的 ≥20 MB/s 门禁（`scale.rs`）只量本机回环，
+  往返近乎为零；在容器出口注入 netem 延迟后，1.0.0 与 OpenSSH `sftp` 同条件对比
+  （MB/s 上传/下载）：单向 10 ms 时 5.0/7.2 对 26.1/28.4，
+  25 ms 时 2.1/3.2 对 21.0/28.3——**不达标**，且差距随延迟线性放大。根因：每块都要等齐
+  「打开 → 读写 → 关闭」的往返，逐块串行。
+- **设计**：
+  - 上传：`SftpOps::open_writer` → 同一句柄、按偏移递增的流水线写（russh-sftp 最多 8 个写请求
+    在途）。「已排队」与「已确认」分开记账，失败重试与续传只认已确认下界并把临时件截回那里；
+    单句柄 + 服务端按序处理保证远端始终是连续前缀（续传以远端大小为断点的前提）。
+  - 下载：窗口从 1 起步，一次读 ≤1 s 加一、≥5 s 减半，上限 8；`SftpOps::open_reader` 复用读句柄，
+    每块只剩一次 READ 往返；本地按序落盘，短块（含空块）即报错并丢弃窗口里后续的读。
+  - 两个入口的默认实现就是 1.0.0 的逐块调用，测试替身与故障注入不受影响；只有 `RemoteSftp`
+    与包着它的 `TimedSftp` 覆写。
+  - 慢链路：russh-sftp 单请求超时由默认 10 s 放宽到 600 s（1.0.0 因这 10 s 在低于约 26 KB/s 的
+    链路上必然失败）；存活检测仍由 `TimedSftp` 按每次调用计时。下限见 `sftp.rs` 的
+    `REQUEST_TIMEOUT_SECS` 注释。
+- **出口标准**：
+  - [x] 高延迟下吞吐与 OpenSSH 同量级。（判据：`sftp_bench.rs` 与 OpenSSH `sftp` 同一时段交替
+    各 5 轮，中位数上传/下载——10 ms：1.0.1 53.8/29.4、1.0.0 5.6/8.8、OpenSSH 73.3/103.6；
+    25 ms：35.5/32.3、2.5/3.7、38.9/19.2。方法与测量边界见
+    [性能验证](verification/performance.md)「SFTP 高延迟对比」）
+  - [x] 断点语义不变。（判据：`crates/itest/tests/transfer_real.rs` 128 MiB 上传在 16 MiB 处
+    掐断连接，临时件逐字节是本地前缀、续传后完整；替身用例 `upload_retry_resumes_from_the_confirmed_floor_not_the_queued_offset`、
+    `upload_retry_after_a_failed_finish_resumes_from_the_confirmed_floor`、
+    `source_shrunk_mid_download_stops_at_the_short_chunk`）
+  - [x] 窗口行为可观测。（判据：暂停时钟下的 `download_pipeline_grows_the_window_on_fast_reads`
+    恰好涨到上限、`…_stays_sequential_on_slow_reads` 停在 1、`…_shrinks_the_window_when_the_link_slows_down`
+    骤降后缩回 1；`download_reuses_read_handles_instead_of_reopening_per_chunk` 读句柄数 ≤ 窗口上限）
+  - [x] 超时层不被绕开。（判据：`tests/timeouts.rs` 的读取器/写入器各两条：实参原样转交内层、
+    按数据面预算计时且挂死即判死通道）
+  - [x] 变异证明。（34 条：写入器已确认下界与起点、收尾不 fsync、会话配置、上传两条失败路径的
+    断点与截断、下载窗口增/停/缩/上限、短块保护、读句柄复用与读满、超时层六处转交与预算、
+    `RemoteSftp` 两个覆写的源码守卫。存活 2 条，均已说明：会话配置里的在途上限与默认值恰好
+    同为 8（等价变异）；上传每轮更新断点只在本地源文件读出 I/O 错误时可达，tokio 文件读取
+    在测试里注入不了这种错误）
+  - [ ] SSH 通道接收窗口。10 ms 下载仍明显落后 OpenSSH，读耗时显示是交付速率受限；同一时段
+    交替 5 轮，8 MiB 窗口在 25 ms 下把下载从 8.2 提到 14.0 MB/s，Nagle 开关则无差别。**未采纳**：russh 的窗口是会话级配置，终端通道会一起变大，
+    Ctrl-C 之后要排空的在途输出从 2 MiB 变成 8 MiB；逐通道设置 russh 不支持（补窗目标是会话级
+    字段）。可行方向：SFTP 走独立连接，或给 russh 提逐通道窗口。
+- **范围外**：`scale.rs` 的回环门禁不变；延迟对比依赖 netem 与 OpenSSH 客户端，不进 CI。
+
 ---
 
 ## §2 对标与超越矩阵

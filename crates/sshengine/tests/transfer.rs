@@ -112,6 +112,18 @@ struct FakeFs {
     commit_log: Mutex<Vec<String>>,
     /// 置位后 `sync` 失败：验证落盘失败时**不改名**、临时件留着、最终目标不被触碰。
     fail_sync: Mutex<bool>,
+    /// 每次数据读的人为耗时（毫秒，tokio 时钟）。配合 `start_paused` 的暂停时钟，
+    /// 可以把「慢读」做成瞬间跑完的确定性用例。
+    read_delay_ms: Mutex<u64>,
+    /// 同时在途的数据读个数，与其历史最大值：下载流水线（1.0.1）到底有没有真的并发、
+    /// 慢链路上是不是退回了一次一个，只看最终内容是看不出来的。
+    inflight_reads: std::sync::atomic::AtomicUsize,
+    max_inflight_reads: std::sync::atomic::AtomicUsize,
+    /// `(n, ms)`：从第 n 次数据读（0 基）起改用 ms 的耗时——模拟传到一半链路变慢。
+    slow_reads_from: Mutex<Option<(usize, u64)>>,
+    /// 数据读的序号计数，与每次读开始时（含自己）的同时在途数。
+    data_reads: std::sync::atomic::AtomicUsize,
+    inflight_at_start: Mutex<Vec<usize>>,
 }
 
 /// (第几次数据读之后, 目标路径, 新内容, 新 mtime)
@@ -195,6 +207,19 @@ impl SftpOps for FakeFs {
         // 悄悄变成「读身份记录失败」——断言仍绿而覆盖的路径已经完全不同。
         // 理由与下方 `write_at` 对空写与 `.fsmeta` 的豁免完全相同。
         if !path.ends_with(".fsmeta") {
+            use std::sync::atomic::Ordering::SeqCst;
+            let idx = self.data_reads.fetch_add(1, SeqCst);
+            let delay = match *self.slow_reads_from.lock().unwrap() {
+                Some((from, ms)) if idx >= from => ms,
+                _ => *self.read_delay_ms.lock().unwrap(),
+            };
+            if delay > 0 {
+                let now = self.inflight_reads.fetch_add(1, SeqCst) + 1;
+                self.max_inflight_reads.fetch_max(now, SeqCst);
+                self.inflight_at_start.lock().unwrap().push(now);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                self.inflight_reads.fetch_sub(1, SeqCst);
+            }
             self.read_log
                 .lock()
                 .unwrap()
@@ -335,6 +360,10 @@ impl SftpOps for FakeFs {
         Ok(())
     }
     async fn truncate(&self, path: &str, size: u64) -> Result<(), fs_sshengine::Error> {
+        self.commit_log
+            .lock()
+            .unwrap()
+            .push(format!("truncate {path} {size}"));
         let mut fs = self.files.lock().unwrap();
         let f = fs
             .get_mut(path)
@@ -710,6 +739,291 @@ async fn upload_does_not_commit_when_the_final_sync_fails() {
     assert!(
         fs.get("/keep.bin.fspart").is_some(),
         "临时件应留着，续传才有得续"
+    );
+}
+
+/// 下载流水线（1.0.1）：读得快时窗口要真的涨起来（同时在途 > 1），且不超过上限。
+///
+/// 判据是替身观测到的**同时在途数**。只看最终内容证明不了任何事——顺序读也能得到
+/// 正确的内容，而顺序读正是 1.0.0 在高延迟链路上只有 OpenSSH 十分之一吞吐的原因。
+#[tokio::test(start_paused = true)]
+async fn download_pipeline_grows_the_window_on_fast_reads() {
+    let fs = Arc::new(FakeFs::default());
+    // 40 块：窗口每收一块加一、同时空出一格，在途数随完成数线性上涨；块太少（例如 12 块）
+    // 时读完之前在途数只到 6–7，「不超过上限」的断言就从未被考验过。
+    let payload: Vec<u8> = (0..(40 * CHUNK) as u32).map(|i| (i % 253) as u8).collect();
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/fast.bin".into(), payload.clone());
+    *fs.read_delay_ms.lock().unwrap() = 20; // 一次往返 20 ms：远低于「快」的门槛
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let root = temp_subdir();
+    let dest = root.join("fast.bin");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/fast.bin", root))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("快链路下载应成功，实得 {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        payload,
+        "流水线下载的内容必须逐字节一致"
+    );
+    let max = fs
+        .max_inflight_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        max,
+        fs_sshengine::transfer::READ_WINDOW_MAX,
+        "读得快时窗口应恰好涨到上限：小于它是流水线没生效，大于它是上限没守住"
+    );
+}
+
+/// 慢链路上窗口必须停在 1：排在窗口后面的读要等前面的数据传完才被应答，而每次读受
+/// 120 s 数据面预算约束——固定深窗口会把 1.0.0 能用的慢链路变成超时。
+/// 一次读 6 s（≥ 5 s 的「慢」门槛）时，任何时刻都只能有一个读在途。
+#[tokio::test(start_paused = true)]
+async fn download_pipeline_stays_sequential_on_slow_reads() {
+    let fs = Arc::new(FakeFs::default());
+    let payload: Vec<u8> = (0..(4 * CHUNK) as u32).map(|i| (i % 241) as u8).collect();
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/slow.bin".into(), payload.clone());
+    *fs.read_delay_ms.lock().unwrap() = 6_000;
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let root = temp_subdir();
+    let dest = root.join("slow.bin");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/slow.bin", root))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("慢链路下载应成功，实得 {other:?}"),
+    }
+    assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    assert_eq!(
+        fs.max_inflight_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "慢链路上窗口没有停在 1：排在后面的读会撞上数据面超时"
+    );
+}
+
+/// 传到一半链路变慢，窗口必须**缩回来**：前 16 次读 20 ms（窗口涨满），之后每次 6 s。
+///
+/// 只测「一直慢」证明不了这一点——窗口从 1 起步、从没涨过，缩不缩都是 1。真正危险的是
+/// 涨满之后链路骤降：不缩的话，排在窗口后面的读每个都要等前面几块传完，逐个逼近
+/// 数据面超时。缩回之后每次读开始时应只有它自己在途。
+#[tokio::test(start_paused = true)]
+async fn download_pipeline_shrinks_the_window_when_the_link_slows_down() {
+    let fs = Arc::new(FakeFs::default());
+    let payload: Vec<u8> = (0..(40 * CHUNK) as u32).map(|i| (i % 251) as u8).collect();
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/degrade.bin".into(), payload.clone());
+    *fs.read_delay_ms.lock().unwrap() = 20;
+    *fs.slow_reads_from.lock().unwrap() = Some((16, 6_000));
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let root = temp_subdir();
+    let dest = root.join("degrade.bin");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/degrade.bin", root))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("链路变慢后下载仍应成功，实得 {other:?}"),
+    }
+    assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    let starts = fs.inflight_at_start.lock().unwrap().clone();
+    assert_eq!(starts.len(), 40);
+    assert!(
+        starts[..16].iter().any(|&n| n > 1),
+        "快的阶段窗口就没涨起来，本用例测不到「缩」：{starts:?}"
+    );
+    assert!(
+        starts[30..].iter().all(|&n| n == 1),
+        "链路变慢后窗口没有缩回 1（每次读开始时的同时在途数：{starts:?}）"
+    );
+}
+
+/// 下载复用读句柄（1.0.1）：40 块的文件，打开的读取器个数不超过窗口上限，而不是每块一个。
+///
+/// 逐块重新打开的话每块多一次 OPEN 往返——真网络上这正是句柄复用要省掉的那一半时间，
+/// 而内容照样全对，只看结果完全看不出来。
+#[tokio::test(start_paused = true)]
+async fn download_reuses_read_handles_instead_of_reopening_per_chunk() {
+    let inner = Arc::new(FakeFs::default());
+    let payload: Vec<u8> = (0..(40 * CHUNK) as u32).map(|i| (i % 229) as u8).collect();
+    inner
+        .files
+        .lock()
+        .unwrap()
+        .insert("/reuse.bin".into(), payload.clone());
+    *inner.read_delay_ms.lock().unwrap() = 20;
+    let ops = PipelineOps::new(inner.clone(), 0, 0);
+    let mgr = TransferManager::spawn(ops.clone(), 1);
+    let root = temp_subdir();
+    let dest = root.join("reuse.bin");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/reuse.bin", root))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("下载应成功，实得 {other:?}"),
+    }
+    assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    let opened = ops.readers_opened.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=fs_sshengine::transfer::READ_WINDOW_MAX).contains(&opened),
+        "40 块打开了 {opened} 个读取器：应不超过窗口上限 {}，读完的句柄没有被复用",
+        fs_sshengine::transfer::READ_WINDOW_MAX
+    );
+    assert!(
+        inner
+            .max_inflight_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 1,
+        "复用读取器不能以牺牲并发为代价"
+    );
+}
+
+/// 下载途中源被截短（1.0.1 流水线下的短块）：必须以「提前返回空块」失败，且落盘的只有
+/// 真实收到的前缀。
+///
+/// 顺序读时这件事的处置是自然的：短块写下去，下一次读拿到空块就报错。流水线下不一样——
+/// 短块后面的请求是按**整块**偏移发出的，与落盘位置已经错开。若接着用它们，源文件一旦
+/// 又长回来（日志轮转、被重新写入），数据就会落到错误的位置上。
+#[tokio::test]
+async fn source_shrunk_mid_download_stops_at_the_short_chunk() {
+    let fs = Arc::new(FakeFs::default());
+    let payload: Vec<u8> = (0..(6 * CHUNK) as u32).map(|i| (i % 247) as u8).collect();
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/cut.bin".into(), payload.clone());
+    let cut = CHUNK + 1000;
+    // 读 #0 收完整块之后，源被截成 CHUNK + 1000：读 #1 只能拿到 1000 字节
+    *fs.mutate_after_read.lock().unwrap() =
+        vec![(0, "/cut.bin".into(), payload[..cut].to_vec(), None)];
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let root = temp_subdir();
+    let dest = root.join("cut.bin");
+    let part = part_of(&dest);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/cut.bin", root))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Failed(msg) => assert!(
+            msg.contains("提前返回空块"),
+            "应以「远端提前返回空块」终结，实得：{msg}"
+        ),
+        other => panic!("源在途中变短必须失败，实得 {other:?}"),
+    }
+    assert!(!dest.exists(), "失败的传输不得产生最终文件");
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        payload[..cut].to_vec(),
+        "临时件只能是真实收到的前缀"
+    );
+}
+
+/// 上传收尾（等齐全部写确认）失败时，重试同样从**已确认**处续写（1.0.1）。
+///
+/// 收尾之前流水线里还有最多一整窗未确认的写；此时拿已排队数（= total）当断点，
+/// 重试会以为「全传完了」，直接进提交——远端缺的那一截永远补不上。
+#[tokio::test]
+async fn upload_retry_after_a_failed_finish_resumes_from_the_confirmed_floor() {
+    let inner = Arc::new(FakeFs::default());
+    let ops = PipelineOps::new(inner.clone(), 2 * CHUNK as u64, 1);
+    let mgr = TransferManager::spawn(ops, 1);
+    let payload: Vec<u8> = (0..(6 * CHUNK) as u32).map(|i| (i % 233) as u8).collect();
+    let local = write_temp(&payload);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(up_job(local, "/fin.bin", "ns-fin"))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("收尾失败一次后重试应成功，实得 {other:?}"),
+    }
+    assert_eq!(inner.get("/fin.bin").as_deref(), Some(&payload[..]));
+    let floor = 4 * CHUNK as u64; // 已排队 6 块 − 滞后 2 块
+    let log = inner.commit_log.lock().unwrap().clone();
+    assert!(
+        log.contains(&format!("truncate /fin.bin.fspart {floor}")),
+        "收尾失败后应把临时件截回已确认处：{log:?}"
+    );
+    let writes = inner.write_log.lock().unwrap().clone();
+    assert_eq!(
+        writes.get(6).map(|(off, _)| *off),
+        Some(floor),
+        "重试的第一次写必须落在已确认的 {floor}（流水 {writes:?}）"
+    );
+}
+
+/// 流水线写入器的「已确认」落后于「已排队」时（1.0.1），写失败后的重试必须从**已确认**处
+/// 续写，并先把临时件截回那里。
+///
+/// 拿已排队数当断点的后果：服务端其实没收到的那一截被当成已传好，重试从它后面接着写，
+/// 远端留下一段空洞——长度对、内容错，默认配置下没有任何一关能发现。
+/// 替身的默认写入器是逐块同步写（已确认恒等于已排队），所以这里包一层，
+/// 让 `confirmed` 按真实流水线的样子滞后两块。
+#[tokio::test]
+async fn upload_retry_resumes_from_the_confirmed_floor_not_the_queued_offset() {
+    let inner = Arc::new(FakeFs::default());
+    // 第 3 次数据写（0 基）失败：此时已排队 3 块，而滞后两块的写入器只确认了 1 块
+    *inner.fail_write_indices.lock().unwrap() = vec![3];
+    let ops = PipelineOps::new(inner.clone(), 2 * CHUNK as u64, 0);
+    let mgr = TransferManager::spawn(ops, 1);
+    let payload: Vec<u8> = (0..(6 * CHUNK) as u32).map(|i| (i % 239) as u8).collect();
+    let local = write_temp(&payload);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(up_job(local, "/lag.bin", "ns-lag"))
+        .await
+        .expect("submit 应受理");
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Done => {}
+        other => panic!("注入一次失败后重试应成功，实得 {other:?}"),
+    }
+    assert_eq!(
+        inner.get("/lag.bin").as_deref(),
+        Some(&payload[..]),
+        "重试后的最终内容必须与源一致"
+    );
+    let confirmed_at_failure = CHUNK as u64; // 已排队 3 块 − 滞后 2 块
+    let log = inner.commit_log.lock().unwrap().clone();
+    assert!(
+        log.contains(&format!("truncate /lag.bin.fspart {confirmed_at_failure}")),
+        "写失败后应把临时件截回已确认处：{log:?}"
+    );
+    let writes = inner.write_log.lock().unwrap().clone();
+    let resumed_at = writes
+        .iter()
+        .skip_while(|(off, _)| *off != 3 * CHUNK as u64) // 跳过失败前的三次写
+        .skip(1)
+        .map(|(off, _)| *off)
+        .next();
+    assert_eq!(
+        resumed_at,
+        Some(confirmed_at_failure),
+        "重试必须从已确认的 {confirmed_at_failure} 续写，不能从已排队处（流水 {writes:?}）"
     );
 }
 
@@ -2813,4 +3127,160 @@ fn sha256_hex_validation() {
     );
     assert!(Sha256Hex::new("abc").is_err());
     assert!(Sha256Hex::new("g".repeat(64)).is_err());
+}
+
+/// 模拟真通道流水线行为的替身包装：一切委托给 [`FakeFs`]，只换掉两处——
+///
+/// - `open_writer`：「每次 `write` 同步落盘、但 `confirmed` 滞后 `lag` 字节」的写入器，
+///   正是真流水线写入器的样子；
+/// - `open_reader`：每次读仍走 `FakeFs::read_range`（延迟、并发计数、故障注入照旧），
+///   但记下打开过几个读取器——句柄到底有没有被复用，只有这个数看得出来。
+struct PipelineOps {
+    inner: Arc<FakeFs>,
+    lag: u64,
+    /// 接下来几次 `finish` 注入失败（递减到 0 后放行）。
+    fail_finish: Mutex<usize>,
+    readers_opened: std::sync::atomic::AtomicUsize,
+}
+
+impl PipelineOps {
+    fn new(inner: Arc<FakeFs>, lag: u64, fail_finish: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            lag,
+            fail_finish: Mutex::new(fail_finish),
+            readers_opened: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+struct CountedReader<'a> {
+    fs: &'a FakeFs,
+    path: &'a str,
+}
+
+#[async_trait::async_trait]
+impl fs_sshengine::sftp::RemoteReader for CountedReader<'_> {
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, fs_sshengine::Error> {
+        self.fs.read_range(self.path, offset, len).await
+    }
+}
+
+struct LaggingWriter<'a> {
+    fs: &'a FakeFs,
+    fail_finish: &'a Mutex<usize>,
+    path: &'a str,
+    start: u64,
+    queued: u64,
+    lag: u64,
+}
+
+#[async_trait::async_trait]
+impl fs_sshengine::sftp::RemoteWriter for LaggingWriter<'_> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), fs_sshengine::Error> {
+        self.fs.write_at(self.path, self.queued, data).await?;
+        self.queued += data.len() as u64;
+        Ok(())
+    }
+    fn confirmed(&self) -> u64 {
+        self.queued.saturating_sub(self.lag).max(self.start)
+    }
+    async fn finish(self: Box<Self>) -> Result<(), fs_sshengine::Error> {
+        let mut left = self.fail_finish.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            return Err(fs_sshengine::Error::Sftp("注入：收尾时连接断开".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SftpOps for PipelineOps {
+    async fn list(
+        &self,
+        path: &str,
+    ) -> Result<fs_sshengine::sftp::ListResult, fs_sshengine::Error> {
+        self.inner.list(path).await
+    }
+    async fn stat_size(&self, path: &str) -> Result<u64, fs_sshengine::Error> {
+        self.inner.stat_size(path).await
+    }
+    async fn stat_meta(
+        &self,
+        path: &str,
+    ) -> Result<fs_sshengine::sftp::FileMeta, fs_sshengine::Error> {
+        self.inner.stat_meta(path).await
+    }
+    async fn read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, fs_sshengine::Error> {
+        self.inner.read_range(path, offset, len).await
+    }
+    async fn write_at(
+        &self,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), fs_sshengine::Error> {
+        self.inner.write_at(path, offset, data).await
+    }
+    async fn open_reader<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Result<Box<dyn fs_sshengine::sftp::RemoteReader + 'a>, fs_sshengine::Error> {
+        self.readers_opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(CountedReader {
+            fs: &self.inner,
+            path,
+        }))
+    }
+    async fn open_writer<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+    ) -> Result<Box<dyn fs_sshengine::sftp::RemoteWriter + 'a>, fs_sshengine::Error> {
+        Ok(Box::new(LaggingWriter {
+            fs: &self.inner,
+            fail_finish: &self.fail_finish,
+            path,
+            start: offset,
+            queued: offset,
+            lag: self.lag,
+        }))
+    }
+    async fn sync(&self, path: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.sync(path).await
+    }
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), fs_sshengine::Error> {
+        self.inner.truncate(path, size).await
+    }
+    async fn mkdir(&self, p: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.mkdir(p).await
+    }
+    async fn remove(&self, p: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.remove(p).await
+    }
+    async fn remove_dir(&self, p: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.remove_dir(p).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.rename(from, to).await
+    }
+    async fn lstat(&self, path: &str) -> Result<fs_sshengine::sftp::FileMeta, fs_sshengine::Error> {
+        self.inner.lstat(path).await
+    }
+    async fn read_link(&self, path: &str) -> Result<String, fs_sshengine::Error> {
+        self.inner.read_link(path).await
+    }
+    async fn symlink(&self, target: &str, link: &str) -> Result<(), fs_sshengine::Error> {
+        self.inner.symlink(target, link).await
+    }
+    async fn canonicalize(&self, path: &str) -> Result<String, fs_sshengine::Error> {
+        self.inner.canonicalize(path).await
+    }
 }

@@ -14,6 +14,34 @@
 运行 `bash scripts/linux-itest.sh`；本次运行结果见 [1.0.0 发版检查](release-readiness-1.0.0.md)。
 这些结果覆盖协议与后端管道，不能替代 WebView 实际绘制、远程网络环境和真机操作的测量。
 
+## SFTP 高延迟对比（手动）
+
+`scale.rs` 的吞吐门禁只量本机回环，往返近乎为零，看不出实现被往返时间卡住。1.0.1 起用
+`crates/itest/tests/sftp_bench.rs`（`#[ignore]`，走产品的连接路径与传输引擎）在注入延迟的对端上
+与 OpenSSH `sftp` 对照。对端准备：
+
+```bash
+docker run -d --name fs-sshref --cap-add NET_ADMIN -p 127.0.0.1:2299:2222 \
+  -e PUID=1000 -e PGID=1000 -e USER_NAME=it -e PUBLIC_KEY="$(cat key.pub)" \
+  linuxserver/openssh-server
+docker exec fs-sshref apk add --no-cache iproute2-tc iptables   # tc 依赖 libxtables
+docker exec fs-sshref tc qdisc add dev eth0 root netem delay 25ms   # 改延迟用 change
+```
+
+延迟加在容器出口（服务端 → 客户端方向），往返即所设值。我们的数字取基准输出；OpenSSH 用
+`sftp -b` 对同一文件做 64 MiB 上传与下载，扣除一次空批处理量到的建连时间。三者按轮交替、
+各跑 5 轮取中位数——本机（Windows + Docker Desktop 端口代理）负载波动大，同一二进制相邻两次
+可差数倍，**只比较同一时段的相对值**。2026-09-30 结果（MB/s，上传 / 下载）：
+
+| 单向延迟 | 1.0.0 | 1.0.1 | OpenSSH |
+|---|---|---|---|
+| 10 ms | 5.6 / 8.8 | 53.8 / 29.4 | 73.3 / 103.6 |
+| 25 ms | 2.5 / 3.7 | 35.5 / 32.3 | 38.9 / 19.2 |
+
+零延迟一档不列：OpenSSH 的 64 MiB 在零点几秒内完成，扣除建连时间的估计误差会把结果放大到
+不可信的程度。10 ms 下载仍明显落后，读耗时显示受 SSH 通道接收窗口（2 MiB）限制，
+原因与未采纳的理由见[路线图](../roadmap.md)「1.0.1 SFTP 高延迟吞吐」。
+
 ## 本机 GUI 自查
 
 `crates/itest/tests/perf.rs` 全部使用 `#[ignore]`，普通 CI 不执行。

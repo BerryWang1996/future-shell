@@ -57,6 +57,75 @@ pub const LIST_ENTRY_CAP: usize = 20_000;
 /// 一个名字就足以打爆序列化与渲染。超长条目跳过并计 `truncated`（它是真实存在的条目）。
 pub const LIST_NAME_CHARS_MAX: usize = 1024;
 
+/// 顺序写入器（见 [`SftpOps::open_writer`]）。
+///
+/// # 「已确认」与「已排队」必须分开
+///
+/// `write` 返回 `Ok` 只表示数据已**排队**发出，不代表服务端已写入——流水线的意义正在于此。
+/// 失败重试与续传要的是**已确认**的字节数：拿排队数当断点，失败后就会从一个服务端其实没收到
+/// 的偏移续写，留下一段空洞。[`RemoteWriter::confirmed`] 给出的是保守下界（绝对偏移）。
+///
+/// # 为什么远端永远是连续前缀
+///
+/// 所有写请求在**同一个句柄**上按偏移递增发出，而 SFTP 服务端按到达顺序逐条处理。
+/// 于是断线时服务端已落盘的部分一定是一个从起点开始的连续前缀——这是续传以远端
+/// 文件大小为断点（`transfer::prepare_part`）的前提。换成多句柄并发写，这个前提就不成立了。
+#[async_trait]
+pub trait RemoteWriter: Send {
+    /// 排队写入一段（紧接上一段之后）。窗口满时会先等最旧的一个请求确认。
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error>;
+    /// 已被服务端确认写入的字节数的**下界**，按绝对偏移计。
+    fn confirmed(&self) -> u64;
+    /// 等齐全部确认并关闭句柄。返回 `Ok` 即全部已写入的字节都已确认（写入器随之消耗，
+    /// 调用方自己记着写到了哪里）。
+    async fn finish(self: Box<Self>) -> Result<(), Error>;
+}
+
+/// [`SftpOps::open_writer`] 的默认实现：每段一次 `write_at`，同步完成。
+struct ChunkWriter<'a, S: SftpOps + ?Sized> {
+    ops: &'a S,
+    path: &'a str,
+    offset: u64,
+}
+
+#[async_trait]
+impl<S: SftpOps + ?Sized> RemoteWriter for ChunkWriter<'_, S> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.ops.write_at(self.path, self.offset, data).await?;
+        self.offset += data.len() as u64;
+        Ok(())
+    }
+    fn confirmed(&self) -> u64 {
+        self.offset
+    }
+    async fn finish(self: Box<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// 可反复定位读取的只读句柄（见 [`SftpOps::open_reader`]）。
+///
+/// 一个读取器同一时刻只服务一个读请求（`&mut self`）；下载引擎维护一个读取器池，
+/// 窗口里每个在途的读各占一个，读完归还。
+#[async_trait]
+pub trait RemoteReader: Send {
+    /// 读 `[offset, offset + len)`。与 [`SftpOps::read_range`] 同一约定：只在 EOF 时少给。
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Error>;
+}
+
+/// [`SftpOps::open_reader`] 的默认实现：每次读都走一次 `read_range`。
+struct RangeReader<'a, S: SftpOps + ?Sized> {
+    ops: &'a S,
+    path: &'a str,
+}
+
+#[async_trait]
+impl<S: SftpOps + ?Sized> RemoteReader for RangeReader<'_, S> {
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+        self.ops.read_range(self.path, offset, len).await
+    }
+}
+
 #[async_trait]
 pub trait SftpOps: Send + Sync {
     async fn list(&self, path: &str) -> Result<ListResult, Error>;
@@ -71,7 +140,37 @@ pub trait SftpOps: Send + Sync {
     /// 与 `stat_size` 的分工：那个只回 size，续传身份还需要 mtime，故不能复用。
     async fn stat_meta(&self, path: &str) -> Result<FileMeta, Error>;
     async fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error>;
+    /// 打开同一远端文件的只读句柄，供下载引擎反复定位读取（1.0.1）。
+    ///
+    /// 存在的理由同 [`SftpOps::open_writer`]：逐块 `read_range` 每块都要先 OPEN 再 READ，
+    /// 两次往返；句柄打开一次之后每块只剩一次 READ。
+    ///
+    /// 默认实现就是逐块 `read_range`——测试替身不必实现它，读的故障注入、读流水与人为
+    /// 延迟照旧生效；只有真通道（[`RemoteSftp`] 与包着它的超时层）覆写成句柄复用。
+    async fn open_reader<'a>(&'a self, path: &'a str) -> Result<Box<dyn RemoteReader + 'a>, Error> {
+        Ok(Box::new(RangeReader { ops: self, path }))
+    }
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error>;
+    /// 从 `offset` 起**顺序**写入同一个远端文件的写入器（上传引擎用，1.0.1）。
+    ///
+    /// 存在的理由是往返：逐块 `write_at` 每块都要「打开 → 写 → 关闭」并等齐应答，
+    /// 真实网络上吞吐被往返时间锁死（往返 50 ms 时约 2 MB/s，同条件 OpenSSH 约 21 MB/s）。
+    /// 写入器只打开一次，同一句柄上允许多个写请求同时在途。
+    ///
+    /// 默认实现就是逐块 `write_at`（每次 `write` 同步完成），行为与 1.0.0 完全一致——
+    /// 测试替身因此不必实现它，故障注入照旧按 `write_at` 生效；只有真通道
+    /// （[`RemoteSftp`] 与包着它的超时层）覆写成流水线版本。
+    async fn open_writer<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        Ok(Box::new(ChunkWriter {
+            ops: self,
+            path,
+            offset,
+        }))
+    }
     /// 把远端文件已写入的内容刷到服务器磁盘（`fsync@openssh.com`）。服务端不支持该扩展时
     /// 是空操作而不是错误——那种服务端上客户端本来就没有办法要求落盘。
     ///
@@ -372,13 +471,129 @@ pub struct RemoteSftp {
     inner: russh_sftp::client::SftpSession,
 }
 
+/// 上传写入器同一句柄上允许同时在途的写请求数（1.0.1）。
+///
+/// 8 × 255 KiB ≈ 2 MiB 在途，与 OpenSSH `sftp` 默认的在途字节数（64 × 32 KiB）相同：
+/// 往返 50 ms 时足以撑到约 40 MB/s，再大也会被服务端的通道窗口（OpenSSH 默认 2 MiB）挡住。
+pub const WRITE_PIPELINE: usize = 8;
+
+/// russh-sftp 每个请求的应答等待上限（秒）。
+///
+/// 默认 10 s 对流水线不够：写窗口里排在最后的请求要等前面 2 MiB 都传完才会被应答，
+/// 1.6 Mbps 的上行就要 10 s。这里放宽，**存活检测**仍由 [`crate::timeouts::TimedSftp`]
+/// 按每次调用计时负责（稳态下每次调用只等一个确认，与顺序写的耗时相同）。
+///
+/// # 慢链路下限（与 1.0.0 对照）
+///
+/// 1.0.0 用的就是默认 10 s：一个 255 KiB 的请求 10 s 内必须传完，低于约 26 KB/s 即失败。
+/// 1.0.1 的各条路径下限都不高于它：上传稳态受本常量约束（2 MiB / 600 s ≈ 3.5 KB/s）；
+/// 上传收尾一次等齐窗口，受 `TimedSftp` 的 120 s 约束（2 MiB / 120 s ≈ 17 KB/s）；
+/// 下载窗口在慢链路上缩回 1（255 KiB / 120 s ≈ 2.1 KB/s），窗口满时链路骤降的最坏情形
+/// 同样是 ≈ 17 KB/s。
+const REQUEST_TIMEOUT_SECS: u64 = 600;
+
+/// 会话配置。单独成函数只为可测：两项都是正确性前提而不只是调优——在途上限是
+/// [`PipelinedWriter`] 算「已确认」下界的依据，请求超时回到默认 10 s 则慢链路退回 1.0.0 的下限。
+fn session_config() -> russh_sftp::client::Config {
+    russh_sftp::client::Config {
+        max_concurrent_writes: WRITE_PIPELINE,
+        request_timeout_secs: REQUEST_TIMEOUT_SECS,
+        ..Default::default()
+    }
+}
+
 impl RemoteSftp {
     pub async fn new(channel: russh::Channel<russh::client::Msg>) -> Result<Self, Error> {
         let stream = channel.into_stream();
-        let inner = russh_sftp::client::SftpSession::new(stream)
+        let inner = russh_sftp::client::SftpSession::new_with_config(stream, session_config())
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
         Ok(Self { inner })
+    }
+}
+
+/// [`RemoteSftp`] 的流水线写入器：一个句柄、按偏移顺序写、最多 [`WRITE_PIPELINE`] 个请求在途。
+///
+/// russh-sftp 的 `File` 本身就是这样工作的：`poll_write` 把请求发出去即返回，在途数达到上限时
+/// 先等最旧的那个应答。据此，任何时刻除最近 [`WRITE_PIPELINE`] 个请求外都已确认。
+///
+/// # 「已确认」的上界为什么按 `largest` 算
+///
+/// 单个请求的长度是 `min(本次交给 poll_write 的切片, 服务端通告的 write_len)`，而通告值被
+/// 原样采用、**不与** 256 KiB 取小——按「每个请求 ≤ 256 KiB」估算，碰上通告 1 MiB 写长的
+/// 服务端就会高估已确认量，失败重试从服务端没收到的位置续写、留下空洞。每个请求不超过
+/// 发出它的那次 `write` 的长度，这一点与服务端无关，于是未确认量 ≤ `WRITE_PIPELINE × largest`。
+///
+/// 对底层句柄泛型只为可测：生产上 `W` 就是 russh-sftp 的 `File`。
+struct PipelinedWriter<W> {
+    file: W,
+    start: u64,
+    queued: u64,
+    /// 迄今最大的一次 `write` 的长度。
+    largest: u64,
+}
+
+#[async_trait]
+impl<W: tokio::io::AsyncWrite + Unpin + Send> RemoteWriter for PipelinedWriter<W> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+        // 先记后写：写到一半失败时，这次已经发出的请求同样要算进上界
+        self.largest = self.largest.max(data.len() as u64);
+        self.file
+            .write_all(data)
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))?;
+        self.queued += data.len() as u64;
+        Ok(())
+    }
+    fn confirmed(&self) -> u64 {
+        let in_flight = WRITE_PIPELINE as u64 * self.largest;
+        self.queued.saturating_sub(in_flight).max(self.start)
+    }
+    async fn finish(mut self: Box<Self>) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+        // 与 `write_at` 同一个收尾：等齐全部写应答并等待 CLOSE，不发 fsync（见 `write_at` 的注释）
+        self.file
+            .shutdown()
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))
+    }
+}
+
+/// [`RemoteSftp`] 的读取器：一个打开着的句柄，每次读先定位再读满（1.0.1）。
+///
+/// russh-sftp 的定位对 `SeekFrom::Start` 是纯本地操作，不发请求；一次 `read` 发一个
+/// READ，长度取服务端通告的读上限（OpenSSH 为 261 120 字节，恰为一个 `transfer::CHUNK`）。
+/// 服务端可能少给，故循环读到满或 EOF 为止。
+///
+/// 对底层句柄泛型只为可测：生产上 `R` 就是 russh-sftp 的 `File`。
+struct FileReader<R> {
+    file: R,
+}
+
+#[async_trait]
+impl<R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send> RemoteReader for FileReader<R> {
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        self.file
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))?;
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            let n = self
+                .file
+                .read(&mut buf[filled..])
+                .await
+                .map_err(|e| Error::Sftp(e.to_string()))?;
+            if n == 0 {
+                break; // EOF
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(buf)
     }
 }
 
@@ -433,29 +648,21 @@ impl SftpOps for RemoteSftp {
     }
 
     async fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = self
+        let file = self
             .inner
             .open(path)
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
-        f.seek(std::io::SeekFrom::Start(offset))
+        FileReader { file }.read_at(offset, len).await
+    }
+
+    async fn open_reader<'a>(&'a self, path: &'a str) -> Result<Box<dyn RemoteReader + 'a>, Error> {
+        let file = self
+            .inner
+            .open(path)
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
-        let mut buf = vec![0u8; len];
-        let mut filled = 0;
-        while filled < len {
-            let n = f
-                .read(&mut buf[filled..])
-                .await
-                .map_err(|e| Error::Sftp(e.to_string()))?;
-            if n == 0 {
-                break; // EOF
-            }
-            filled += n;
-        }
-        buf.truncate(filled);
-        Ok(buf)
+        Ok(Box::new(FileReader { file }))
     }
 
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
@@ -484,6 +691,32 @@ impl SftpOps for RemoteSftp {
         // 也能报出来——原来 `flush` 之后靠 drop 触发的 `close_nowait` 会把它吞掉。
         // 持久性改由上传提交前的一次 `sync` 保证（见 `transfer::commit`）。
         f.shutdown().await.map_err(|e| Error::Sftp(e.to_string()))
+    }
+
+    async fn open_writer<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        use tokio::io::AsyncSeekExt;
+        // 与 `write_at` 同一组打开标志：续传不得截断（WRITE | CREATE，不带 TRUNCATE）
+        let mut file = self
+            .inner
+            .open_with_flags(
+                path,
+                russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::CREATE,
+            )
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))?;
+        Ok(Box::new(PipelinedWriter {
+            file,
+            start: offset,
+            queued: offset,
+            largest: 0,
+        }))
     }
 
     async fn sync(&self, path: &str) -> Result<(), Error> {
@@ -667,6 +900,185 @@ mod tests {
             body.contains(".shutdown()"),
             "write_at 须以 shutdown 等齐写应答并等待关闭"
         );
+    }
+
+    /// 记账的底层句柄：每次 `poll_write` 最多收 1000 字节（逼出 `write_all` 的多次短写），
+    /// 并数 flush / shutdown 的次数。
+    #[derive(Clone, Default)]
+    struct Recorder(std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize, usize)>>);
+
+    impl tokio::io::AsyncWrite for Recorder {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = buf.len().min(1000);
+            self.0.lock().unwrap().0.extend_from_slice(&buf[..n]);
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0.lock().unwrap().1 += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0.lock().unwrap().2 += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 每次 `poll_read` 最多给 1000 字节的内存文件：逼出读取器的「读满为止」循环。
+    struct Dribble(std::io::Cursor<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for Dribble {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut tmp = vec![0u8; buf.remaining().min(1000)];
+            let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+            std::task::ready!(std::pin::Pin::new(&mut self.0).poll_read(cx, &mut rb))?;
+            buf.put_slice(rb.filled());
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for Dribble {
+        fn start_seek(
+            mut self: std::pin::Pin<&mut Self>,
+            pos: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            std::pin::Pin::new(&mut self.0).start_seek(pos)
+        }
+        fn poll_complete(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::pin::Pin::new(&mut self.0).poll_complete(cx)
+        }
+    }
+
+    /// 同一个读取器反复定位读取：每次都从给定偏移读满，只在 EOF 处少给。
+    /// 乱序也必须对——下载窗口里的读按完成顺序归还读取器，下一次拿到它的读未必在后面。
+    #[tokio::test]
+    async fn file_reader_reads_each_range_in_full_and_short_only_at_eof() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let mut r = FileReader {
+            file: Dribble(std::io::Cursor::new(data.clone())),
+        };
+        assert_eq!(r.read_at(1000, 3000).await.unwrap(), data[1000..4000]);
+        assert_eq!(
+            r.read_at(0, 2500).await.unwrap(),
+            data[..2500],
+            "往回定位后必须读到那个位置的数据"
+        );
+        assert_eq!(
+            r.read_at(4000, 3000).await.unwrap(),
+            data[4000..],
+            "越过 EOF 的请求只给到 EOF"
+        );
+        assert!(r.read_at(6000, 10).await.unwrap().is_empty());
+    }
+
+    fn pipelined(rec: &Recorder, start: u64) -> Box<dyn RemoteWriter> {
+        Box::new(PipelinedWriter {
+            file: rec.clone(),
+            start,
+            queued: start,
+            largest: 0,
+        })
+    }
+
+    /// `RemoteSftp` 必须覆写两个流水线入口。不覆写时退回 trait 的默认实现（逐块
+    /// `write_at` / `read_range`），传输结果完全正确、所有行为用例都绿，只是在真网络上
+    /// 退回 1.0.0 的往返锁死——这只在真服务端的吞吐上看得见，故用源码级守卫钉住。
+    #[test]
+    fn remote_sftp_overrides_both_pipelined_entry_points() {
+        let src = include_str!("sftp.rs");
+        let start = src
+            .find("impl SftpOps for RemoteSftp {")
+            .expect("RemoteSftp 的 SftpOps 实现不见了");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("impl 尾")];
+        for entry in ["async fn open_reader<'a>(", "async fn open_writer<'a>("] {
+            assert!(
+                body.contains(entry),
+                "RemoteSftp 没有覆写 {entry}…：退回了默认的逐块实现"
+            );
+        }
+    }
+
+    #[test]
+    fn session_config_matches_the_pipeline_assumptions() {
+        let cfg = session_config();
+        assert_eq!(
+            cfg.max_concurrent_writes, WRITE_PIPELINE,
+            "russh-sftp 的在途上限必须就是写入器算「已确认」时扣掉的那个窗口"
+        );
+        assert_eq!(
+            cfg.request_timeout_secs, REQUEST_TIMEOUT_SECS,
+            "请求超时没有放宽：窗口末尾的写要等前面整窗传完，默认 10 s 在慢链路上必然超时"
+        );
+        assert!(
+            REQUEST_TIMEOUT_SECS >= crate::timeouts::DATA_TIMEOUT.as_secs(),
+            "russh-sftp 的请求超时不能比 TimedSftp 的数据面预算还紧，否则存活检测名不副实"
+        );
+    }
+
+    /// 「已确认」必须扣掉整个在途窗口：失败重试与续传从这里开始，高估一点就是远端空洞。
+    #[tokio::test]
+    async fn pipelined_writer_confirms_only_below_the_in_flight_window() {
+        let rec = Recorder::default();
+        let mut w = pipelined(&rec, 0);
+        let chunk = vec![7u8; 4096];
+        for _ in 0..(WRITE_PIPELINE + 2) {
+            w.write(&chunk).await.unwrap();
+        }
+        assert_eq!(
+            w.confirmed(),
+            2 * 4096,
+            "写了 {} 块、最多 {WRITE_PIPELINE} 块在途，已确认只能是最前面 2 块",
+            WRITE_PIPELINE + 2
+        );
+        // 尾块更短：上界仍按见过的最大一次写算，不能因为最后一次写小了就把窗口缩小
+        w.write(&[1u8; 10]).await.unwrap();
+        assert_eq!(
+            w.confirmed(),
+            (WRITE_PIPELINE as u64 + 2) * 4096 + 10 - WRITE_PIPELINE as u64 * 4096
+        );
+        w.finish().await.unwrap();
+        let (data, flushes, shutdowns) = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            data.len(),
+            (WRITE_PIPELINE + 2) * 4096 + 10,
+            "短写必须被写满"
+        );
+        assert_eq!(shutdowns, 1, "收尾须以 shutdown 等齐写应答并等待关闭");
+        assert_eq!(
+            flushes, 0,
+            "收尾不得 flush：russh-sftp 的 flush 在服务端支持时会发 fsync（持久性归提交前的 sync）"
+        );
+    }
+
+    /// 已确认永远不低于起点（续传时起点之前的部分早已确认），也不高于已排队。
+    #[tokio::test]
+    async fn pipelined_writer_never_reports_below_its_start() {
+        let rec = Recorder::default();
+        let start = 5 * 1024 * 1024;
+        let mut w = pipelined(&rec, start);
+        assert_eq!(w.confirmed(), start);
+        w.write(&[0u8; 300]).await.unwrap();
+        assert_eq!(w.confirmed(), start, "窗口内的写不算已确认，但起点本身算");
+        for _ in 0..WRITE_PIPELINE {
+            w.write(&[0u8; 300]).await.unwrap();
+        }
+        assert_eq!(w.confirmed(), start + 300);
     }
 
     fn item(i: usize) -> (String, bool, bool, u64, i64, Option<String>) {

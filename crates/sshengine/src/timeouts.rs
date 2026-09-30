@@ -22,7 +22,7 @@
 //! 我们就是在一个状态未知的通道上继续改用户的文件——审计2 #8 刚修完的那类数据损失，
 //! 正是从「以为自己知道对端处于什么状态」开始的。所以第一次超时即把整个 `TimedSftp`
 //! 判死，后续调用不再上线、就地返回 [`Error::Poisoned`]，由上层丢弃通道重建。
-use crate::sftp::{FileMeta, ListResult, SftpOps};
+use crate::sftp::{FileMeta, ListResult, RemoteReader, RemoteWriter, SftpOps};
 use crate::verify::ExecChannel;
 use crate::Error;
 use async_trait::async_trait;
@@ -163,6 +163,52 @@ impl TimedSftp {
     }
 }
 
+/// [`TimedSftp::open_writer`] 交出的写入器：每次调用都过同一道 `guard`。
+///
+/// 按**每次调用**计时而不是按整件传输：稳态下一次 `write` 只等一个最旧请求的应答，
+/// 耗时与 1.0.0 的一次 `write_at` 同量级，所以数据面预算的含义不变。
+struct TimedWriter<'a> {
+    owner: &'a TimedSftp,
+    path: &'a str,
+    inner: Box<dyn RemoteWriter + 'a>,
+}
+
+#[async_trait]
+impl RemoteWriter for TimedWriter<'_> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        let (owner, path) = (self.owner, self.path);
+        owner
+            .guard("write", path, owner.data, self.inner.write(data))
+            .await
+    }
+    fn confirmed(&self) -> u64 {
+        self.inner.confirmed()
+    }
+    async fn finish(self: Box<Self>) -> Result<(), Error> {
+        let (owner, path) = (self.owner, self.path);
+        owner
+            .guard("finish", path, owner.data, self.inner.finish())
+            .await
+    }
+}
+
+/// [`TimedSftp::open_reader`] 交出的读取器：每次读都过同一道 `guard`，与 `read_range` 同档。
+struct TimedReader<'a> {
+    owner: &'a TimedSftp,
+    path: &'a str,
+    inner: Box<dyn RemoteReader + 'a>,
+}
+
+#[async_trait]
+impl RemoteReader for TimedReader<'_> {
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+        let (owner, path) = (self.owner, self.path);
+        owner
+            .guard("read_at", path, owner.data, self.inner.read_at(offset, len))
+            .await
+    }
+}
+
 #[async_trait]
 impl SftpOps for TimedSftp {
     async fn list(&self, path: &str) -> Result<ListResult, Error> {
@@ -194,6 +240,40 @@ impl SftpOps for TimedSftp {
             self.inner.write_at(path, offset, data),
         )
         .await
+    }
+    /// 必须覆写，理由同 `open_writer`：默认实现会经本层的 `read_range` 逐块读，功能对但
+    /// 绕开了内层的句柄复用。每次读按数据面预算计时，超时照旧判死整条通道。
+    async fn open_reader<'a>(&'a self, path: &'a str) -> Result<Box<dyn RemoteReader + 'a>, Error> {
+        let inner = self
+            .guard("open_reader", path, self.data, self.inner.open_reader(path))
+            .await?;
+        Ok(Box::new(TimedReader {
+            owner: self,
+            path,
+            inner,
+        }))
+    }
+    /// 必须覆写：默认实现会经本层的 `write_at` 逐块写，功能对但**绕开了**内层的流水线写入器
+    ///（生产上内层就是 `RemoteSftp`），1.0.1 的提速在生产路径上就等于没发生。
+    /// 写入器的每次 `write` / `finish` 都按数据面预算计时，超时照旧判死整条通道。
+    async fn open_writer<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        let inner = self
+            .guard(
+                "open_writer",
+                path,
+                self.data,
+                self.inner.open_writer(path, offset),
+            )
+            .await?;
+        Ok(Box::new(TimedWriter {
+            owner: self,
+            path,
+            inner,
+        }))
     }
     async fn truncate(&self, path: &str, size: u64) -> Result<(), Error> {
         self.guard(
