@@ -154,6 +154,10 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
      `CurrentUser\Root`，Windows 会弹安装确认框，非交互 runner 上没人点，会一直等到 6 小时上限。
    - 两处在 PR #4 修复：交叉目标装到钉死的工具链上；证书改导入 `LocalMachine\Root`，并给该步
      设 5 分钟上限。
+3. **run 36686333284**（PR #4 分支，含上两处修复）：Windows 包通过，签名演练的自签名与 signtool
+   校验跑通；Linux 包通过。macOS 两个架构的 helper 都已编出、`lipo -create` 成功，但紧接着的
+   `lipo -verify_arch x86_64 arm64 <文件>` 参数顺序写反（lipo 的输入文件在命令之前），文件名被当成
+   架构名而失败。PR #4 一并改正。
 
 ## 正式发版前仍需完成
 

@@ -380,7 +380,9 @@ jobs:
           done
           if [ "${{ matrix.tauri_target }}" = "universal-apple-darwin" ]; then
             lipo -create app/binaries/fs-rdp-helper-x86_64-apple-darwin app/binaries/fs-rdp-helper-aarch64-apple-darwin -output app/binaries/fs-rdp-helper-universal-apple-darwin
-            lipo -verify_arch x86_64 arm64 app/binaries/fs-rdp-helper-universal-apple-darwin
+            # lipo 的输入文件在命令之前：`lipo <file> -verify_arch …`。反过来写时文件名被当成
+            # 架构名，报「unknown architecture specification flag」（2026-09-30 试跑）。
+            lipo app/binaries/fs-rdp-helper-universal-apple-darwin -verify_arch x86_64 arm64
           fi
 
       # ── 打包 ────────────────────────────────────────────────────────────────
