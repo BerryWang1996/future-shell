@@ -16,6 +16,11 @@ impl Db {
     /// 本 app 版本号；Db::open 用其与库内 meta.min_app_version 比较（spec §3.4.2）。
     pub const APP_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
+    /// 打开（必要时新建并迁移）库文件。
+    ///
+    /// **同一个库文件不得被并发 open**：迁移不是并发安全的——两边都读到「某条迁移未跑」，
+    /// 后执行的一边建表时撞上先执行的结果。调用方须先持有数据目录的单实例锁
+    /// （app 启动序列里的 `fs_vault::lock_data_dir`）；测试须保证各自的库路径互不相同。
     pub async fn open(path: &Path) -> Result<Self, Error> {
         // P1-18：必须在 `create_if_missing` 把文件变出来**之前**问一次「库本来在不在」。
         // 打开之后再问，答案恒为「在」，就再也分不清「首次建库、本就无可备份」与
@@ -44,8 +49,14 @@ impl Db {
             // 本身，而在它是 builder 的默认值：没人拍过板。现在拍板，并写在这里。
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
-            // S13（med）：多窗口/多进程同时首启时，迁移持写锁，后到者会立刻 SQLITE_BUSY 而不是等待。
-            // SQLite 无跨进程建议锁可用，busy_timeout 是唯一的正解：让后到者退避重试而非报错退出。
+            // S13（med）：另一个连接持写锁时，后到者默认立刻 SQLITE_BUSY 而不是等待；busy_timeout
+            // 让它退避重试（外部工具同时打开本库、连接池内的并发写都属此类）。
+            //
+            // 它**不**能让「两个进程同时首启、各跑一遍迁移」变安全（2026-09-30 实测：同一个新库
+            // 并发打开两次，80 次里 4 次 database is locked、18 次 table already exists。读事务
+            // 升级为写时 SQLite 为防死锁直接回 BUSY，不走 busy handler；没撞锁的那一半则是两边
+            // 都判定迁移未跑）。那条路径由单实例锁封死：app 在建库之前先抢
+            // `fs_vault::lock_data_dir`（审计2 #12），第二个进程到不了这里。
             .busy_timeout(Duration::from_secs(15))
             // S6（med）：`INSERT OR REPLACE` 为满足约束而删行时，**仅在开启递归触发器时**才会触发
             // DELETE 触发器（SQLite 官方 REPLACE 语义）。不开则 audit 表的 append-only 触发器形同虚设：
