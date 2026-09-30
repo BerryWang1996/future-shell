@@ -531,15 +531,17 @@ mod tests {
 
     /// 单测库：临时目录里的真 sqlite（迁移齐跑，审计行能真写进去——
     /// 顺带让「审计写入失败只 warn 不炸」之外的主路径也被走到）。
+    ///
+    /// 目录名用进程内序号而不是纳秒时间戳，与下方 `root()` 同一口径：并发启动的测试在
+    /// Windows 上能取到同一个时间戳，两个测试于是打开**同一个**库文件、迁移互相踩踏——
+    /// CI 上偶发的「开测试库: database is locked」就是这么来的（`Db::open` 不支持同一文件
+    /// 并发打开，见其文档）。
     async fn test_db() -> Arc<Db> {
-        let dir = std::env::temp_dir().join(format!(
-            "fs-rdp-share-db-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("fs-rdp-share-db-{}-{n}", std::process::id()));
+        // 先清掉：进程号会被复用，上一次运行留下的同名库不该被这次的测试接着用
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(
             fs_connmgr::Db::open(&dir.join("t.db"))
