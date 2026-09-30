@@ -1882,10 +1882,14 @@
     `RemoteSftp` 两个覆写的源码守卫。存活 2 条，均已说明：会话配置里的在途上限与默认值恰好
     同为 8（等价变异）；上传每轮更新断点只在本地源文件读出 I/O 错误时可达，tokio 文件读取
     在测试里注入不了这种错误）
-  - [ ] SSH 通道接收窗口。10 ms 下载仍明显落后 OpenSSH，读耗时显示是交付速率受限；同一时段
-    交替 5 轮，8 MiB 窗口在 25 ms 下把下载从 8.2 提到 14.0 MB/s，Nagle 开关则无差别。**未采纳**：russh 的窗口是会话级配置，终端通道会一起变大，
-    Ctrl-C 之后要排空的在途输出从 2 MiB 变成 8 MiB；逐通道设置 russh 不支持（补窗目标是会话级
-    字段）。可行方向：SFTP 走独立连接，或给 russh 提逐通道窗口。
+  - [ ] SSH 通道接收窗口（SFTP 专用加大）。同一时段交替 5 轮，8 MiB 窗口在 25 ms 下把下载从
+    8.2 提到 14.0 MB/s（10 ms 下 +16%，在噪声内），Nagle 开关无差别。**未采纳**：russh 0.62.4 做不到
+    逐通道——收到数据时补窗目标固定取 `config.window_size`，`Handler::adjust_window` 的返回值存进
+    字段却从未用于补窗（`client/encrypted.rs` 的 CHANNEL_DATA 分支）；改会话级窗口则终端通道一起
+    变大，Ctrl-C 后要排空的在途输出从 2 MiB 变成 8 MiB。先例：ConnectBot 的 cbssh 0.5.0 把会话通道
+    定为 2 MiB、SFTP 通道 8 MiB 并分开可配。可行方向：SFTP 走独立连接，或给 russh 提逐通道窗口。
+    （早先「10 ms 下载落后 OpenSSH 3 倍」一说已撤回：同日另一时段交替复测，裸读 8 句柄 18.4、引擎
+    21.2、OpenSSH 14.9 MB/s；本机负载下各路数字随时段大幅漂移，未见稳定差距。）
   - [x] 回环吞吐门禁改测产品路径。（判据：`scale.rs` 的 `large_file_roundtrip_integrity_and_throughput`
     改为 `TransferManager` + 生产组装 `TimedSftp(RemoteSftp)`，门槛仍是合计 ≥20 MB/s、仍逐字节比对。
     旧口径测逐块 `write_at` / `read_range`——1.0.0 时那就是产品的切法，1.0.1 之后不是了。同日 main 上
