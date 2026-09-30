@@ -158,6 +158,11 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    校验跑通；Linux 包通过。macOS 两个架构的 helper 都已编出、`lipo -create` 成功，但紧接着的
    `lipo -verify_arch x86_64 arm64 <文件>` 参数顺序写反（lipo 的输入文件在命令之前），文件名被当成
    架构名而失败。PR #4 一并改正。
+4. **run 36691736560**（含 lipo 修复）：ubuntu 关卡首跑红在 `scale.rs` 吞吐门禁（合计 19.3 MB/s，
+   闸线 20），代码未动、重跑即过——1.0.0 的吞吐门禁在 runner 上压线，见下方待办。Windows、Linux 包
+   通过；macOS 两个架构的应用本体编译完成，打包签名时失败：`security import` 报
+   SecKeychainItemImport 参数无效。secret 未配置时 `APPLE_CERTIFICATE` 等展开为空串，Tauri 判的是
+   「变量存在」而非「非空」，拿空证书去导入钥匙串。PR #4 改为调用前 unset 空值变量，走 ad-hoc 签名。
 
 ## 正式发版前仍需完成
 
@@ -165,6 +170,9 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
 - ~~三平台 CI~~：PR #2、#3 的 Windows/macOS/Linux runner 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
 - 仓库 Variables 已设 `ALLOW_UNSIGNED_RELEASE=true`。PR #4 合入后在 `main` 上再跑一次
   release.yml，确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
+- **吞吐门禁压线**：`scale.rs` 的合计 ≥20 MB/s 在 ubuntu runner 上测得 19.3–22 MB/s，打 tag 时的
+  发布关卡可能因此失败，重跑即过。1.0.0 测的是逐块 `write_at` / `read_range`（当时产品的切法）；
+  1.0.1（PR #5）改测产品的流水线传输路径，本机 100 MB/s 以上。打 tag 若撞上，如实记录后重跑。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
 - PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。

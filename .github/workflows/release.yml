@@ -394,8 +394,9 @@ jobs:
       - name: Build installers
         shell: bash
         env:
-          # 这些是 Tauri CLI 原生识别的 macOS 签名/公证环境变量；未配置时为空串，
-          # Tauri 检测到空即跳过 codesign 与 notarize，不会报错。
+          # 这些是 Tauri CLI 原生识别的 macOS 签名/公证环境变量。secret 未配置时展开为**空串**，
+          # 而 Tauri 判的是「变量存在」而不是「非空」：存在即拿空证书去 `security import`，
+          # 报 SecKeychainItemImport 参数无效（2026-09-30 试跑）。故 run 里先把空的 unset 掉。
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -407,6 +408,11 @@ jobs:
           WIN_THUMBPRINT: ${{ steps.win-cert.outputs.thumbprint || steps.win-selfcert.outputs.thumbprint }}
         run: |
           set -euo pipefail
+          # 空值的 Apple 变量一律 unset（理由见上方 env 注释）。下面「无证书 → ad-hoc 签名」
+          # 那一判写的是 ${APPLE_CERTIFICATE:-}，unset 之后照样判为空，不受影响。
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
           CONFIG='{"build":{"beforeBuildCommand":""}}'
           if [ -n "${WIN_THUMBPRINT:-}" ]; then
             CONFIG=$(printf '{"build":{"beforeBuildCommand":""},"bundle":{"windows":{"certificateThumbprint":"%s","digestAlgorithm":"sha256","timestampUrl":"http://timestamp.digicert.com"}}}' "$WIN_THUMBPRINT")
