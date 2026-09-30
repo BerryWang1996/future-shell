@@ -240,6 +240,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 分支头（该仓库不发 semver tag）
         with:
           targets: ${{ matrix.rust_targets }}
+      # 上一步的 targets 装在 stable 上，而仓库根的 rust-toolchain.toml 钉了具体版本：进了仓库
+      # 目录，rustup 用的是钉死的那个，交叉目标在它上面并不存在。宿主目标不受影响，所以
+      # Linux / Windows 包一直正常；macOS 通用包要在 arm64 runner 上交叉编 x86_64-apple-darwin，
+      # 于是 E0463「can't find crate for `core`」（2026-09-30 main 上的发布试跑）。
+      # 这里把目标装到钉死的工具链上；版本从 rust-toolchain.toml 读，不在此处再写一份。
+      - name: Add targets to the pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ch=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "${ch}" || { echo "::error::rust-toolchain.toml 里读不到 channel"; exit 1; }
+          rustup toolchain install "${ch}"
+          for t in $(echo "${{ matrix.rust_targets }}" | tr ',' ' '); do
+            rustup target add --toolchain "${ch}" "${t}"
+          done
+          rustup target list --toolchain "${ch}" --installed
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.name }}
@@ -319,6 +335,9 @@ jobs:
         id: win-selfcert
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE == '' && env.IS_TAG != 'true'
         shell: pwsh
+        # 生成证书与导入受信根都是秒级操作。设上限是因为这一步曾经无声挂住：导入 CurrentUser\Root
+        # 会弹「是否安装此证书」确认框，非交互 runner 上没人点，任务一直挂到 6 小时的默认上限。
+        timeout-minutes: 5
         run: |
           $ErrorActionPreference = 'Stop'
           # CodeSigningCert 类型 + EKU 1.3.6.1.5.5.7.3.3（代码签名）——少了 EKU 的话
@@ -331,8 +350,11 @@ jobs:
             -CertStoreLocation Cert:\CurrentUser\My `
             -NotAfter (Get-Date).AddDays(30)
           # 自签证书不在受信根里，verify /pa 会因链不可信而失败。把它也放进
-          # CurrentUser\Root，让**这台 runner** 信任它——只影响这个一次性容器。
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root','CurrentUser'
+          # LocalMachine\Root，让**这台 runner** 信任它——只影响这个一次性容器。
+          # 不能用 CurrentUser\Root：往当前用户的根存储加证书，Windows 会弹安全确认框，
+          # 非交互会话里永远等不到点击（2026-09-30 main 上的发布试跑因此挂住）。托管 runner
+          # 以管理员运行，写机器存储不弹框，签名校验同样信任它。
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root','LocalMachine'
           $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
           "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
           "kind=self-signed" >> $env:GITHUB_OUTPUT
@@ -358,7 +380,9 @@ jobs:
           done
           if [ "${{ matrix.tauri_target }}" = "universal-apple-darwin" ]; then
             lipo -create app/binaries/fs-rdp-helper-x86_64-apple-darwin app/binaries/fs-rdp-helper-aarch64-apple-darwin -output app/binaries/fs-rdp-helper-universal-apple-darwin
-            lipo -verify_arch x86_64 arm64 app/binaries/fs-rdp-helper-universal-apple-darwin
+            # lipo 的输入文件在命令之前：`lipo <file> -verify_arch …`。反过来写时文件名被当成
+            # 架构名，报「unknown architecture specification flag」（2026-09-30 试跑）。
+            lipo app/binaries/fs-rdp-helper-universal-apple-darwin -verify_arch x86_64 arm64
           fi
 
       # ── 打包 ────────────────────────────────────────────────────────────────
@@ -370,8 +394,9 @@ jobs:
       - name: Build installers
         shell: bash
         env:
-          # 这些是 Tauri CLI 原生识别的 macOS 签名/公证环境变量；未配置时为空串，
-          # Tauri 检测到空即跳过 codesign 与 notarize，不会报错。
+          # 这些是 Tauri CLI 原生识别的 macOS 签名/公证环境变量。secret 未配置时展开为**空串**，
+          # 而 Tauri 判的是「变量存在」而不是「非空」：存在即拿空证书去 `security import`，
+          # 报 SecKeychainItemImport 参数无效（2026-09-30 试跑）。故 run 里先把空的 unset 掉。
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -383,6 +408,11 @@ jobs:
           WIN_THUMBPRINT: ${{ steps.win-cert.outputs.thumbprint || steps.win-selfcert.outputs.thumbprint }}
         run: |
           set -euo pipefail
+          # 空值的 Apple 变量一律 unset（理由见上方 env 注释）。下面「无证书 → ad-hoc 签名」
+          # 那一判写的是 ${APPLE_CERTIFICATE:-}，unset 之后照样判为空，不受影响。
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
           CONFIG='{"build":{"beforeBuildCommand":""}}'
           if [ -n "${WIN_THUMBPRINT:-}" ]; then
             CONFIG=$(printf '{"build":{"beforeBuildCommand":""},"bundle":{"windows":{"certificateThumbprint":"%s","digestAlgorithm":"sha256","timestampUrl":"http://timestamp.digicert.com"}}}' "$WIN_THUMBPRINT")
@@ -580,22 +610,32 @@ jobs:
             Write-Host "launch smoke 通过：$($exe.FullName)"
           }
 
-          $msi = Get-ChildItem artifacts -Filter *.msi | Select-Object -First 1
-          $nsis = Get-ChildItem artifacts -Filter *.exe | Select-Object -First 1
+          # 产物按上传时的公共父目录保留子目录（artifacts/msi/…、artifacts/nsis/…），必须递归找。
+          # 不递归时拿到的是空值，msiexec /i "" 静默什么都不装，错误要拖到「目录不存在」才冒出来
+          #（2026-09-30 试跑）。找不到就当场报。
+          $msi = Get-ChildItem artifacts -Filter *.msi -Recurse | Select-Object -First 1
+          $nsis = Get-ChildItem artifacts -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $msi) { throw "artifacts 里找不到 .msi" }
+          if (-not $nsis) { throw "artifacts 里找不到 NSIS 安装器（.exe）" }
+
+          # msiexec 失败不抛异常，只有退出码（3010 = 成功但需重启）
+          function Invoke-Msiexec([string[]] $argv, [string] $log) {
+            $p = Start-Process msiexec -ArgumentList ($argv + @('/qn', '/norestart', '/l*v', $log)) -Wait -PassThru
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "msiexec $($argv[0]) 退出码 $($p.ExitCode)，日志：$log" }
+          }
 
           Write-Host "== MSI 安装 =="
-          $msiLog = Join-Path $env:RUNNER_TEMP 'msi-install.log'
-          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', $msiLog -Wait
+          Invoke-Msiexec @('/i', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-install.log')
           if (-not (Test-Path $installDir)) { throw "MSI 安装后目录不存在" }
           Invoke-SmokeLaunch
 
           Write-Host "== MSI 覆盖重装（同版本 reinstall）=="
-          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-reinstall.log" -Wait
+          Invoke-Msiexec @('/i', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-reinstall.log')
           if (-not (Test-Path $installDir)) { throw "MSI 重装后目录不存在" }
           Invoke-SmokeLaunch
 
           Write-Host "== MSI 卸载 =="
-          Start-Process msiexec -ArgumentList '/x', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-uninstall.log" -Wait
+          Invoke-Msiexec @('/x', $msi.FullName) (Join-Path $env:RUNNER_TEMP 'msi-uninstall.log')
           if (Test-Path $installDir) { throw "MSI 卸载后安装目录仍在" }
 
           Write-Host "== NSIS 静默安装 =="
@@ -616,7 +656,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DMG=$(ls artifacts/*.dmg | head -1)
+          # 递归找并判空，与 Windows / Linux 同口径（产物可能带子目录）
+          DMG=$(find artifacts -type f -name '*.dmg' | head -1)
+          [ -n "${DMG}" ] || { echo "::error::artifacts 里找不到 .dmg"; ls -R artifacts; exit 1; }
           MNT=/tmp/futureshell-smoke
           mkdir -p "$MNT"
           hdiutil attach "$DMG" -nobrowse -mountpoint "$MNT"
@@ -666,7 +708,10 @@ jobs:
             echo "launch smoke 通过：$1"
           }
 
-          DEB=$(ls artifacts/*.deb | head -1)
+          # 产物按上传时的公共父目录保留子目录（artifacts/deb/…、artifacts/appimage/…），必须递归找
+          #（2026-09-30 试跑：`ls artifacts/*.deb` 找不到）。
+          DEB=$(find artifacts -type f -name '*.deb' | head -1)
+          [ -n "${DEB}" ] || { echo "::error::artifacts 里找不到 .deb"; ls -R artifacts; exit 1; }
           PKG=$(dpkg-deb -f "$DEB" Package)
 
           echo "== deb 安装 =="
@@ -686,7 +731,8 @@ jobs:
           [ ! -e "$BIN" ] || { echo "::error::卸载后二进制仍在：$BIN"; exit 1; }
 
           echo "== AppImage（无安装面：extract-and-run 即「安装」，删除即「卸载」）=="
-          APPIMAGE=$(ls artifacts/*.AppImage | head -1)
+          APPIMAGE=$(find artifacts -type f -name '*.AppImage' | head -1)
+          [ -n "${APPIMAGE}" ] || { echo "::error::artifacts 里找不到 .AppImage"; ls -R artifacts; exit 1; }
           chmod +x "$APPIMAGE"
           APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 xvfb-run -a "$APPIMAGE" --smoke-exit-ms 20000
           rm -f "$APPIMAGE"

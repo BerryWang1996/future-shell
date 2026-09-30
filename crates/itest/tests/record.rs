@@ -86,7 +86,10 @@ async fn cast_from_real_ssh_plays_in_real_asciinema() {
             Ok(None) => break,
             Ok(Some(ChannelMsg::Data { ref data })) => raw.extend_from_slice(data),
             Ok(Some(ChannelMsg::ExtendedData { .. })) => {}
-            Ok(Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::Close)) => break,
+            // 收到退出状态**不能**停：sshd 在子进程退出时就发 exit-status，管道里剩下的输出
+            // 可能随后才到（引擎侧 `exit_status_sent_after_eof_is_still_collected` 钉的正是这个）。
+            // 在这里停过，CI 上偶发拿到空输出（2026-09-30 PR #5 的 ubuntu runner）。收到关闭为止。
+            Ok(Some(ChannelMsg::Close)) => break,
             Ok(Some(_)) => {}
         }
     }

@@ -137,12 +137,50 @@ MSI 采用管理提取，在独立便携目录和独立 WebView 数据目录内�
 
 macOS 仍无本地替代；macOS 专属代码仅 3 处且均为平台常量分支，其余 Unix 代码已由 Linux 镜像覆盖。
 
+## 2026-09-30 发布试跑
+
+候选分支经 PR #2 合入 `main` 后，用 `workflow_dispatch` 在 `main` 上跑 release.yml（无 tag，只产出
+artifact、不生成 Release）。前两次都没有跑通，三处问题此前都没有暴露过：每次都是前一处先失败，
+后面的步骤根本没有执行。
+
+1. **run 36673520609**（`main` = `5f97442`）：ubuntu 关卡红在
+   `jump_path::editing_the_jump_chain_changes_the_actual_path`，打包全部跳过。用例在会话句柄丢弃、
+   连接开始拆除之后才去跳板 1 上 netstat 到跳板 2 的连接；若跳板 2 那头先关，跳板 1 一侧不留
+   TIME_WAIT，计数为 0。同一份代码在 PR #2 的 CI 上是绿的。PR #3 改为连接存活时检查。
+2. **run 36681479869**（`main` = `eddc444`）：五个关卡全绿，Linux 包通过。
+   - macOS 通用包：构建 helper 的 `x86_64-apple-darwin` 时 E0463（找不到 `core`）。matrix 的交叉目标
+     装在 stable 上，而 `rust-toolchain.toml` 钉了 1.97.1，进仓库目录后用的是后者。
+   - Windows 包：挂在签名演练的「生成自签证书」一步 30 分钟以上，手动取消。该步把证书导入
+     `CurrentUser\Root`，Windows 会弹安装确认框，非交互 runner 上没人点，会一直等到 6 小时上限。
+   - 两处在 PR #4 修复：交叉目标装到钉死的工具链上；证书改导入 `LocalMachine\Root`，并给该步
+     设 5 分钟上限。
+3. **run 36686333284**（PR #4 分支，含上两处修复）：Windows 包通过，签名演练的自签名与 signtool
+   校验跑通；Linux 包通过。macOS 两个架构的 helper 都已编出、`lipo -create` 成功，但紧接着的
+   `lipo -verify_arch x86_64 arm64 <文件>` 参数顺序写反（lipo 的输入文件在命令之前），文件名被当成
+   架构名而失败。PR #4 一并改正。
+4. **run 36691736560**（含 lipo 修复）：ubuntu 关卡首跑红在 `scale.rs` 吞吐门禁（合计 19.3 MB/s，
+   闸线 20），代码未动、重跑即过——1.0.0 的吞吐门禁在 runner 上压线，见下方待办。Windows、Linux 包
+   通过；macOS 两个架构的应用本体编译完成，打包签名时失败：`security import` 报
+   SecKeychainItemImport 参数无效。secret 未配置时 `APPLE_CERTIFICATE` 等展开为空串，Tauri 判的是
+   「变量存在」而非「非空」，拿空证书去导入钥匙串。PR #4 改为调用前 unset 空值变量，走 ad-hoc 签名。
+5. **run 36697677719**（含 unset 修复）：五个关卡一次全绿，**三平台安装包全部构建成功**；macOS 的
+   DMG 安装、启动、覆盖重装、卸载 smoke 通过。Windows / Linux smoke 失败，同一根因：产物上传了两个
+   路径（msi + nsis、deb + AppImage），下载后按公共父目录保留子目录（`artifacts/msi/…`），smoke 却只在
+   `artifacts/` 根下找。Windows 上拿到空值后 `msiexec /i ""` 静默什么都不装，错误拖到「安装后目录不存在」
+   才冒出。PR #4 改为三平台都递归查找、找不到即报错，并检查 msiexec 的退出码（此前三次调用都不看）。
+6. **run 36702772941**（PR #4 分支 `dd0f161`，含以上全部修复）：**整轮通过**。五个关卡一次全绿；
+   三平台安装包构建成功；三平台 smoke 全部通过——Windows MSI 与 NSIS、macOS DMG、Linux deb 与
+   AppImage 的安装、启动（`--smoke-exit-ms`）、覆盖重装、卸载。release 任务按设计跳过（无 tag）。
+
 ## 正式发版前仍需完成
 
-- **推送修复**：推送 `release/1.0.0`，以它重开 PR 并关闭 #1。
-- Windows/macOS/Linux GitHub runner 的 CI 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
-- 在仓库 Variables 设 `ALLOW_UNSIGNED_RELEASE=true`，用 `workflow_dispatch` 跑一次 release.yml，
-  确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
+- ~~推送修复~~：`release/1.0.0` 已推送，PR #2 于 2026-09-30 合入 `main`，#1 已关闭。
+- ~~三平台 CI~~：PR #2、#3 的 Windows/macOS/Linux runner 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
+- 仓库 Variables 已设 `ALLOW_UNSIGNED_RELEASE=true`。PR #4 合入后在 `main` 上再跑一次
+  release.yml，确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
+- **吞吐门禁压线**：`scale.rs` 的合计 ≥20 MB/s 在 ubuntu runner 上测得 19.3–22 MB/s，打 tag 时的
+  发布关卡可能因此失败，重跑即过。1.0.0 测的是逐块 `write_at` / `read_range`（当时产品的切法）；
+  1.0.1（PR #5）改测产品的流水线传输路径，本机 100 MB/s 以上。打 tag 若撞上，如实记录后重跑。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
 - PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。

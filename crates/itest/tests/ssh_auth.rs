@@ -252,10 +252,10 @@ async fn publickey_auth_succeeds_against_real_sshd() {
     loop {
         match tokio::time::timeout_at(deadline, ch.wait()).await {
             Ok(Some(russh::ChannelMsg::Data { data })) => out.extend_from_slice(&data),
-            Ok(Some(russh::ChannelMsg::ExitStatus { exit_status })) => {
-                status = Some(exit_status);
-                break;
-            }
+            // 退出状态可能先于剩余输出到达（sshd 在子进程退出时即发），记下后继续收，
+            // 直到通道关闭。在这里 break 过，CI 上偶发拿到空输出（2026-09-30）。
+            Ok(Some(russh::ChannelMsg::ExitStatus { exit_status })) => status = Some(exit_status),
+            Ok(Some(russh::ChannelMsg::Close)) => break,
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => panic!(
@@ -384,10 +384,10 @@ async fn kbd_interactive_auth_succeeds_against_real_sshd() {
     loop {
         match tokio::time::timeout_at(deadline, ch.wait()).await {
             Ok(Some(russh::ChannelMsg::Data { data })) => out.extend_from_slice(&data),
-            Ok(Some(russh::ChannelMsg::ExitStatus { exit_status })) => {
-                status = Some(exit_status);
-                break;
-            }
+            // 退出状态可能先于剩余输出到达（sshd 在子进程退出时即发），记下后继续收，
+            // 直到通道关闭。在这里 break 过，CI 上偶发拿到空输出（2026-09-30）。
+            Ok(Some(russh::ChannelMsg::ExitStatus { exit_status })) => status = Some(exit_status),
+            Ok(Some(russh::ChannelMsg::Close)) => break,
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => panic!(
