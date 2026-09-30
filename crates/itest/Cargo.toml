@@ -1,0 +1,66 @@
+[package]
+name = "fs_itest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 库本体（src/sshd.rs）只需要容器编排 + 异步 DNS；russh / 本仓 crate / base64 / tempfile 全是
+# tests/ 专属，放 dev-dependencies——否则 `cargo build --workspace`（非测试）会为本 crate 白编译
+# russh 与 sqlx 依赖树（Task 9 第二裁判 S31）。同批删掉 futures、tracing-subscriber：全仓无一处
+# 引用，只是白白扩大编译面与 cargo-deny 的告警面。
+[dependencies]
+testcontainers = "0.27"
+# 注意：无需 testcontainers-modules —— 0.15.0 已对齐 testcontainers ^0.27.0（版本冲突不再存在），但其 57 项 feature 中无 "generic"，
+# GenericImage 始终由 testcontainers core 直接提供；且 modules 无 sshd 模块，引入零收益（Round 2 复审 P2-3 结论保留，理由更新）。
+# 严禁开启 0.27 新增 optional feature host-port-exposure（会拉 russh ^0.60.0 与本仓 =0.62.4 双版本编译）；默认特征不动，不加任何 feature。
+tokio.workspace = true
+# src/bin/fake_mcp_server.rs 的唯一依赖。放 [dependencies] 而不是 dev-dependencies
+# 是被迫的——bin 只看 [dependencies]，而 `CARGO_BIN_EXE_*` 只在**同一个 package**
+# 的集成测试里可用，所以这个假 server 必须是本 crate 的 bin。
+#
+# 上面那条「dev-dependencies 免得白编译」的告诫在这里不适用：serde_json 是全仓
+# 每个 crate 都已经在编的叶子依赖，加进来不扩大编译面，与 russh/sqlx 那种量级
+# 不是一回事。
+serde_json = "1"
+
+[dev-dependencies]
+russh.workspace = true
+fs_sshengine = { path = "../sshengine" }
+fs_connmgr = { path = "../connmgr" }
+# rdp.rs：与 helper 子进程说 fs_rdpproto（线格式两端同一份实现）。
+fs_rdpproto = { path = "../rdpproto" }
+# mcp_client.rs：把 src/bin/fake_mcp_server.rs 当成**真的外部 MCP server 子进程**
+# 挂载起来，走产品自己的 client（现连现断、TokioChildProcess）。
+# 测的是发货的那份代码，不是测试里另抄一遍协议。
+fs_mcpbridge = { path = "../mcpbridge" }
+fs_ai = { path = "../ai" }
+fs_policy = { path = "../policy" }
+# zmodem.rs：对真实 lrzsz 跑 rz/sz，用的是产品自己的协议状态机（不是测试里另抄一份，
+# 那样测的就不是发货的那份代码了）
+fs_terminal = { path = "../terminal" }
+# zmodem.rs 上传方向的校验哈希。版本与 sshengine 的 sha2 一致，避免双版本编译。
+sha2 = "0.10"
+# history.rs 端到端链路要建一个内存库跑迁移。走 workspace 表（=0.9.0 精确钉），
+# 与 connmgr 同一版本——双版本 sqlx 会各带一份 SQLite。
+sqlx.workspace = true
+base64 = "0.22"
+tempfile = "3"
+# ssh_auth.rs 需要：Profile.id 是 Uuid，SecretSource::secret 返回 Zeroizing<Vec<u8>>。
+# 版本一律走 workspace 表，避免与 sshengine/connmgr 编出双版本。
+uuid.workspace = true
+zeroize.workspace = true
+# sftp.rs 的 ExecChannel 实现（传后校验 round-trip）：该 trait 经 async-trait 装箱以保持对象安全
+async-trait = "0.1"
+# perf.rs 观测应用进程的 RSS 与 CPU（本机自查，全部 #[ignore]，见该文件头部说明）
+sysinfo = "0.32"
+# 审计整改：以下四项已删除，删除理由留档，防止「看着眼熟又加回来」
+#   - tauri-driver 0.1：**该 crate 没有 lib target**，`use tauri_driver::…` 根本编译不进来，
+#     声明它只是给依赖树白挂一棵子树、给 cargo-deny 白增一片告警面。perf.rs 从头到尾也没有
+#     真正用 WebDriver 驱动过应用。
+#   - criterion 0.5（+ html_reports）：声明了但全仓无一处 `use criterion`，perf.rs 的分位数
+#     是手算的。criterion 的依赖树（plotters/rayon/tinytemplate…）相当可观，白编译。
+#   - reqwest 0.12 / serde_json：只被两条断言 `/api/version` 与 `/__health` 的测试用到，
+#     而这两个端点在本仓从未实现，测试已整条删除（详见 perf.rs 头部）。
+#   - tokio（dev 侧带 "time" 特性的重复声明）：随上面那条 HTTP 测试一起没了用户；且
+#     [dependencies] 已用 workspace tokio 的 "full"，dev 侧再声明一次是纯冗余。

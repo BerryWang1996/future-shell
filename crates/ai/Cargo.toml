@@ -1,0 +1,27 @@
+[package]
+name = "fs_ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+fs_policy = { path = "../policy" }
+# 出站面：本 crate 是全仓**唯一**允许声明 HTTP 客户端的出货 crate
+# （README「出站面」节 + egress-contract.test.ts 的 HTTP_ALLOWED 逐 crate 名豁免）。
+# 只用 rustls，不用 native-tls：后者在 Linux 上要 OpenSSL，而本仓的 TLS 面已由
+# russh 的 aws-lc-rs 承担，再引一套系统 OpenSSL 是白增攻击面与打包麻烦。
+# 不开 default-features：默认会带上 native-tls。
+#
+# 根证书用**操作系统信任库**（rustls-tls-native-roots）而不是打包 Mozilla 的那份
+# （rustls-tls / webpki-roots）。两个理由：
+#   ① 本产品的用户是运维，相当一部分坐在做 TLS 检查的企业代理后面，私有 CA 装在系统库里。
+#      打包一份 Mozilla 根会让 AI 调用在**恰好是这些环境**里失败，而系统库能用。
+#   ② webpki-roots 的许可证是 CDLA-Permissive-2.0（数据许可），不在 deny.toml 白名单内。
+#      走系统信任库连这个例外都不需要——少一条例外比多一条注释好。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }

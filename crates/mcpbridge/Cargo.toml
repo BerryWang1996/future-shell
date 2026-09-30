@@ -1,0 +1,30 @@
+[package]
+name = "fs_mcpbridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 出站面：本 crate **不得**声明任何 HTTP 客户端或服务端框架。
+# 传输只有 stdio（总设计 §4.5：「stdio 为 M3 阶段唯一传输，传输层无监听地址」），
+# 由 `frontend/src/lib/egress-contract.test.ts` 的 MCP 专章逐条守着——那里既查
+# 本文件的依赖名单，也查（将来接入 rmcp 时）rmcp 的特性名单与带 HTTP 的特性无交集。
+#
+# `fs_ai` 是全仓唯一允许声明 HTTP 客户端的出货 crate，因此本 crate 传递地含有
+# reqwest。这是刻意接受的：MCP 面要与内置 Agent **共用同一个闸门与同一份
+# run_command 契约**（§4.5「⚠ = 经策略引擎，与内置 Agent 同一闸门」），而那些
+# 实现都在 fs_ai 里；为躲一个传递依赖去复制一份闸门，换来的是两套会各自漂移的
+# 判定口径——那比多一条传递依赖坏得多。本 crate 自己一行出站代码都没有，
+# 由 `lib.rs` 的 `this_crate_never_speaks_http` 逐文件扫描守着。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+fs_policy = { path = "../policy" }
+fs_ai = { path = "../ai" }
+# M3 出口 5（Server）用 server+transport-io；出口 6（Client 挂载外部 server）再加
+# client+transport-child-process（stdio 外部服务器 = 拉起子进程）。三个特性全在
+# egress-contract.test.ts 的 STDIO_SAFE_FEATURES 白名单内；带 HTTP 的一个不碰。
+# transport-child-process 传递引入 process-wrap（Apache-2.0 OR MIT，已在 deny 白名单）。
+rmcp = { version = "3.1.4", default-features = false, features = ["server", "client", "macros", "transport-io", "transport-child-process"] }
+# 传输层用它的异步 Mutex（守卫要跨 await）与 stdio 运行时。非出站依赖。
+tokio = { workspace = true }

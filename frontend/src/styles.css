@@ -1,0 +1,274 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; }
+body {
+  margin: 0;
+  font-family: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 12.5px;
+  color: var(--fs-fg-primary);
+  background: var(--fs-bg-app);
+}
+button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--fs-accent);
+  outline-offset: 1px;
+}
+
+/* ── 表单控件基线（2026-09-01 用户裁定「原生控件都要有自己的样式」）────────
+ *
+ * 此前全局只有上面那条焦点环，控件外观各组件各写各的——没写的地方就是
+ * 浏览器默认外观（Windows 上的灰底方角控件，混在深色 chrome 里格外扎眼）。
+ *
+ * 优先级刻意压低（不用 !important、选择器只有一层）：组件里已有的更具体规则
+ * 照旧赢，这一层只兜底那些没人管的控件。
+ *
+ * **一条如实的边界**：`<option>` 展开后的面板由操作系统绘制，CSS 管不到
+ * （Chromium 在 Windows 上只让 background/color 部分生效，圆角/内边距无效）。
+ * 要展开态也主题化只能换自绘下拉组件，那要自己实现键盘导航与 aria 语义，
+ * 属另一批工作。这里把**收起态**做到位，不假装解决展开态。 */
+
+select,
+input[type="text"], input[type="password"], input[type="number"],
+input[type="url"], input[type="search"], input[type="email"], input:not([type]),
+textarea {
+  background: var(--fs-bg-input);
+  color: var(--fs-fg-primary);
+  border: 1px solid var(--fs-border);
+  border-radius: var(--fs-radius);
+  padding: 3px 6px;
+  font: inherit;
+}
+select:hover,
+input[type="text"]:hover, input[type="password"]:hover, input[type="number"]:hover,
+input[type="url"]:hover, input[type="search"]:hover, input:not([type]):hover,
+textarea:hover {
+  border-color: var(--fs-border-strong);
+}
+select:disabled, input:disabled, textarea:disabled {
+  color: var(--fs-fg-disabled);
+  background: var(--fs-bg-panel);
+  cursor: not-allowed;
+}
+::placeholder { color: var(--fs-fg-disabled); }
+
+/* select：自绘下拉箭头（2026-09-01 对抗审计后重做）。
+ *
+ * 三处都是实测出来的问题：
+ * ① 第一版用 `background-image` 却没加 !important，被 **8 个组件的
+ *    `background:` 简写**静默重置为 none——简写会把 background-image 一并
+ *    清零，没有任何报错，只是箭头消失。用户报的「这个下拉没有样式」正是它。
+ *    现在三条声明都加 !important：守的是「自绘箭头不可被组件盒样式误伤」
+ *    这条不变量，不是打特异度战争——它已经被静默误伤 8 次。
+ * ② 箭头颜色第一版写死 `%238b93a3`：浅色主题实测约 3.09:1（WCAG 非文本构件
+ *    地板 3:1，几乎没有余量），高对比主题下比该主题本意暗一档。
+ *    `background-image` 吃不到 currentColor，故改为**按主题各写一次**
+ *    （下方 [data-theme] 块）——四条 data-URI 换来颜色可控。
+ * ③ forced-colors（Windows 高对比度）全仓此前零处理，而 appearance:none
+ *    已经交出了系统绘制的控件。下方 @media 把控件交还给系统。
+ *
+ * padding-right **不**加 !important：组件可能有正当理由改内距，那时它自己
+ * 负责给箭头留位。 */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 22px;
+  cursor: pointer;
+  background-repeat: no-repeat !important;
+  background-position: right 6px center !important;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b93a3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+}
+/* 按主题给箭头上色（值 = 各主题的 --fs-fg-secondary，URL 里不能引用变量）。 */
+:root[data-theme="daylight"] select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235a6474' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+}
+:root[data-theme="slate"] select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+}
+/* hc：主题意图是最高对比，箭头用该主题的次级前景（#d0d0d0），不沿用暗灰。 */
+:root[data-theme="hc"] select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23d0d0d0' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+}
+
+/* Windows 高对比度：把控件交还系统绘制。自绘箭头在强制颜色模式下不受系统
+ * 调色板保护，而 appearance:none 又已经把原生箭头交了出去——不处理的话
+ * 高对比度用户两头落空。全仓此前 forced-colors 零命中，这是第一处。 */
+@media (forced-colors: active) {
+  select {
+    appearance: auto;
+    -webkit-appearance: auto;
+    background-image: none !important;
+    padding-right: 6px;
+    border: 1px solid ButtonBorder;
+    color: ButtonText;
+  }
+}
+
+/* ── Windows 高对比度（forced-colors: active）的两条房规（路线图 4c，2026-09-02）──────
+ *
+ * 强制颜色模式把 color / background-color / border-color / fill / stroke 全换成系统调色板，
+ * 并把 box-shadow 抹成 none。于是**只靠颜色区分**与**只靠投影区分**的状态会塌成同一个样子。
+ * 2026-09-02 实测（scripts/forced-colors-audit.mjs）：6 个构件、16 对状态在强制颜色下不可辨——
+ * 七盏主机灯只剩两种样子、选中的标签与没选中的一模一样、状态栏三色点完全相同。
+ *
+ * ① **状态靠形状区分**（实心/空心 × 圆/方 × 边框粗细），颜色只作辅助。高对比度用户要的恰恰是
+ *    「不依赖颜色也能分辨」。填充**必须写系统色关键字**（CanvasText / GrayText）：实测
+ *    `background: currentColor` 会被引擎强制成 Canvas——那是一颗**画不出来**的点，而两两比对
+ *    还会因为圆角不同判它「可辨」。只有系统色关键字能在强制颜色下留住（`GrayText` 实测留住了）。
+ * ② **「选中 / 强调」用 `outline: 2px solid Highlight; outline-offset: -2px`**。outline 不占布局、
+ *    在强制颜色下是被重新着色而不是被抹掉，且**不动背景**——这一点是①的前提：容器底色始终是
+ *    Canvas，里面那些 CanvasText 填充的指示点才恒有对比。换成 `background: Highlight` 就会
+ *    出现「高亮底上的 CanvasText 点」这种没人保证过对比度的组合。
+ *
+ * 规则本身写在各组件里（Svelte 样式是散列作用域的，全局选择器够不着 `.lamp` / `.tab`）；
+ * 判据是 `scripts/forced-colors-audit.mjs`——它把每个构件各语义状态的计算样式两两比对，
+ * 而不是检查「有没有写过 forced-colors 规则」（那只能证明写过）。
+ */
+
+/* 勾选/单选：accent-color 是让原生控件上主题色的唯一低成本手段。
+ * 不做 appearance:none 全自绘——那会连带失去原生的键盘与读屏行为，
+ * 而那些行为正是本仓 a11y 判据依赖的部分。 */
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--fs-accent);
+  cursor: pointer;
+}
+input[type="range"] { accent-color: var(--fs-accent); }
+
+/* 按钮基线：只兜没有 class 的裸按钮，有 class 的一律由组件自己管
+ * （组件里的规则更具体，天然赢过这条）。 */
+button:not([class]) {
+  background: var(--fs-bg-elevated);
+  color: var(--fs-fg-primary);
+  border: 1px solid var(--fs-border);
+  border-radius: var(--fs-radius);
+  padding: 3px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+button:not([class]):hover { background: var(--fs-bg-hover); }
+button:not([class]):disabled {
+  color: var(--fs-fg-disabled);
+  cursor: not-allowed;
+  background: var(--fs-bg-panel);
+}
+/* ── 动效（路线图 4c「动效补齐」，2026-09-02）────────────────────────────
+ *
+ * 三条口径：
+ * ① **只用 CSS**（transition / animation / @starting-style）。不用 Svelte 的 transition:/in:/out: 指令，
+ *    不用 Web Animations API——它们是 JS 驱动的，下面那条 prefers-reduced-motion 的 `!important` 兜底
+ *    管不到；lib/motion-guards.test.ts 守着这条。JS 侧唯一的动效时序是 toast 退场要等一拍再删
+ *    （lib/toast.ts），它自己经 lib/motion.ts 查 matchMedia。
+ * ② **进场靠 @starting-style**：元素插入（或 display:none → 可见）那一刻的起始态，只在进场生效一次。
+ *    不用挂在类名上的 keyframes：类切换会让它重放——VaultDialog 抖完一次会再「冒」一次。
+ *    Chromium 117+ / WebKit 17.5+ 支持；不支持的引擎直接落到终态，不动效、不报错。
+ * ③ **只动 opacity / transform / height，时长走 token，最长 140ms**：这是个终端，不是营销页——
+ *    动效的作用是让状态切换有连续感，不是让人等。
+ * 写在全局而不是各组件：31 个对话框、7 个菜单各写一份，漏一份就是一处不一致。
+ * 选择器只用 role / data-testid / 稳定类名，与组件散列作用域的规则互不覆盖（组件规则更具体，照旧赢）。 */
+:root {
+  --fs-motion-fast: 80ms;   /* 菜单、标签、终端区切换 */
+  --fs-motion-base: 140ms;  /* 对话框、面板、toast */
+  --fs-ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+/* 对话框：遮罩淡入 + 面板轻微上浮。遮罩只认 .overlay / role=presentation 的直接父级——
+   ComposeBar 的目标选择器也是 role=dialog，但它的父级是个按钮盒，不该被当遮罩淡。 */
+.overlay:has(> [role="dialog"]),
+[role="presentation"]:has(> [role="dialog"]) {
+  transition: opacity var(--fs-motion-base) var(--fs-ease-out);
+}
+[role="dialog"] {
+  transition: opacity var(--fs-motion-base) var(--fs-ease-out), transform var(--fs-motion-base) var(--fs-ease-out);
+}
+/* 菜单（菜单栏下拉 / 右键菜单 / 子菜单）：淡入。只动 opacity——clampToViewport 用 translate 钳位，不跟它抢。 */
+[role="menu"] {
+  transition: opacity var(--fs-motion-fast) var(--fs-ease-out);
+}
+/* 标签：底色 / 前景 / 选中指示的过渡；会话标签切换时终端区淡入（.term-wrapper 是 display:none ↔ block 切换）。 */
+[role="tab"] {
+  transition: background-color var(--fs-motion-fast), color var(--fs-motion-fast), box-shadow var(--fs-motion-fast);
+}
+.term-wrapper.active {
+  transition: opacity var(--fs-motion-fast) var(--fs-ease-out);
+}
+/* 面板：监控抽屉从 0 长到 150px；组合命令栏 / 快速命令条 / 状态栏淡入。 */
+[data-testid="monitor"] {
+  transition: height var(--fs-motion-base) var(--fs-ease-out), opacity var(--fs-motion-base) var(--fs-ease-out);
+}
+[data-testid="composebar"],
+[data-testid="quickbar"],
+[data-testid="statusbar"] {
+  transition: opacity var(--fs-motion-base) var(--fs-ease-out);
+}
+/* toast 的进场 / 退场在 Toast.svelte（进场 keyframes 早就有，退场靠 .leaving），时长同样取上面的 token。 */
+@starting-style {
+  .overlay:has(> [role="dialog"]),
+  [role="presentation"]:has(> [role="dialog"]) { opacity: 0; }
+  [role="dialog"] { opacity: 0; transform: translateY(8px); }
+  [role="menu"] { opacity: 0; }
+  .term-wrapper.active { opacity: 0; }
+  [data-testid="monitor"] { height: 0; opacity: 0; }
+  [data-testid="composebar"],
+  [data-testid="quickbar"],
+  [data-testid="statusbar"] { opacity: 0; }
+}
+
+/* 降级：系统设了「减少动态效果」→ 全部 transition / animation 清零。上面的动效全部是 CSS，
+ * 这一条就管得住全部（JS 侧唯一的时序在 lib/toast.ts，自己查 matchMedia）。 */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* ── 滚动条与滚动方向（2026-08-31 用户裁定）────────────────────────────
+ *
+ * 两条全局裁定：
+ * ① 滚动条用**自己的样式**（细、主题色、圆角），不用系统默认的粗条——
+ *    三平台的 WebView 都是 WebKit 系，::-webkit-scrollbar 全覆盖；
+ *    Firefox 侧再补 scrollbar-width/scrollbar-color（多写不亏）。
+ * ② **只允许纵向滚动**：html/body 层禁掉横向溢出。个别确实需要横向
+ *    查看宽内容的地方（代码块等）一律**换行**而不是出横向滚动条
+ *    （见各组件的 pre：white-space: pre-wrap + overflow-wrap）。
+ *    TabBar 的标签条是历史例外之外唯一保留横向滚动的——标签多了
+ *    横向滚动是它的语义（像浏览器的标签条），不是布局事故。
+ */
+html, body {
+  overflow-x: hidden;
+}
+
+/* 禁用操作保持可辨认，避免危险确认按钮在条件未满足时看起来仍可执行。 */
+button:disabled { opacity: .55; cursor: not-allowed; }
+
+/* ── 密度系统（2026-08-31 接线：设置页的「宽松密度」此前写了 --fs-density
+ *    但零消费——一个可操作却无视觉反馈的假选项，评审 P1-3）──────────────
+ *
+ * --fs-density 由主题表给出（紧凑 1.2 / 宽松 1.5），设置页即时改写。
+ * 这里派生出 chrome 的纵向尺寸，供工具栏/标签条/侧栏/状态栏/菜单消费：
+ * 派生量只此四件——多一个自由度就多一处各组件不一致的口子。
+ * 终端区域**不参与**密度：字号有自己的设置项，行列数由用户终端决定，
+ * 行高再乘系数会同时改变滚动语义。 */
+:root {
+  --fs-chrome-h: calc(26px * var(--fs-density, 1.2));   /* 按钮/行内件基准高 */
+  --fs-chrome-bar: calc(34px * var(--fs-density, 1.2)); /* 整条栏高 */
+  --fs-chrome-pad-y: calc(3px * var(--fs-density, 1.2));/* 行纵向内距 */
+  --fs-chrome-gap: calc(6px * var(--fs-density, 1.2));  /* 行间距 */
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--fs-border, #444);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--fs-fg-dim, #666);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+/* Firefox（以及未来引擎）的等价声明 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fs-border, #444) transparent;
+}

@@ -1,0 +1,20 @@
+[package]
+name = "fs_rdpproto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# **本 crate 的依赖必须保持在这个规模。**
+#
+# 它是主程序工作区与 `rdp-helper/` 工作区**唯一**共享的东西，两边各自 path 依赖它。
+# 之所以能共享，正是因为它谁也不碰：不碰 russh（主程序那侧的 SSH 栈），
+# 也不碰 ironrdp（helper 那侧的 RDP 栈）。这两者的依赖图不能相遇——那正是
+# 拆出 helper 进程的全部理由（curve25519-dalek 的 5.0.0 与 5.0.0-rc.1 冲突）。
+#
+# 往这里加任何一个会牵连到那两棵树的依赖，都会把那个冲突重新引回来。
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

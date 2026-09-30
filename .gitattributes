@@ -1,0 +1,18 @@
+# 全仓统一 LF：库内一律 LF，**检出到工作区也保持 LF**。
+#
+# 为什么必须显式声明：Windows 上 git 的默认 core.autocrlf=true 是**每台机器各自的本地配置**，
+# 不随仓库走。本机现在就是 true，于是每次 checkout / stash / 切分支，git 都会把整棵树的
+# 文本文件转成 CRLF——`git diff` 会刷满 "LF will be replaced by CRLF" 警告，rustfmt 与
+# 自建的 CR 扫描（`grep -cU -P '\r'`）随后全线报警，历史上每做一次 stash 就要手工复查一遍。
+# 更糟的是它不可复现：另一个贡献者的 autocrlf 若为 false，同一份文件在两台机器上会得到
+# 不同的换行，产出全文件级的假 diff。
+#
+# eol=lf 把这件事从「每人各自配置对」变成「仓库自己保证」。
+# 声明时机是安全的：`git ls-files --eol` 显示库内全部文本文件已经是 i/lf，
+# 因此本声明不产生任何重规范化 diff（零文件内容变更）。
+* text=auto eol=lf
+
+# 二进制：禁止一切换行/差分文本处理，否则图标会被 CRLF 转换损坏
+*.png binary
+*.ico binary
+*.icns binary

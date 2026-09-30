@@ -1,0 +1,8 @@
+{
+  "id": "futureshell-dark", "name": "FutureShell Dark", "dark": true,
+  "background": "#0f1115", "foreground": "#d7dbe2",
+  "cursor": "#4f8cff", "selection": "#2b3a55",
+  "ansi": ["#1f232b","#ff5f56","#3fd68c","#ffd166","#4f8cff","#c792ea","#56d4dd","#d7dbe2",
+           "#57606f","#ff7b72","#56f2a5","#ffe08a","#79a8ff","#e2b3ff","#7ee7f0","#ffffff"],
+  "boldBright": true
+}

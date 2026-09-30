@@ -1,0 +1,61 @@
+/* ============ 主题令牌（UI 规格 §3.1；值与 docs/mockups/index.html 参考实现一致） ============ */
+:root[data-theme="obsidian"] {
+  color-scheme: dark; /* 原生控件（滚动条/下拉/输入）随主题，Daylight 不再是暗件混进亮页（评审 P2-6） */
+  --fs-bg-app: #0b0d11; --fs-bg-panel: #12151c; --fs-bg-elevated: #1a1f29; --fs-bg-input: #0e1117;
+  --fs-bg-tab-active: #0f1115; --fs-bg-tab-inactive: #161a22; --fs-bg-hover: #1e2430;
+  --fs-fg-primary: #d7dbe2; --fs-fg-secondary: #8b93a3; --fs-fg-disabled: #545b68;
+  --fs-border: #262c38; --fs-border-strong: #39414f;
+  --fs-accent: #4f8cff; --fs-accent-hover: #6b9eff; --fs-accent-fg: #000000; --fs-accent-dim: rgba(79,140,255,.14);
+  --fs-ok: #3fd68c; --fs-warn: #ffd166; --fs-danger: #ff5f56; --fs-info: #56d4dd;
+  --fs-warn-dim: rgba(255,209,102,.14); --fs-danger-dim: rgba(255,95,86,.14);
+  --fs-selection: #2b3a55;
+  --fs-term-bg: #0f1115;
+  --fs-radius: 4px; --fs-shadow: 0 8px 28px rgba(0,0,0,.5);
+  --fs-radius-lg: 8px; --fs-bg-tooltip: #1a1f29; --fs-fg-tooltip: #d7dbe2;
+  --fs-density: 1.2;
+}
+:root[data-theme="daylight"] {
+  color-scheme: light; /* 原生控件（滚动条/下拉/输入）随主题，Daylight 不再是暗件混进亮页（评审 P2-6） */
+  --fs-bg-app: #eef0f4; --fs-bg-panel: #ffffff; --fs-bg-elevated: #ffffff; --fs-bg-input: #ffffff;
+  --fs-bg-tab-active: #ffffff; --fs-bg-tab-inactive: #e9ebef; --fs-bg-hover: #e4e8ef;
+  --fs-fg-primary: #1d2433; --fs-fg-secondary: #5a6474; --fs-fg-disabled: #a2aab8;
+  --fs-border: #d6dae2; --fs-border-strong: #bcc2cd;
+  --fs-accent: #2563eb; --fs-accent-hover: #3b82f6; --fs-accent-fg: #ffffff; --fs-accent-dim: rgba(37,99,235,.10);
+  --fs-ok: #16a34a; --fs-warn: #b45309; --fs-danger: #dc2626; --fs-info: #0891b2;
+  --fs-warn-dim: rgba(217,119,6,.10); --fs-danger-dim: rgba(220,38,38,.08);
+  --fs-selection: #bfdbfe;
+  --fs-term-bg: #10141c;
+  --fs-radius: 4px; --fs-shadow: 0 8px 28px rgba(15,23,42,.18);
+  --fs-radius-lg: 8px; --fs-bg-tooltip: #ffffff; --fs-fg-tooltip: #1d2433;
+  --fs-density: 1.2;
+}
+:root[data-theme="slate"] {
+  color-scheme: dark; /* 原生控件（滚动条/下拉/输入）随主题，Daylight 不再是暗件混进亮页（评审 P2-6） */
+  --fs-bg-app: #0c1220; --fs-bg-panel: #131a2b; --fs-bg-elevated: #1a2338; --fs-bg-input: #0e1526;
+  --fs-bg-tab-active: #101828; --fs-bg-tab-inactive: #172034; --fs-bg-hover: #212c46;
+  --fs-fg-primary: #dbe4f5; --fs-fg-secondary: #8494b3; --fs-fg-disabled: #4e5c78;
+  --fs-border: #243049; --fs-border-strong: #354463;
+  --fs-accent: #22d3ee; --fs-accent-hover: #4ddff2; --fs-accent-fg: #06283a; --fs-accent-dim: rgba(34,211,238,.12);
+  --fs-ok: #34d399; --fs-warn: #fbbf24; --fs-danger: #fb7185; --fs-info: #38bdf8;
+  --fs-warn-dim: rgba(251,191,36,.12); --fs-danger-dim: rgba(251,113,133,.12);
+  --fs-selection: #1d3a5f;
+  --fs-term-bg: #101828;
+  --fs-radius: 4px; --fs-shadow: 0 8px 28px rgba(0,0,0,.55);
+  --fs-radius-lg: 8px; --fs-bg-tooltip: #1a2338; --fs-fg-tooltip: #dbe4f5;
+  --fs-density: 1.2;
+}
+:root[data-theme="hc"] {
+  color-scheme: dark; /* 原生控件（滚动条/下拉/输入）随主题，Daylight 不再是暗件混进亮页（评审 P2-6） */
+  --fs-bg-app: #000000; --fs-bg-panel: #000000; --fs-bg-elevated: #0a0a0a; --fs-bg-input: #000000;
+  --fs-bg-tab-active: #000000; --fs-bg-tab-inactive: #000000; --fs-bg-hover: #1c1c1c;
+  --fs-fg-primary: #ffffff; --fs-fg-secondary: #d0d0d0; --fs-fg-disabled: #8a8a8a;
+  --fs-border: #6e6e6e; --fs-border-strong: #a8a8a8;
+  --fs-accent: #ffd400; --fs-accent-hover: #ffe14d; --fs-accent-fg: #000000; --fs-accent-dim: rgba(255,212,0,.16);
+  --fs-ok: #4dff88; --fs-warn: #ffd400; --fs-danger: #ff6b61; --fs-info: #61d5ff;
+  --fs-warn-dim: rgba(255,212,0,.16); --fs-danger-dim: rgba(255,107,97,.16);
+  --fs-selection: #3a3a00;
+  --fs-term-bg: #000000;
+  --fs-radius: 2px; --fs-shadow: 0 8px 28px rgba(0,0,0,.9);
+  --fs-radius-lg: 8px; --fs-bg-tooltip: #0a0a0a; --fs-fg-tooltip: #ffffff;
+  --fs-density: 1.2;
+}

@@ -1,0 +1,27 @@
+# cargo-about 配置：生成随安装包分发的 THIRD_PARTY_NOTICES（审计2 #7）。
+# accepted 与 deny.toml 的 [licenses].allow 同口径（宽松许可白名单 + 定向例外）。
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",   # 定向例外（clipboard-win/error-code，见 deny.toml 同条目理由）
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# 三平台四个目标：产物随哪几个平台分发，清单就覆盖哪几个平台的依赖树
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# 全仓依赖清单含 build-dep（NASM/cc 等构建工具链），不进运行时产物，
+# 与 npm 侧 --omit=dev 同口径：清单只答「运行时产物里有什么」
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

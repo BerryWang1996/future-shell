@@ -1,0 +1,29 @@
+# 必须落在 write（单次确认）的日常写操作。
+#
+# 这一批守的是**上界**：它们确实有副作用，所以不能自动放行；但它们不该触发强确认。
+# 把日常的 mkdir/cp/git commit 都判成 dangerous，等于把强确认这件事本身贬值。
+write	ordinary-write	mkdir -p /tmp/build
+write	ordinary-write	touch /tmp/marker
+write	ordinary-write	cp app.conf app.conf.bak
+write	ordinary-write	mv old.log archive/old.log
+write	ordinary-write	rm /tmp/scratch
+write	ordinary-write	rm -rf /tmp/build
+write	ordinary-write	rm -rf ./node_modules
+write	ordinary-write	chmod 644 app.conf
+write	ordinary-write	chown deploy app.conf
+write	ordinary-write	tar -czf backup.tar.gz src
+write	ordinary-write	git commit -m wip
+write	ordinary-write	git checkout -b feature
+write	ordinary-write	npm install
+write	ordinary-write	apt-get install nginx
+write	ordinary-write	systemctl restart nginx
+write	ordinary-write	docker run -d nginx
+write	ordinary-write	sed -i s/a/b/ app.conf
+write	ordinary-write	truncate -s 0 /tmp/app.log
+write	ordinary-write	ln -s /opt/app/bin/app /tmp/app
+write	ordinary-write	kill 1234
+write	ordinary-write	mount /dev/sdb1 /mnt
+write	ordinary-write	cp /etc/hosts /tmp/hosts.bak
+write	ordinary-write	find /tmp -name core -delete
+write	ordinary-write	echo aGVsbG8= | base64 -d
+write	ordinary-write	curl https://example.com/f.tgz -o /tmp/f.tgz

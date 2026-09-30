@@ -1,0 +1,818 @@
+# 发布流水线：tag 触发 → 版本一致性 → 质量门禁 → 三平台安装包 → 签名验证 → 安装 smoke → draft release
+#
+# ════════════════════════════════════════════════════════════════════════════════
+# 签名配置与发布材料
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# 1. 代码签名凭据（仓库 Settings → Secrets and variables → Actions）
+#    Windows Authenticode：
+#      WINDOWS_CERTIFICATE          base64 编码的 .pfx（`base64 -w0 cert.pfx`）
+#      WINDOWS_CERTIFICATE_PASSWORD .pfx 的导出口令
+#    macOS codesign + notarization：
+#      APPLE_CERTIFICATE            base64 编码的 Developer ID Application .p12
+#      APPLE_CERTIFICATE_PASSWORD   .p12 口令
+#      APPLE_SIGNING_IDENTITY       形如 "Developer ID Application: NAME (TEAMID)"
+#      APPLE_ID / APPLE_PASSWORD    Apple ID 与 **app-specific password**（不是账号密码）
+#      APPLE_TEAM_ID                10 位 Team ID
+#    这些 secret 一个都没有硬编码在本文件里，也不该有。
+#    **审计2 #1：tag 触发的正式构建里，缺失签名 secret 默认直接失败**——
+#    未签名产物连 draft release 都进不去，人工想发布也没有可发布的文件。
+#    workflow_dispatch（无 tag 的打包链路验证）仍允许无签名构建，产物只上传为 artifact、
+#    不会自动成为 release。
+#
+#    **未签名发布的显式开关（维护者裁定 2026-09-29）**：本项目是开源项目，不购买商业
+#    代码签名证书。仓库变量（Settings → Secrets and variables → Actions → **Variables**，
+#    不是 Secrets）`ALLOW_UNSIGNED_RELEASE=true` 时，tag 构建在缺证书的平台上改为
+#    警告放行。放行不是静默的：job summary 标「未签名正式发布」，draft release 正文
+#    顶部自动写明哪些平台未签名、如何用 SHA256SUMS 与构建来源证明核对完整性、以及
+#    SmartScreen / Gatekeeper 的放行方法。变量不存在或不是字面量 `true` 时仍按原规则失败。
+#    macOS 无 Apple 证书时打 ad-hoc 签名（`signingIdentity: "-"`）：Apple Silicon 上完全
+#    无签名的可执行文件会被判「已损坏」，ad-hoc 签名至少让用户能按 Gatekeeper 提示放行。
+#
+# 2. SBOM：cargo-cyclonedx 覆盖主工作区与 RDP helper 的全目标依赖，npm sbom 覆盖前端。
+#    notices job 生成三份许可材料，bundle job 下载后随安装包分发。
+#
+# 3. 构建来源证明（provenance attestation）
+#    release job 使用 actions/attest-build-provenance 给全部附件签 SLSA provenance，
+#    所需写权限仅在该 job 启用；验证侧使用 `gh attestation verify`。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # 手动触发：用于在不打 tag 的情况下验证打包链路是否还通（产物只上传为 artifact，
+  # 不会创建 release——create-release job 有 tag 判据）
+  workflow_dispatch:
+
+# 最小权限起步，只有真正要写 release 的 job 单独提权
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 版本一致性（审计2 #2）：tag 与 Cargo workspace / tauri.conf.json / package.json /
+  # helper / 锁文件必须逐字一致，数据库 APP_VERSION 从包版本派生。
+  # 脚本自带 --selftest（正例 2 + 反例 23），先自检再上岗。
+  # ──────────────────────────────────────────────────────────────────────────────
+  version-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24 }
+      - name: Self-test the version gate script first
+        run: bash .github/scripts/check-version-consistency.sh --selftest
+      - name: Assert version consistency (tag / workspace / tauri / frontend / APP_VERSION)
+        run: bash .github/scripts/check-version-consistency.sh
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 门禁：直接复用 CI 的完整矩阵（fmt / clippy / cargo-deny / nextest / cargo test，
+  # 其中 Linux 的 FS_ITEST 容器化 itest 以**真 sshd 回环**验证连接/认证/跳板/SFTP 主路径）。
+  # 复用而非在本文件里抄一遍，是为了杜绝「CI 改了、release 没跟上」的漂移——
+  # 那种漂移的表现形式恰好是最坏的一种：发版流水线的门禁比日常 CI 还松。
+  # ──────────────────────────────────────────────────────────────────────────────
+  gate:
+    needs: version-gate
+    uses: ./.github/workflows/ci.yml
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 第三方许可材料（审计2 #7）：随安装包分发 THIRD_PARTY_NOTICES。
+  # 集中生成一次（cargo-about + 前端 npm sbom 脚本），三个平台的 bundle job 各自
+  # 下载后放进 tauri resources——不复制生成逻辑到三个平台。
+  # 仓库里提交的是最近一次生成的快照（本地 dev 构建也要有 resources 可打），
+  # 发版时以本 job 的实时生成为准。
+  # ──────────────────────────────────────────────────────────────────────────────
+  notices:
+    needs: version-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 分支头（该仓库不发 semver tag）
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # cargo-about 0.9.x 的 CLI 是 opt-in feature，只装默认 feature 会「成功但没二进制」
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+      - name: Install frontend deps (本地 license 字段回落的来源)
+        run: npm ci
+        working-directory: frontend
+      - name: Generate THIRD_PARTY_NOTICES (Rust + 前端)
+        run: |
+          set -euo pipefail
+          cargo about generate --locked -o app/THIRD_PARTY_NOTICES.html about.hbs
+          cargo about generate --manifest-path rdp-helper/Cargo.toml --locked --config about.toml -o app/THIRD_PARTY_NOTICES.rdp.html about.hbs
+          node frontend/scripts/gen-licenses.mjs > app/THIRD_PARTY_NOTICES.npm.md
+          # 自检：三份文件非空且 HTML 含许可条目（生成器静默失败 = 空文件混进安装包）
+          [ -s app/THIRD_PARTY_NOTICES.html ]
+          [ -s app/THIRD_PARTY_NOTICES.rdp.html ]
+          [ -s app/THIRD_PARTY_NOTICES.npm.md ]
+          grep -q "Used by" app/THIRD_PARTY_NOTICES.html
+          grep -q "Used by" app/THIRD_PARTY_NOTICES.rdp.html
+          ls -la app/THIRD_PARTY_NOTICES.*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: notices
+          path: |
+            app/THIRD_PARTY_NOTICES.html
+            app/THIRD_PARTY_NOTICES.rdp.html
+            app/THIRD_PARTY_NOTICES.npm.md
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # SBOM（审计2 #3 的一半）：Rust 侧 cargo-cyclonedx（每 crate 一份，workspace 全集
+  # 打包）+ 前端 npm sbom（CycloneDX）。随 release 资产分发；provenance 见 release job。
+  # ──────────────────────────────────────────────────────────────────────────────
+  sbom:
+    needs: version-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 分支头（该仓库不发 semver tag）
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM (Rust + 前端)
+        run: |
+          set -euo pipefail
+          cargo cyclonedx -f json --target all
+          cargo cyclonedx --manifest-path rdp-helper/Cargo.toml -f json --target all
+          mkdir -p sbom
+          # 0.5.9 的输出是**每个 workspace 成员一份** <crate>.cdx.json，落在各 crate 目录
+          find . -name '*.cdx.json' -not -path '*/node_modules/*' -not -path './sbom/*' -exec cp {} sbom/ \;
+          ls sbom/
+          # 前端从 lockfile 生成（无需 node_modules）：npm sbom 是 npm ≥10.9 自带命令
+          (cd frontend && npm sbom --sbom-format cyclonedx --json --omit dev --package-lock-only > ../sbom/frontend.cdx.json)
+          # 自检：SBOM 非空且是合法 JSON（生成器静默失败 = 空文件混进 release）
+          [ -s sbom/frontend.cdx.json ]
+          python3 - <<'PYEOF'
+          import json, glob
+          files = glob.glob("sbom/*.cdx.json")
+          assert files, "no sbom files"
+          total = 0
+          for f in files:
+              with open(f, encoding="utf-8") as fh:
+                  b = json.load(fh)
+              assert "components" in b or "serialNumber" in b, f
+              total += len(b.get("components", []))
+          print(f"SBOM ok: {len(files)} 份，组件总数 {total}")
+          PYEOF
+          tar -czf sbom.tar.gz sbom
+          ls -la sbom.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: sbom.tar.gz
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 打包：产出**安装包**而不是裸二进制
+  # 裸 exe/ELF 对用户是不可用的交付物——没有图标、没有卸载入口、Linux 上缺 webkit 运行时
+  # 依赖直接起不来。这里改走 `cargo tauri build`，产出 MSI/NSIS/DMG/AppImage/deb。
+  # ──────────────────────────────────────────────────────────────────────────────
+  bundle:
+    needs: [gate, notices]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            name: windows-x86_64
+            rust_targets: x86_64-pc-windows-msvc
+            # tauri 的 --target 留空即用宿主 target
+            tauri_target: ""
+            bundles: nsis,msi
+            artifact_glob: |
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*.exe
+          - os: macos-14
+            name: macos-universal
+            # 通用二进制一次覆盖 Intel 与 Apple Silicon，省掉一条矩阵分支，
+            # 也省掉「用户下错架构」这一整类支持成本
+            rust_targets: x86_64-apple-darwin,aarch64-apple-darwin
+            tauri_target: universal-apple-darwin
+            bundles: dmg
+            artifact_glob: |
+              target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          # 刻意钉 22.04 而不是 ubuntu-latest：AppImage / deb 的 glibc 与 webkit 符号版本
+          # 由**构建机**决定，在 24.04 上产出的包在 22.04 用户机上会因 glibc 过新而拒绝启动。
+          # 构建基线只能往老里选，不能跟着 latest 漂。
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            rust_targets: x86_64-unknown-linux-gnu
+            tauri_target: ""
+            bundles: appimage,deb
+            artifact_glob: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/appimage/*.AppImage
+    runs-on: ${{ matrix.os }}
+    env:
+      # secrets 上下文在 step 的 if: 里不可直接引用，必须先落到 env 再用 env.* 判空。
+      # 这也顺带保证了「secret 未配置」与「secret 配了空串」表现一致：都走跳过分支。
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      # 只认字面量 true（大小写敏感）：变量写错成 "yes"/"True" 时按未放行处理，宁严勿宽。
+      ALLOW_UNSIGNED: ${{ vars.ALLOW_UNSIGNED_RELEASE == 'true' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # 所有第三方 action 一律钉 commit SHA，不用 @v4 这种可变标签：
+      # 标签是可以被仓库所有者（或拿到其凭据的人）重新指向任意 commit 的，
+      # 供应链攻击的标准入口就是把 @v4 悄悄挪到带后门的 commit 上。
+      # 钉 SHA 后升级变成一次显式 PR——这正是我们想要的摩擦。
+      # 升级方法：`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 分支头（该仓库不发 semver tag）
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.name }}
+
+      # NASM 是 Windows MSVC 的硬前置：russh 默认 feature aws-lc-rs → aws-lc-sys 的 build
+      # script 在 x86_64-pc-windows-msvc 上必须找到 nasm.exe，否则 panic 中止构建。
+      # windows runner 镜像不自带。
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+        if: runner.os == 'Windows'
+
+      - name: Install Linux webkit deps
+        if: runner.os == 'Linux'
+        # libdbus-1-dev：tauri 2.11 默认 dbus 特性的系统库兜底；libxdo-dev / libssl-dev：tauri 官方 CI 前置
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libdbus-1-dev libxdo-dev libssl-dev
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 前端在这里显式构建，而不是交给 tauri.conf.json 的 beforeBuildCommand：
+      # beforeBuildCommand 只有 `npm run build`，不含安装步骤，而发版必须走 `npm ci`
+      # （严格按 lockfile 装，不允许 npm 顺手升 caret 范围内的小版本）。既然这里已经
+      # 完整构建过一次，下面的 build 步骤会把 beforeBuildCommand 覆盖成空串，免得同一份
+      # 前端被编译两遍——Tauri CLI 对空串 hook 的定义就是「不执行」，不是「执行空命令」。
+      - name: Build frontend (tauri generate_context! 的编译期前置)
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - name: Install Tauri CLI
+        # --locked：按 crate 自带的 Cargo.lock 装，避免 CLI 的传递依赖在两次发版之间漂移。
+        # CLI 与 tauri crate 独立发版；tauri 2.11.5 对应的可用 CLI 是 2.11.4。
+        run: cargo install tauri-cli --version "2.11.4" --locked
+
+      # ── 第三方许可材料（审计2 #7）──────────────────────────────────────────
+      # notices job 实时生成的清单，覆盖掉仓库里的快照——发版包里的材料永远
+      # 与本次依赖树一致。文件位于 app/ 下，tauri bundle.resources 随安装包分发。
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notices
+          path: app
+
+      # ── Windows 代码签名（可选）─────────────────────────────────────────────
+      # Tauri 走的是 Windows 证书存储 + 指纹，而不是直接吃 .pfx 文件路径，所以要先导入。
+      # 导入的是 CurrentUser\My，runner 是一次性的，作业结束即随虚拟机销毁。
+      - name: Import Windows signing certificate
+        id: win-cert
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $pfx = [System.IO.Path]::GetTempFileName() + ".pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pass = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pass
+          Remove-Item $pfx -Force
+          # 只输出指纹（公开信息），私钥留在证书存储里，绝不进日志
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          "kind=real" >> $env:GITHUB_OUTPUT
+
+      # ── CI 内自签证书（M4b 出口「签名链路」；出口原文：CI 内自签证书可接受）────────
+      #
+      # 没有这一步的话，**整条签名链路在没配 secret 时零执行**：导入证书、
+      # 拼 certificateThumbprint、signtool verify 三段代码从没跑过，而它们第一次运行
+      # 会是在真正发版的那一刻。那正是最不该发现「原来这里写错了」的时刻。
+      #
+      # 于是非 tag 构建现场造一张自签证书，把同一条链路完整走一遍。签出来的产物
+      # **不可分发**（用户机上会是「未知发布者」），但这一步验的不是信任链，
+      # 是「我们的构建脚本会不会签、签完验不验得过」。
+      #
+      # 刻意只在非 tag 上做：tag 构建必须用真证书，上面那道 Enforce 闸已经拦死。
+      # 两者互斥由 if 条件保证——`win-cert` 有输出就说明真证书在，这一步整个跳过。
+      - name: Generate self-signed certificate (non-tag signing rehearsal)
+        id: win-selfcert
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE == '' && env.IS_TAG != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # CodeSigningCert 类型 + EKU 1.3.6.1.5.5.7.3.3（代码签名）——少了 EKU 的话
+          # signtool 会签上去但 verify /pa 判失败，那种"签了却验不过"最难查。
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=FutureShell CI Self-Signed (NOT FOR DISTRIBUTION)" `
+            -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA -KeyLength 2048 `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -NotAfter (Get-Date).AddDays(30)
+          # 自签证书不在受信根里，verify /pa 会因链不可信而失败。把它也放进
+          # CurrentUser\Root，让**这台 runner** 信任它——只影响这个一次性容器。
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root','CurrentUser'
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          "kind=self-signed" >> $env:GITHUB_OUTPUT
+          Write-Host "自签证书已生成：$($cert.Thumbprint)（30 天有效，仅本次构建）"
+
+      # ── RDP helper（externalBin 的打包前置）────────────────────────────────
+      # helper 是独立工作区，`cargo tauri build` 不会编它；而 app/binaries/ 在
+      # .gitignore 里（产物不入库），CI 的全新 checkout 里不存在。缺了这一步，
+      # tauri 打包时找不到 sidecar：要么构建整条红掉，要么（若容缺）装出来的
+      # 包里没有 fs-rdp-helper——用户点 RDP 只会得到「安装不完整，请重装」。
+      # macOS 通用二进制要对每个 rust target 各建一份（Tauri 按 triple 找 sidecar）。
+      - name: Build RDP helper (externalBin sidecar)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in $(echo "${{ matrix.rust_targets }}" | tr ',' ' '); do
+            if [ "$t" = "x86_64-pc-windows-msvc" ] || [ "$t" = "x86_64-unknown-linux-gnu" ] || [ "$t" = "x86_64-apple-darwin" ] || [ "$t" = "aarch64-apple-darwin" ]; then
+              bash scripts/build-rdp-helper.sh --target "$t"
+            else
+              echo "::error::matrix 出现未认识的 rust target：${t}（helper 的构建步骤需要同步认识它）"
+              exit 1
+            fi
+          done
+          if [ "${{ matrix.tauri_target }}" = "universal-apple-darwin" ]; then
+            lipo -create app/binaries/fs-rdp-helper-x86_64-apple-darwin app/binaries/fs-rdp-helper-aarch64-apple-darwin -output app/binaries/fs-rdp-helper-universal-apple-darwin
+            lipo -verify_arch x86_64 arm64 app/binaries/fs-rdp-helper-universal-apple-darwin
+          fi
+
+      # ── 打包 ────────────────────────────────────────────────────────────────
+      # --config 里塞两件事：
+      #   1. beforeBuildCommand 置空（理由见上面前端构建步骤的注释）
+      #   2. Windows 签名指纹（有则填，无则该键不出现，Tauri 走不签名路径）
+      # 时间戳服务器用 DigiCert 的公开 RFC3161 端点：不带时间戳的 Authenticode 签名会随
+      # 证书到期一起失效，已装机的旧版本会突然变成"未知发布者"。
+      - name: Build installers
+        shell: bash
+        env:
+          # 这些是 Tauri CLI 原生识别的 macOS 签名/公证环境变量；未配置时为空串，
+          # Tauri 检测到空即跳过 codesign 与 notarize，不会报错。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 真证书优先；没有真证书时用本次构建现场生成的自签证书（非 tag 才有）。
+          # 两者互斥：win-cert 只在有 secret 时跑，win-selfcert 只在没 secret 时跑。
+          WIN_THUMBPRINT: ${{ steps.win-cert.outputs.thumbprint || steps.win-selfcert.outputs.thumbprint }}
+        run: |
+          set -euo pipefail
+          CONFIG='{"build":{"beforeBuildCommand":""}}'
+          if [ -n "${WIN_THUMBPRINT:-}" ]; then
+            CONFIG=$(printf '{"build":{"beforeBuildCommand":""},"bundle":{"windows":{"certificateThumbprint":"%s","digestAlgorithm":"sha256","timestampUrl":"http://timestamp.digicert.com"}}}' "$WIN_THUMBPRINT")
+          fi
+          # 无 Apple 证书时 ad-hoc 签名：Apple Silicon 拒绝运行完全无签名的代码（提示「已损坏」
+          # 且没有放行入口）；ad-hoc 签名不提供身份，但让 Gatekeeper 走「无法验证开发者 →
+          # 仍要打开」那条用户可操作的路径。有证书时 Tauri 用 APPLE_SIGNING_IDENTITY，不经这里。
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            CONFIG='{"build":{"beforeBuildCommand":""},"bundle":{"macOS":{"signingIdentity":"-"}}}'
+          fi
+          TARGET_ARG=""
+          if [ -n "${{ matrix.tauri_target }}" ]; then
+            TARGET_ARG="--target ${{ matrix.tauri_target }}"
+          fi
+          # `-- --locked` 之后的参数透传给 cargo build：锁死 Cargo.lock，
+          # 发版构建绝不允许 cargo 顺手升级依赖（那会让产物与门禁跑过的依赖树不是同一棵）
+          cargo tauri build --bundles ${{ matrix.bundles }} $TARGET_ARG --config "$CONFIG" -- --locked
+
+      # ── 签名强制（审计2 #1）────────────────────────────────────────────────
+      # 正式发版（tag）的产物必须签名：secret 缺失时旧实现只写 summary、构建照常成功，
+      # draft release 里躺着未签名产物，人工一点就发出去。现在把「有没有证书」从
+      # 「事后记账」变成「前置断言」——签不上的 tag 构建在这里直接死掉。
+      - name: Enforce signing on tag builds
+        if: env.IS_TAG == 'true'
+        shell: bash
+        run: |
+          missing=""
+          if [ "${{ runner.os }}" = "Windows" ] && [ -z "${WINDOWS_CERTIFICATE:-}" ]; then
+            missing="WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD"
+          fi
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            missing="APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY"
+          fi
+          if [ -z "$missing" ]; then
+            echo "签名 secret 已配置（${{ runner.os }}）"
+          elif [ "${ALLOW_UNSIGNED:-}" = "true" ]; then
+            echo "::warning::${{ runner.os }} 未签名正式发布：${missing} 未配置，仓库变量 ALLOW_UNSIGNED_RELEASE=true 放行"
+          else
+            echo "::error::tag 构建必须签名：${missing} 未配置。开源项目确认不签名时，设置仓库变量 ALLOW_UNSIGNED_RELEASE=true（Variables，不是 Secrets）"
+            exit 1
+          fi
+
+      # ── 签名验证（审计2 #1 的另一半）───────────────────────────────────────
+      # 「已签名」不许再由「secret 存在」推断——secret 在、签名步骤跑挂了、产物裸奔，
+      # 同样会被下面的验证逮住。只验**签名是否存在**，不验证书链身份（runner 上验
+      # 发行者链需要额外信任配置，留作后续增强；notarization 由 stapler 实测）。
+      # 条件是「**签了没有**」而不是「有没有 secret」：自签演练那一路同样要验，
+      # 否则演练只演到「签名步骤没报错」——而签名步骤不报错与产物真的带上了签名，
+      # 是两件事（Tauri 在指纹拼错时是静默跳过签名的）。
+      - name: Verify Windows signature with signtool
+        if: runner.os == 'Windows' && (steps.win-cert.outputs.thumbprint != '' || steps.win-selfcert.outputs.thumbprint != '')
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool not found" }
+          $files = @(Get-ChildItem -Recurse target/release/bundle -Include *.exe,*.msi)
+          if ($files.Count -eq 0) { throw "no artifacts to verify" }
+          foreach ($f in $files) {
+            Write-Host "verifying $($f.FullName)"
+            & $signtool.FullName verify /pa /v $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $($f.FullName)" }
+          }
+
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPS=$(find target -maxdepth 4 -type d -name '*.app' | head -1)
+          if [ -z "${APPS:-}" ]; then echo "::error::未找到 .app 包"; exit 1; fi
+          echo "验证 $APPS"
+          codesign --verify --deep --strict --verbose=2 "$APPS"
+          spctl --assess --type execute --verbose=4 "$APPS"
+          # 公证回执必须已经钉在包上（stapler validate）；没钉上先钉（Tauri 公证成功后
+          # 会尝试 staple，但以实测为准），钉不上即失败。
+          if ! xcrun stapler validate "$APPS"; then
+            xcrun stapler staple "$APPS"
+            xcrun stapler validate "$APPS"
+          fi
+          echo "codesign + notarization 验证通过"
+
+      # ── 签名状态记账 ────────────────────────────────────────────────────────
+      # 写进 job summary 而不是只 echo 到日志：日志会被折叠、会过期，summary 是发版决策时
+      # 真正会被看一眼的地方。tag 构建到不了「未签名」分支（上一道闸已拦），dispatch
+      # 验证构建的未签名状态仍须**可见**。
+      - name: Record signing status
+        if: always()
+        shell: bash
+        run: |
+          # 自签演练**不算**已签名。写成 "true" 的话 summary 上会写着「已签名且验证通过」，
+          # 而那份产物在用户机上是「未知发布者」——发版决策看的就是这一行，
+          # 它不能把演练说成正式签名。
+          SELF_SIGNED="${{ steps.win-selfcert.outputs.thumbprint != '' }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            CONFIGURED="${{ env.WINDOWS_CERTIFICATE != '' }}"
+            SCHEME="Windows Authenticode（signtool /pa 已验证）"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            CONFIGURED="${{ env.APPLE_CERTIFICATE != '' }}"
+            SCHEME="macOS codesign + notarization（spctl/stapler 已验证）"
+          else
+            CONFIGURED="n/a"
+            SCHEME="Linux（本项目不做包签名）"
+          fi
+          {
+            echo "### ${{ matrix.name }} 签名状态"
+            echo ""
+            if [ "$CONFIGURED" = "true" ]; then
+              echo "已签名且验证通过 — $SCHEME"
+            elif [ "$CONFIGURED" = "n/a" ]; then
+              echo "不适用 — $SCHEME"
+            elif [ "$SELF_SIGNED" = "true" ]; then
+              echo "**自签演练** — 用本次构建现场生成的一次性证书走通了完整签名链路"
+              echo "（导入证书 → certificateThumbprint → 打包签名 → signtool /pa 验证）。"
+              echo ""
+              echo "**产物不可分发**：自签证书不在任何受信根里，用户机上会显示「未知发布者」。"
+              echo "这一步验的不是信任链，是构建脚本会不会签、签完验不验得过——"
+              echo "没有它的话，那三段代码第一次运行会是在真正发版的那一刻。"
+              echo ""
+              echo "正式发版仍须配置 WINDOWS_CERTIFICATE（tag 构建会被签名强制闸拦下）。"
+            elif [ "${IS_TAG:-}" = "true" ]; then
+              echo "**未签名正式发布** — $SCHEME 的 secrets 未配置，"
+              echo "仓库变量 ALLOW_UNSIGNED_RELEASE=true 放行（维护者裁定：开源项目不购买商业证书）。"
+              echo ""
+              echo "draft release 正文会写明未签名平台与完整性核对方法（SHA256SUMS + 构建来源证明）。"
+            else
+              echo "**本次产物未签名** — $SCHEME 的 secrets 未配置，签名步骤已跳过。"
+              echo ""
+              echo "本次是 workflow_dispatch 的打包链路验证；产物只上传为 artifact，不会成为 release。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-${{ matrix.name }}
+          path: ${{ matrix.artifact_glob }}
+          # 打包静默失败（bundler 没产出文件）过去会一路走到 release 才被发现，
+          # 而那时 release 已经建出来了。这里直接把空产物判为失败。
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 安装包 smoke test（审计2 #5）
+  #
+  # 编译成功不能证明安装包可安装、依赖齐全。这里对**最终产物**做：真实安装 → 文件布局
+  # 落位 → 启动（完整 GUI 路径 + `--smoke-exit-ms` 自动退出，退出码 0 = 窗口建起来了、
+  # webkit/GTK 等动态依赖齐全）→ 覆盖重装（同版本 reinstall，验证安装器对已有安装的处理
+  # 与既有数据保留）→ 卸载 → 确认清理。
+  #
+  # 「基础连接」不在本 job：那是引擎层能力，已由上游 gate（ci.yml 的 Linux 容器化 itest，
+  # FS_ITEST=1）以真 sshd 回环覆盖 connect/auth/jump/sftp 主路径。安装后的 GUI 应用没有
+  # headless 连接面，为它再造一条连接 CLI 属于新功能而非 smoke。
+  #
+  # 未覆盖（据实记下）：跨版本真实升级（vN → vN+1 覆盖安装）需要上一次 release 的产物，
+  # 单次 release run 内无法构造；Windows/macOS 的启动冒烟依赖 runner 的图形会话，若
+  # 平台 runner 镜像变更导致不可用，以「进程存活至自动退出且退出码 0」为唯一判据。
+  # ──────────────────────────────────────────────────────────────────────────────
+  smoke:
+    needs: bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            name: windows-x86_64
+          - os: macos-14
+            name: macos-universal
+          - os: ubuntu-22.04
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: installer-${{ matrix.name }}
+          path: artifacts
+
+      - name: "Smoke test (Windows: MSI + NSIS)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDir = 'C:\Program Files\FutureShell'
+
+          function Invoke-SmokeLaunch {
+            # 排除卸载器：NSIS 装完后目录里同时有主程序与 uninstall*.exe，
+            # 把卸载器当主程序拉起会顺手把刚装好的东西卸掉
+            $exe = Get-Item -LiteralPath (Join-Path $installDir 'future-shell-app.exe')
+            if (-not $exe) { throw "安装目录里没有可执行文件：$installDir" }
+            if (-not (Test-Path (Join-Path $installDir 'fs-rdp-helper.exe'))) { throw "安装目录里缺少 RDP helper" }
+            $p = Start-Process -FilePath $exe.FullName -ArgumentList '--smoke-exit-ms','20000' -WindowStyle Hidden -PassThru
+            # 启动失败（缺 DLL 等）表现为提前退出且非零；正常路径在 20s 后自退 0
+            if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "smoke 启动超时未退出" }
+            if ($p.ExitCode -ne 0) { throw "smoke 启动退出码 $($p.ExitCode)" }
+            Write-Host "launch smoke 通过：$($exe.FullName)"
+          }
+
+          $msi = Get-ChildItem artifacts -Filter *.msi | Select-Object -First 1
+          $nsis = Get-ChildItem artifacts -Filter *.exe | Select-Object -First 1
+
+          Write-Host "== MSI 安装 =="
+          $msiLog = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', $msiLog -Wait
+          if (-not (Test-Path $installDir)) { throw "MSI 安装后目录不存在" }
+          Invoke-SmokeLaunch
+
+          Write-Host "== MSI 覆盖重装（同版本 reinstall）=="
+          Start-Process msiexec -ArgumentList '/i', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-reinstall.log" -Wait
+          if (-not (Test-Path $installDir)) { throw "MSI 重装后目录不存在" }
+          Invoke-SmokeLaunch
+
+          Write-Host "== MSI 卸载 =="
+          Start-Process msiexec -ArgumentList '/x', $msi.FullName, '/qn', '/norestart', '/l*v', "$env:RUNNER_TEMP\msi-uninstall.log" -Wait
+          if (Test-Path $installDir) { throw "MSI 卸载后安装目录仍在" }
+
+          Write-Host "== NSIS 静默安装 =="
+          $installDir = Join-Path $env:LOCALAPPDATA 'FutureShell'
+          Start-Process $nsis.FullName -ArgumentList '/S' -Wait
+          if (-not (Test-Path $installDir)) { throw "NSIS 安装后目录不存在" }
+          Invoke-SmokeLaunch
+
+          Write-Host "== NSIS 卸载 =="
+          $un = Get-ChildItem -Path $installDir -Filter 'uninstall*.exe' -Recurse | Select-Object -First 1
+          if (-not $un) { throw "找不到 NSIS 卸载器" }
+          Start-Process $un.FullName -ArgumentList '/S' -Wait
+          if (Test-Path $installDir) { throw "NSIS 卸载后安装目录仍在" }
+          Write-Host "Windows smoke 通过"
+
+      - name: "Smoke test (macOS: DMG)"
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG=$(ls artifacts/*.dmg | head -1)
+          MNT=/tmp/futureshell-smoke
+          mkdir -p "$MNT"
+          hdiutil attach "$DMG" -nobrowse -mountpoint "$MNT"
+
+          launch_smoke() {
+            local app_dir bin_name bin
+            app_dir="/Applications/$(basename "$APP")"
+            bin_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_dir/Contents/Info.plist")
+            bin="$app_dir/Contents/MacOS/$bin_name"
+            [ -x "$bin" ] || { echo "::error::安装后找不到主程序"; exit 1; }
+            [ -x "$app_dir/Contents/MacOS/fs-rdp-helper" ] || { echo "::error::安装后缺少 RDP helper"; exit 1; }
+            python3 -c 'import subprocess,sys; subprocess.run([sys.argv[1], "--smoke-exit-ms", "20000"], check=True, timeout=90)' "$bin"
+            echo "launch smoke 通过：$bin"
+          }
+
+          APP=$(find "$MNT" -maxdepth 1 -name '*.app' | head -1)
+          cp -R "$APP" /Applications/
+          # 签名验证属于 tag 构建（bundle job 已验原产物）；dispatch 的无签名验证构建
+          # 照常走安装/启动/卸载，签名在这里不必再验
+          if [ "${IS_TAG:-}" = "true" ]; then
+            codesign --verify --deep --strict "/Applications/$(basename "$APP")"
+          fi
+          launch_smoke
+
+          echo "== 覆盖重装（同版本覆盖拷贝）=="
+          rm -rf "/Applications/$(basename "$APP")"
+          cp -R "$APP" /Applications/
+          launch_smoke
+
+          echo "== 卸载 =="
+          rm -rf "/Applications/$(basename "$APP")"
+          [ ! -e "/Applications/$(basename "$APP")" ] || { echo "::error::卸载后 .app 仍在"; exit 1; }
+
+          hdiutil detach "$MNT"
+          echo "macOS smoke 通过"
+
+      - name: "Smoke test (Linux: deb + AppImage)"
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+          launch_smoke() { # $1=可执行文件
+            timeout 90 xvfb-run -a "$1" --smoke-exit-ms 20000
+            echo "launch smoke 通过：$1"
+          }
+
+          DEB=$(ls artifacts/*.deb | head -1)
+          PKG=$(dpkg-deb -f "$DEB" Package)
+
+          echo "== deb 安装 =="
+          # apt 同时安装包内声明的 WebKit/GTK 运行时依赖，dpkg -i 不会补依赖。
+          sudo apt-get install -y "./$DEB"
+          BIN=/usr/bin/future-shell-app
+          [ -x "$BIN" ] || { echo "::error::deb 安装后缺少主程序"; exit 1; }
+          [ -x /usr/bin/fs-rdp-helper ] || { echo "::error::deb 安装后缺少 RDP helper"; exit 1; }
+          launch_smoke "$BIN"
+
+          echo "== deb 覆盖重装（同版本 reinstall）=="
+          sudo apt-get install -y --reinstall "./$DEB"
+          launch_smoke "$BIN"
+
+          echo "== deb 卸载 =="
+          sudo dpkg -r "$PKG"
+          [ ! -e "$BIN" ] || { echo "::error::卸载后二进制仍在：$BIN"; exit 1; }
+
+          echo "== AppImage（无安装面：extract-and-run 即「安装」，删除即「卸载」）=="
+          APPIMAGE=$(ls artifacts/*.AppImage | head -1)
+          chmod +x "$APPIMAGE"
+          APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 xvfb-run -a "$APPIMAGE" --smoke-exit-ms 20000
+          rm -f "$APPIMAGE"
+          echo "Linux smoke 通过"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 发布：汇总产物 + 校验和 + 建 draft release
+  # ──────────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [smoke, sbom, notices]
+    # 只有 tag 推送才建 release；workflow_dispatch 的手动验证到 smoke 为止
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      # 审计2 #3：构建来源证明（SLSA provenance）。attest-build-provenance 对全部
+      # 发布资产签名证明「这些文件出自本次 workflow run」；验证侧 `gh attestation verify`。
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: installer-*
+          # 摊平到一层，避免 release 资产名里混进 job 名目录
+          merge-multiple: true
+
+      - name: Fetch SBOM and notices artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: "@(sbom|notices)"
+          merge-multiple: true
+      - name: Extract SBOM tarball next to the installers
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # GitHub Release 附件没有目录层级；在校验和与 provenance 生成前摊平，
+          # 保证 SBOM 同样被 artifacts/* 覆盖，校验和中的名字也与下载文件一致。
+          tar -xzf sbom.tar.gz --strip-components=1
+          rm sbom.tar.gz
+
+      # 校验和是「零遥测、公开分发」这条产品线上给用户的完整性凭据——与代码签名并列，
+      # 而不是替代。文件名沿用 sha256sum 的原生格式，用户可以直接 `sha256sum -c SHA256SUMS.txt`。
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # 按名字排序，让同一份产物在不同次构建中生成逐字节一致的校验和文件
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort | \
+            xargs -r sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # 先生成校验和，确保来源证明覆盖校验和文件本身和全部发布附件。
+      # 验证命令：gh attestation verify <file> --repo <owner>/<repo>
+      - name: Attest build provenance for all release assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+      # 未签名说明：哪个平台没签就写哪个，签了就不写——正文只陈述本次产物的事实。
+      - name: Write signing notice for release body
+        env:
+          WIN_SIGNED: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+          MAC_SIGNED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : > release-notice.md
+          if [ "$WIN_SIGNED" != "true" ] || [ "$MAC_SIGNED" != "true" ]; then
+            {
+              echo "## 安装包签名说明"
+              echo ""
+              echo "FutureShell 是开源项目，本版本以下安装包**未使用商业代码签名证书**："
+              [ "$WIN_SIGNED" != "true" ] && echo "- Windows（.msi / .exe）：首次运行时 SmartScreen 可能提示「未知发布者」，点「更多信息 → 仍要运行」。"
+              [ "$MAC_SIGNED" != "true" ] && echo "- macOS（.dmg）：仅 ad-hoc 签名、未经 Apple 公证。首次打开被拦时，到「系统设置 → 隐私与安全性」点「仍要打开」。"
+              echo ""
+              echo "请用以下任一方式核对下载文件未被篡改："
+              echo ""
+              echo '```'
+              echo "sha256sum -c SHA256SUMS.txt --ignore-missing"
+              echo "gh attestation verify <下载的文件> --repo ${REPO}"
+              echo '```'
+              echo ""
+              echo "构建来源证明（SLSA provenance）由本仓库的 GitHub Actions 发布流水线生成，覆盖全部附件。"
+            } > release-notice.md
+          fi
+          cat release-notice.md
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          body_path: release-notice.md
+          # draft 默认开：发版是不可逆动作（GitHub release 一旦 publish 就会触发订阅者通知、
+          # 被镜像站抓取），tag 推错、产物缺一个平台——这些都要留一个人工闸门。
+          # 确认无误后在 Web UI 上点 Publish。
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.msi
+            artifacts/*.exe
+            artifacts/*.dmg
+            artifacts/*.deb
+            artifacts/*.AppImage
+            artifacts/SHA256SUMS.txt
+            artifacts/*.cdx.json
+            artifacts/THIRD_PARTY_NOTICES.html
+            artifacts/THIRD_PARTY_NOTICES.rdp.html
+            artifacts/THIRD_PARTY_NOTICES.npm.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restate release checklist on the release job
+        run: |
+          {
+            echo "### Release 已创建为 **draft**"
+            echo ""
+            echo "发布前请逐项确认："
+            echo ""
+            echo "- [ ] 三个平台的安装包都在（Windows MSI+NSIS / macOS DMG / Linux deb+AppImage）"
+            echo "- [ ] SHA256SUMS.txt 覆盖了全部产物"
+            echo "- [ ] 各平台 bundle job 的签名验证状态（signtool / spctl+stapler）符合本次发版预期"
+            echo "- [ ] smoke job 三平台全绿（安装/启动/覆盖重装/卸载）"
+            echo "- [ ] 版本一致性已在 version-gate 通过（tag = workspace = tauri = 前端 = APP_VERSION）"
+            echo "- [ ] SBOM（Rust 全集 + 前端）与 THIRD_PARTY_NOTICES 已随资产发布"
+            echo "- [ ] provenance 已生成（gh attestation verify 可验）"
+          } >> "$GITHUB_STEP_SUMMARY"

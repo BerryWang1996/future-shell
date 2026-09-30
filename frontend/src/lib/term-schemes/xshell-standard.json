@@ -1,0 +1,8 @@
+{
+  "id": "xshell-standard", "name": "Xshell Standard", "dark": true,
+  "background": "#1b1b1b", "foreground": "#cfcfcf",
+  "cursor": "#e0e0e0", "selection": "#264f78",
+  "ansi": ["#000000","#cd0000","#00cd00","#cdcd00","#0000cd","#cd00cd","#00cdcd","#e5e5e5",
+           "#7f7f7f","#ff0000","#00ff00","#ffff00","#5c5cff","#ff00ff","#00ffff","#ffffff"],
+  "boldBright": true
+}

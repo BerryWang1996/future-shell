@@ -1,0 +1,44 @@
+[package]
+name = "fs_sshengine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fs_connmgr = { path = "../connmgr" }
+russh.workspace = true
+russh-sftp.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+zeroize.workspace = true
+futures = "0.3"
+# SftpOps / ExecChannel 都必须是 dyn-compatible（`Arc<dyn SftpOps>` / `&dyn ExecChannel`），
+# 原生 AFIT 生成的 impl-Trait 返回类型不满足对象安全，故仍需 async-trait 装箱。
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tempfile = "3"
+# 仅测试用：进程内 russh 服务端要现场生成一对主机密钥（`PrivateKey::random` 要一个 CryptoRng）。
+# ssh-key 用的 rand_core 0.10 本身不带系统熵源，故由 rand 的 sys_rng 提供。选它而不是把私钥当 fixture
+# 写进仓库：这个仓库正在接受安全审计，一份**看起来像真私钥**的常量既会触发密钥扫描，
+# 也会让后来的人得先花时间确认它是不是真的泄露了。该版本已在 Cargo.lock 中，不引入新包。
+rand = { version = "0.10", features = ["sys_rng"] }
+# 仅测试用：`russh::ChannelMsg::Data` 的载荷类型是 `bytes::Bytes`，脚本化通道要现场造消息。
+# russh 不转出这个类型，故直接声明。该版本已在 Cargo.lock 中（russh 的传递依赖），不引入新包。
+bytes = "1"
+
+# 仅 unix 测试用：`.fspart` 必须以 0600 落地（审计2 #16）。open 时给的 mode 会被 umask 掐掉，
+# 所以断言前必须先把 umask 钉成一个**宽松**的已知值（0o022）——否则一台 umask 已经是 0o077
+# 的开发机上，连「什么都不做」都能得出 0600，用例假绿。umask(2) 是进程级的，没有 libc 就调不到。
+# 该版本已在 Cargo.lock 中（tokio/mio 的传递依赖），不引入新包。
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
