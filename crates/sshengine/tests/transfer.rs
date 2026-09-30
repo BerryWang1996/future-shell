@@ -785,7 +785,7 @@ async fn download_pipeline_grows_the_window_on_fast_reads() {
 }
 
 /// 慢链路上窗口必须停在 1：排在窗口后面的读要等前面的数据传完才被应答，而每次读受
-/// 120 s 数据面预算约束——固定深窗口会把 1.0.0 能用的慢链路变成超时。
+/// 120 s 数据面预算约束——固定 8 个在途时低于约 17 KB/s 即超时，窗口停在 1 时下限约 2.1 KB/s。
 /// 一次读 6 s（≥ 5 s 的「慢」门槛）时，任何时刻都只能有一个读在途。
 #[tokio::test(start_paused = true)]
 async fn download_pipeline_stays_sequential_on_slow_reads() {
