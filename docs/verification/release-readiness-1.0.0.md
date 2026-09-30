@@ -171,16 +171,22 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
 6. **run 36702772941**（PR #4 分支 `dd0f161`，含以上全部修复）：**整轮通过**。五个关卡一次全绿；
    三平台安装包构建成功；三平台 smoke 全部通过——Windows MSI 与 NSIS、macOS DMG、Linux deb 与
    AppImage 的安装、启动（`--smoke-exit-ms`）、覆盖重装、卸载。release 任务按设计跳过（无 tag）。
+7. **run 36711509923**（PR #4 合入后的 `main` = `84bb2f1`）：**整轮通过**，关卡一次全绿（未重跑），
+   三平台安装包与三平台 smoke 全部通过。这是打 `v1.0.0` tag 之前 `main` 上的发布流水线证据。
+   同日的其余偶发失败另见下方待办：`scale.rs` 吞吐门禁压线；另有 Windows 上 `app/src/rdp_share.rs`
+   的测试建库偶发 `database is locked`（每个测试独占库文件，`Db::open` 串行执行且设了 15 s
+   busy_timeout，疑为 runner 的实时扫描使 SQLite 的共享冲突重试耗尽，未查实），重跑即过。
 
 ## 正式发版前仍需完成
 
 - ~~推送修复~~：`release/1.0.0` 已推送，PR #2 于 2026-09-30 合入 `main`，#1 已关闭。
 - ~~三平台 CI~~：PR #2、#3 的 Windows/macOS/Linux runner 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
-- 仓库 Variables 已设 `ALLOW_UNSIGNED_RELEASE=true`。PR #4 合入后在 `main` 上再跑一次
-  release.yml，确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
+- ~~发布试跑~~：仓库 Variables 已设 `ALLOW_UNSIGNED_RELEASE=true`；PR #4 合入后 `main` 上
+  release.yml 整轮通过（上文第 7 条），三平台 bundle 与安装/覆盖安装/卸载 smoke 均已验证。
 - **吞吐门禁压线**：`scale.rs` 的合计 ≥20 MB/s 在 ubuntu runner 上测得 19.3–22 MB/s，打 tag 时的
   发布关卡可能因此失败，重跑即过。1.0.0 测的是逐块 `write_at` / `read_range`（当时产品的切法）；
   1.0.1（PR #5）改测产品的流水线传输路径，本机 100 MB/s 以上。打 tag 若撞上，如实记录后重跑。
+  Windows 的 `database is locked` 偶发同理。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
 - PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。
