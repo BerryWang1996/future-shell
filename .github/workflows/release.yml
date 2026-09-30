@@ -335,6 +335,9 @@ jobs:
         id: win-selfcert
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE == '' && env.IS_TAG != 'true'
         shell: pwsh
+        # 生成证书与导入受信根都是秒级操作。设上限是因为这一步曾经无声挂住：导入 CurrentUser\Root
+        # 会弹「是否安装此证书」确认框，非交互 runner 上没人点，任务一直挂到 6 小时的默认上限。
+        timeout-minutes: 5
         run: |
           $ErrorActionPreference = 'Stop'
           # CodeSigningCert 类型 + EKU 1.3.6.1.5.5.7.3.3（代码签名）——少了 EKU 的话
@@ -347,8 +350,11 @@ jobs:
             -CertStoreLocation Cert:\CurrentUser\My `
             -NotAfter (Get-Date).AddDays(30)
           # 自签证书不在受信根里，verify /pa 会因链不可信而失败。把它也放进
-          # CurrentUser\Root，让**这台 runner** 信任它——只影响这个一次性容器。
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root','CurrentUser'
+          # LocalMachine\Root，让**这台 runner** 信任它——只影响这个一次性容器。
+          # 不能用 CurrentUser\Root：往当前用户的根存储加证书，Windows 会弹安全确认框，
+          # 非交互会话里永远等不到点击（2026-09-30 main 上的发布试跑因此挂住）。托管 runner
+          # 以管理员运行，写机器存储不弹框，签名校验同样信任它。
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root','LocalMachine'
           $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
           "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
           "kind=self-signed" >> $env:GITHUB_OUTPUT
