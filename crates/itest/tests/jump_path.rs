@@ -178,19 +178,24 @@ async fn editing_the_jump_chain_changes_the_actual_path() {
     // ── ③ 再加一跳（b1 → b2 → 目标）：目标看到的必须变成**末跳** b2
     let mut two = one.clone();
     two.jump = vec![first_hop(&b1, 2).await, inner_hop(&b2, 3).await];
-    let via2 = peer_ip_seen_by_target(&two, &secrets, &db, events.clone()).await;
+    let (via2, live) = peer_ip_and_live_handle(&two, &secrets, &db, events.clone()).await;
     assert_eq!(
         via2, b2_ip,
         "两跳链上目标看到的对端必须是**末跳** b2（实得 {via2}；等于 {b1_ip} 则说明第二跳没建、\
          链被截断在 b1）"
     );
-    // 两跳链的中间跳也必须真的被用上：b1 上应能看到一条到 b2 的出向连接
+    // 两跳链的中间跳也必须真的被用上：b1 上应能看到一条到 b2 的出向连接。
+    //
+    // 必须在**连接还活着时**看。断开之后再看是竞态：若 b2 那头先关，b1 这一侧走
+    // CLOSE_WAIT → LAST_ACK 转眼就消失、不留 TIME_WAIT，grep 数到 0——1.0.0 发布试跑的
+    // ubuntu 关卡就是这样红的，而同一份代码在 PR 的 CI 上是绿的。
     let b1_seen = b1
         .run(&format!(
             "(netstat -tn 2>/dev/null || ss -tn) | grep -c '{b2_ip}:{INTERNAL_SSH_PORT}' || true"
         ))
         .await
         .unwrap();
+    drop(live);
     assert_ne!(
         b1_seen.trim(),
         "0",
