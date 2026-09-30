@@ -173,9 +173,17 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    AppImage 的安装、启动（`--smoke-exit-ms`）、覆盖重装、卸载。release 任务按设计跳过（无 tag）。
 7. **run 36711509923**（PR #4 合入后的 `main` = `84bb2f1`）：**整轮通过**，关卡一次全绿（未重跑），
    三平台安装包与三平台 smoke 全部通过。这是打 `v1.0.0` tag 之前 `main` 上的发布流水线证据。
-   同日的其余偶发失败另见下方待办：`scale.rs` 吞吐门禁压线；另有 Windows 上 `app/src/rdp_share.rs`
-   的测试建库偶发 `database is locked`（每个测试独占库文件，`Db::open` 串行执行且设了 15 s
-   busy_timeout，疑为 runner 的实时扫描使 SQLite 的共享冲突重试耗尽，未查实），重跑即过。
+   同日的其余偶发失败：`scale.rs` 吞吐门禁压线（见下方待办）；Windows 上 `app/src/rdp_share.rs`
+   的测试建库偶发 `database is locked`——根因是测试库目录名只靠纳秒时间戳，并发启动的测试撞名、
+   打开同一个库，迁移互相踩踏（实验：同一新库并发打开两次，80 次里 4 次 locked、18 次 already
+   exists），PR #7 改用进程内序号修复。
+8. **release 任务（只在 tag 时执行，从未运行过）**：逐行审查 tag 路径后，用第 7 条试跑的真实
+   artifact 在本地模拟 release 任务，发现 Windows / Linux 安装包在 `msi/`、`nsis/`、`deb/`、
+   `appimage/` 子目录里——`merge-multiple` 不摊平 artifact 内部目录——导致 4 条 Release 附件通配
+   匹配不到（`fail_on_unmatched_files` 下 **v1.0.0 发版会直接失败**）、校验和只覆盖 dmg。PR #8 在算
+   校验和之前加「摊平」一步，模拟复核：10 条通配全部匹配、校验和覆盖 5 个安装包。同一 PR 把
+   macOS smoke 的 `codesign --verify --deep --strict` 从「只在 tag」改为每次都验，分支试跑
+   run 36725162385 整轮通过，ad-hoc 签名产物输出 `valid on disk` / `satisfies its Designated Requirement`。
 
 ## 正式发版前仍需完成
 
@@ -186,7 +194,6 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
 - **吞吐门禁压线**：`scale.rs` 的合计 ≥20 MB/s 在 ubuntu runner 上测得 19.3–22 MB/s，打 tag 时的
   发布关卡可能因此失败，重跑即过。1.0.0 测的是逐块 `write_at` / `read_range`（当时产品的切法）；
   1.0.1（PR #5）改测产品的流水线传输路径，本机 100 MB/s 以上。打 tag 若撞上，如实记录后重跑。
-  Windows 的 `database is locked` 偶发同理。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
 - PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。
