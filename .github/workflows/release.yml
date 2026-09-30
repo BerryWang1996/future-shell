@@ -676,11 +676,10 @@ jobs:
 
           APP=$(find "$MNT" -maxdepth 1 -name '*.app' | head -1)
           cp -R "$APP" /Applications/
-          # 签名验证属于 tag 构建（bundle job 已验原产物）；dispatch 的无签名验证构建
-          # 照常走安装/启动/卸载，签名在这里不必再验
-          if [ "${IS_TAG:-}" = "true" ]; then
-            codesign --verify --deep --strict "/Applications/$(basename "$APP")"
-          fi
+          # 签名完整性每次都验，不只 tag：无 Apple 证书时 tag 与 dispatch 的产物是同一种 ad-hoc
+          # 签名（bundle 的 signingIdentity "-"），只在 tag 上验等于这一步第一次运行就在正式
+          # 发版的那一刻。有证书时 bundle job 另验身份与公证，这里只验签名本身完好。
+          codesign --verify --deep --strict --verbose=2 "/Applications/$(basename "$APP")"
           launch_smoke
 
           echo "== 覆盖重装（同版本覆盖拷贝）=="
@@ -757,7 +756,8 @@ jobs:
         with:
           path: artifacts
           pattern: installer-*
-          # 摊平到一层，避免 release 资产名里混进 job 名目录
+          # 各 artifact 解到同一目录，而不是各自一个 artifact 名的子目录。注意它**不**摊平
+          # artifact 内部的目录：见下方「Flatten installers」
           merge-multiple: true
 
       - name: Fetch SBOM and notices artifacts
@@ -774,6 +774,27 @@ jobs:
           # 保证 SBOM 同样被 artifacts/* 覆盖，校验和中的名字也与下载文件一致。
           tar -xzf sbom.tar.gz --strip-components=1
           rm sbom.tar.gz
+
+      # upload-artifact 以多个路径的公共父目录为根保留子目录：Windows 与 Linux 各上传两个
+      # 路径，下载后是 msi/、nsis/、deb/、appimage/ 下的文件（macOS 只有一个路径，dmg 在顶层）。
+      # 而 Release 附件没有目录层级，下面的校验和（-maxdepth 1）、来源证明与 files 通配都只看
+      # 顶层——不摊平的话 Windows/Linux 安装包既不进校验和、也匹配不到附件通配，
+      # fail_on_unmatched_files 让整个发版失败（2026-09-30 用 main 上试跑的真实 artifact
+      # 本地模拟：4 条通配未匹配、校验和只覆盖 dmg 一个安装包）。
+      - name: Flatten installers
+        run: |
+          set -euo pipefail
+          cd artifacts
+          find . -mindepth 2 -type f -print0 | while IFS= read -r -d '' f; do
+            b=$(basename "$f")
+            [ ! -e "$b" ] || { echo "::error::摊平时重名：$b"; exit 1; }
+            mv "$f" "$b"
+          done
+          find . -mindepth 1 -type d -empty -delete
+          if find . -mindepth 1 -type d | grep -q .; then
+            echo "::error::摊平后仍有子目录"; find . -type d; exit 1
+          fi
+          ls -la
 
       # 校验和是「零遥测、公开分发」这条产品线上给用户的完整性凭据——与代码签名并列，
       # 而不是替代。文件名沿用 sha256sum 的原生格式，用户可以直接 `sha256sum -c SHA256SUMS.txt`。
