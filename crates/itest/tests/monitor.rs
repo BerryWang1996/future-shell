@@ -26,8 +26,12 @@ async fn monitor_numbers_match_container_tools_within_5_percent() {
 
     // 被测命令与对照命令在**同一次 exec** 里跑，中间只隔几毫秒——分两次 exec 会让
     // 「误差」里混进真实的内存波动，那时 5% 这个阈值就不再是在衡量我们的采集正确性。
+    //
+    // 负载在采集**之前和之后**各读一次：内核每 5 s 刷新 /proc/loadavg，几毫秒的间隔仍可能
+    // 恰好跨过一次刷新（CI 上撞过：我们 5.01、对照 4.93）。5 s 一次的刷新不可能在这几毫秒里
+    // 发生两次，所以前后两次读数里至少有一次与采集时刻相同。
     let combined = format!(
-        "{cmd}\necho '===REF==='\nfree -m | awk '/^Mem:/{{print \"REF_TOTAL=\" $2; print \"REF_USED=\" $3}}'\necho \"REF_LOAD=$(cat /proc/loadavg)\"\nhead -1 /proc/stat",
+        "FS_REF_L0=$(cat /proc/loadavg)\n{cmd}\necho '===REF==='\nfree -m | awk '/^Mem:/{{print \"REF_TOTAL=\" $2; print \"REF_USED=\" $3}}'\necho \"REF_LOAD0=$FS_REF_L0\"\necho \"REF_LOAD=$(cat /proc/loadavg)\"\nhead -1 /proc/stat",
         cmd = monitor_command()
     );
     let out = sshd.run(&combined).await.unwrap();
@@ -82,18 +86,26 @@ async fn monitor_numbers_match_container_tools_within_5_percent() {
     );
     // 三项必须分别对上 /proc/loadavg 的第 1/2/3 列。只断言 load_1 非空太松：
     // 三项都取同一列（5/15 分钟恒等于 1 分钟）会活下来，而那在界面上看不出来。
-    let ref_load: Vec<f32> = reference
-        .lines()
-        .find_map(|l| l.strip_prefix("REF_LOAD="))
-        .unwrap_or_else(|| panic!("对照负载取不到：{reference}"))
-        .split_whitespace()
-        .take(3)
-        .map(|x| x.parse().unwrap_or(-1.0))
-        .collect();
-    assert_eq!(ref_load.len(), 3, "对照负载不是三项：{ref_load:?}");
-    assert_eq!(snap.load_1, Some(ref_load[0]), "1 分钟负载取错列");
-    assert_eq!(snap.load_5, Some(ref_load[1]), "5 分钟负载取错列");
-    assert_eq!(snap.load_15, Some(ref_load[2]), "15 分钟负载取错列");
+    // 判据是「三项**整体**等于采集前或采集后的某一次读数」：逐列放宽容差的话，负载接近时
+    // 取错列也能混过去；整体相等则不会。
+    let ref_load = |key: &str| -> Vec<Option<f32>> {
+        reference
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("对照负载 {key} 取不到：{reference}"))
+            .split_whitespace()
+            .take(3)
+            .map(|x| x.parse().ok())
+            .collect()
+    };
+    let (before, after) = (ref_load("REF_LOAD0="), ref_load("REF_LOAD="));
+    assert_eq!(before.len(), 3, "对照负载不是三项：{before:?}");
+    assert_eq!(after.len(), 3, "对照负载不是三项：{after:?}");
+    let ours = vec![snap.load_1, snap.load_5, snap.load_15];
+    assert!(
+        ours == before || ours == after,
+        "负载三项与 /proc/loadavg 对不上——取错列（我们 {ours:?}，采集前 {before:?}，采集后 {after:?}）"
+    );
 
     // CPU：单次采集只有累计值，百分比要两次差量。这里验「拿得到 /proc/stat 首行且能解析」，
     // 差量算法本身由单测 cpu_percent_between 钉。
