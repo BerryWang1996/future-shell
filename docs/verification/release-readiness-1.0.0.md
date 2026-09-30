@@ -137,12 +137,30 @@ MSI 采用管理提取，在独立便携目录和独立 WebView 数据目录内�
 
 macOS 仍无本地替代；macOS 专属代码仅 3 处且均为平台常量分支，其余 Unix 代码已由 Linux 镜像覆盖。
 
+## 2026-09-30 发布试跑
+
+候选分支经 PR #2 合入 `main` 后，用 `workflow_dispatch` 在 `main` 上跑 release.yml（无 tag，只产出
+artifact、不生成 Release）。前两次都没有跑通，三处问题此前都没有暴露过：每次都是前一处先失败，
+后面的步骤根本没有执行。
+
+1. **run 36673520609**（`main` = `5f97442`）：ubuntu 关卡红在
+   `jump_path::editing_the_jump_chain_changes_the_actual_path`，打包全部跳过。用例在会话句柄丢弃、
+   连接开始拆除之后才去跳板 1 上 netstat 到跳板 2 的连接；若跳板 2 那头先关，跳板 1 一侧不留
+   TIME_WAIT，计数为 0。同一份代码在 PR #2 的 CI 上是绿的。PR #3 改为连接存活时检查。
+2. **run 36681479869**（`main` = `eddc444`）：五个关卡全绿，Linux 包通过。
+   - macOS 通用包：构建 helper 的 `x86_64-apple-darwin` 时 E0463（找不到 `core`）。matrix 的交叉目标
+     装在 stable 上，而 `rust-toolchain.toml` 钉了 1.97.1，进仓库目录后用的是后者。
+   - Windows 包：挂在签名演练的「生成自签证书」一步 30 分钟以上，手动取消。该步把证书导入
+     `CurrentUser\Root`，Windows 会弹安装确认框，非交互 runner 上没人点，会一直等到 6 小时上限。
+   - 两处在 PR #4 修复：交叉目标装到钉死的工具链上；证书改导入 `LocalMachine\Root`，并给该步
+     设 5 分钟上限。
+
 ## 正式发版前仍需完成
 
-- **推送修复**：推送 `release/1.0.0`，以它重开 PR 并关闭 #1。
-- Windows/macOS/Linux GitHub runner 的 CI 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
-- 在仓库 Variables 设 `ALLOW_UNSIGNED_RELEASE=true`，用 `workflow_dispatch` 跑一次 release.yml，
-  确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
+- ~~推送修复~~：`release/1.0.0` 已推送，PR #2 于 2026-09-30 合入 `main`，#1 已关闭。
+- ~~三平台 CI~~：PR #2、#3 的 Windows/macOS/Linux runner 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
+- 仓库 Variables 已设 `ALLOW_UNSIGNED_RELEASE=true`。PR #4 合入后在 `main` 上再跑一次
+  release.yml，确认三平台 bundle 与安装/覆盖安装/卸载 smoke 通过。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
 - PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。
