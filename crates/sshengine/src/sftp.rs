@@ -72,6 +72,12 @@ pub trait SftpOps: Send + Sync {
     async fn stat_meta(&self, path: &str) -> Result<FileMeta, Error>;
     async fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error>;
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error>;
+    /// 把远端文件已写入的内容刷到服务器磁盘（`fsync@openssh.com`）。服务端不支持该扩展时
+    /// 是空操作而不是错误——那种服务端上客户端本来就没有办法要求落盘。
+    ///
+    /// **刻意不给默认实现**：这是持久性语义，默认 `Ok(())` 会让某个实现者「编译通过、
+    /// 静默不落盘」。上传在提交（rename）之前调它一次；`write_at` 自己不落盘，见其实现注释。
+    async fn sync(&self, path: &str) -> Result<(), Error>;
     /// SSH_FXP_SETSTAT(size)：把远端文件截断/扩展到 `size` 字节。
     ///
     /// 存在的唯一理由是 `write_at` 刻意不带 TRUNCATE（否则毁断点续传）：非续传上传若覆写一个
@@ -470,7 +476,28 @@ impl SftpOps for RemoteSftp {
         f.write_all(data)
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
-        f.flush().await.map_err(|e| Error::Sftp(e.to_string()))
+        // `shutdown` 而不是 `flush`：两者都会等齐全部 WRITE 应答（写失败照样在这里报出来），
+        // 区别在收尾——russh-sftp 的 `flush` 在服务端支持 `fsync@openssh.com` 时**每次都发 fsync**，
+        // 而传输引擎按 256 KiB 一块调用本方法，64 MiB 就是 256 次服务端落盘同步。
+        // 1.0.0 候选的 CI 实测上行只有 4.5–9 MB/s（同环境 OpenSSH 顺序写 34–56 MB/s）就栽在这里。
+        // `shutdown` 则是等应答 + **等待** CLOSE 完成：关闭时的错误（如配额/磁盘满在关闭时才报）
+        // 也能报出来——原来 `flush` 之后靠 drop 触发的 `close_nowait` 会把它吞掉。
+        // 持久性改由上传提交前的一次 `sync` 保证（见 `transfer::commit`）。
+        f.shutdown().await.map_err(|e| Error::Sftp(e.to_string()))
+    }
+
+    async fn sync(&self, path: &str) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+        // 只读打开即可：fsync(2) 对只读 fd 同样把该文件的脏页刷盘，且不引入写语义的副作用。
+        let mut f = self
+            .inner
+            .open_with_flags(path, russh_sftp::protocol::OpenFlags::READ)
+            .await
+            .map_err(|e| Error::Sftp(e.to_string()))?;
+        f.sync_all()
+            .await
+            .map_err(|e| Error::Sftp(format!("fsync {path}：{e}")))?;
+        f.shutdown().await.map_err(|e| Error::Sftp(e.to_string()))
     }
 
     async fn truncate(&self, path: &str, size: u64) -> Result<(), Error> {
@@ -611,6 +638,36 @@ fn mtime_secs(m: &russh_sftp::client::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RemoteSftp::write_at` 不得调 `flush()`：russh-sftp 的 `flush` 在服务端支持
+    /// `fsync@openssh.com` 时每次都发 fsync，传输引擎逐块调用本方法，等于每 255 KiB 一次
+    /// 服务端落盘（1.0.0 候选 CI 上行 4.5–9 MB/s 的根因）。持久性由上传提交前的一次
+    /// `sync` 负责。这件事只在真服务端的吞吐上才看得见，故用源码级守卫钉住。
+    #[test]
+    fn remote_write_at_does_not_fsync_every_chunk() {
+        let src = include_str!("sftp.rs");
+        let start = src
+            // 带 `{` 的那一处才是 RemoteSftp 的实现（trait 里的声明以分号结尾）
+            .find("async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {")
+            .expect("RemoteSftp::write_at 不见了");
+        let body = &src[start
+            ..start
+                + src[start..]
+                    .find(
+                        "
+    }
+",
+                    )
+                    .expect("函数尾")];
+        assert!(
+            !body.contains(".flush()"),
+            "write_at 又调了 flush()（逐块 fsync）"
+        );
+        assert!(
+            body.contains(".shutdown()"),
+            "write_at 须以 shutdown 等齐写应答并等待关闭"
+        );
+    }
 
     fn item(i: usize) -> (String, bool, bool, u64, i64, Option<String>) {
         (
@@ -782,6 +839,9 @@ mod tests {
         }
         async fn truncate(&self, _: &str, _: u64) -> Result<(), Error> {
             Err(Error::Sftp("mem: truncate 未实现".into()))
+        }
+        async fn sync(&self, _: &str) -> Result<(), Error> {
+            Err(Error::Sftp("mem: sync 未实现".into()))
         }
         async fn mkdir(&self, _: &str) -> Result<(), Error> {
             Err(Error::Sftp("mem: mkdir 未实现".into()))

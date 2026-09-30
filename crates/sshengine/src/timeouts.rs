@@ -204,6 +204,10 @@ impl SftpOps for TimedSftp {
         )
         .await
     }
+    async fn sync(&self, path: &str) -> Result<(), Error> {
+        self.guard("sync", path, self.control, self.inner.sync(path))
+            .await
+    }
     async fn mkdir(&self, path: &str) -> Result<(), Error> {
         self.guard("mkdir", path, self.control, self.inner.mkdir(path))
             .await

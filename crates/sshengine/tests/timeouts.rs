@@ -104,6 +104,10 @@ impl SftpOps for Fake {
             .await;
         Ok(())
     }
+    async fn sync(&self, path: &str) -> Result<(), Error> {
+        self.enter(format!("sync {path}")).await;
+        Ok(())
+    }
     async fn truncate(&self, path: &str, size: u64) -> Result<(), Error> {
         self.enter(format!("truncate {path} {size}")).await;
         Ok(())

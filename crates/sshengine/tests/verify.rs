@@ -104,6 +104,9 @@ impl SftpOps for FakeFs {
         v.resize(size as usize, 0);
         Ok(())
     }
+    async fn sync(&self, _: &str) -> Result<(), fs_sshengine::Error> {
+        Ok(())
+    }
     async fn mkdir(&self, _: &str) -> Result<(), fs_sshengine::Error> {
         Ok(())
     }

@@ -4,7 +4,7 @@
 use fs_sshengine::sftp::{Entry, SftpOps};
 use fs_sshengine::transfer::{
     next_transfer_id, Direction, Sha256Hex, TransferEvent, TransferJob, TransferManager,
-    TransferState,
+    TransferState, CHUNK,
 };
 use fs_sshengine::verify::ExecChannel;
 use std::collections::HashMap;
@@ -107,6 +107,11 @@ struct FakeFs {
     /// 或者干脆是个不存在的目录。这一格不是锦上添花：规范化失败时的**降级**语义
     ///（退回纯词法键、照常传输）与成功时的**收紧**语义同等重要，而降级路径只能从这里造。
     canon: Mutex<HashMap<String, Option<String>>>,
+    /// `sync` 与 `rename` 的先后流水（`"sync <path>"` / `"rename <from> -> <to>"`）。
+    /// 「提交前先落盘」是次序问题，只看最终内容证明不了次序。
+    commit_log: Mutex<Vec<String>>,
+    /// 置位后 `sync` 失败：验证落盘失败时**不改名**、临时件留着、最终目标不被触碰。
+    fail_sync: Mutex<bool>,
 }
 
 /// (第几次数据读之后, 目标路径, 新内容, 新 mtime)
@@ -351,7 +356,20 @@ impl SftpOps for FakeFs {
     /// 而「最终目标未被破坏」则会因为最终目标压根没被写过而假绿。拒绝已存在目标同样是
     /// 必需的：SSH_FXP_RENAME 没有覆盖语义，`commit` 的「删旧目标后重试一次」分支
     /// 只有在 fake 端如实拒绝时才会被走到。
+    async fn sync(&self, path: &str) -> Result<(), fs_sshengine::Error> {
+        self.commit_log.lock().unwrap().push(format!("sync {path}"));
+        if *self.fail_sync.lock().unwrap() {
+            return Err(fs_sshengine::Error::Sftp(format!(
+                "injected fsync failure: {path}"
+            )));
+        }
+        Ok(())
+    }
     async fn rename(&self, from: &str, to: &str) -> Result<(), fs_sshengine::Error> {
+        self.commit_log
+            .lock()
+            .unwrap()
+            .push(format!("rename {from} -> {to}"));
         {
             let mut budget = self.fail_rename_to.lock().unwrap();
             if let Some(n) = budget.get_mut(to) {
@@ -612,6 +630,89 @@ async fn upload_chunked_with_progress_and_done() {
     );
 }
 
+/// 提交次序：临时件**先落盘再改名**。`write_at` 为吞吐不再逐块 fsync，整个文件的持久性
+/// 系于提交前这一次——次序反了（先改名后落盘）或干脆漏掉，断电后可能得到一个名字是新的、
+/// 内容残缺的文件，而用户原来的文件已被顶替。
+#[tokio::test]
+async fn upload_syncs_the_part_before_renaming_it_into_place() {
+    let fs = Arc::new(FakeFs::default());
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let local = write_temp(b"durable-before-rename");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(up_job(local, "/durable.bin", "ns-sync-order"))
+        .await
+        .expect("submit 应受理");
+    loop {
+        let e = next_event(&mut ev).await;
+        if e.id != id {
+            continue;
+        }
+        match e.state {
+            TransferState::Done => break,
+            TransferState::Failed(msg) => panic!("顺利上传不应失败: {msg}"),
+            _ => {}
+        }
+    }
+    let log = fs.commit_log.lock().unwrap().clone();
+    let sync_at = log
+        .iter()
+        .position(|l| l == "sync /durable.bin.fspart")
+        .unwrap_or_else(|| panic!("提交前没有对临时件落盘：{log:?}"));
+    let rename_at = log
+        .iter()
+        .position(|l| l == "rename /durable.bin.fspart -> /durable.bin")
+        .unwrap_or_else(|| panic!("没有提交改名：{log:?}"));
+    assert!(sync_at < rename_at, "必须先落盘再改名：{log:?}");
+}
+
+/// 落盘失败即不提交：不改名、最终目标原样、临时件留着（续传/重试还有路可走）。
+#[tokio::test]
+async fn upload_does_not_commit_when_the_final_sync_fails() {
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/keep.bin".into(), b"users-original".to_vec());
+    *fs.fail_sync.lock().unwrap() = true;
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let local = write_temp(b"new-content-that-was-not-durable");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(up_job(local, "/keep.bin", "ns-sync-fail"))
+        .await
+        .expect("submit 应受理");
+    let msg = loop {
+        let e = next_event(&mut ev).await;
+        if e.id != id {
+            continue;
+        }
+        match e.state {
+            TransferState::Failed(msg) => break msg,
+            TransferState::Done => panic!("落盘失败却报完成"),
+            _ => {}
+        }
+    };
+    assert!(msg.contains("落盘"), "失败原因要说清是落盘失败：{msg}");
+    assert_eq!(
+        fs.get("/keep.bin").as_deref(),
+        Some(&b"users-original"[..]),
+        "落盘失败时用户原文件必须原样"
+    );
+    assert!(
+        !fs.commit_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("rename")),
+        "落盘失败后不得再改名"
+    );
+    assert!(
+        fs.get("/keep.bin.fspart").is_some(),
+        "临时件应留着，续传才有得续"
+    );
+}
+
 #[tokio::test]
 async fn retries_then_succeeds() {
     let fs = Arc::new(FakeFs::default());
@@ -649,19 +750,19 @@ async fn retries_then_succeeds() {
 /// 而老断言照样全绿。**判别式只能是读偏移**，故本用例钉 `read_log`。
 ///
 /// 构造：注入三次读失败让第一件传输耗尽三次尝试并以 Failed 收尾——此时磁盘上留下的是
-/// 引擎自己写的 `.fspart`（256 KiB）+ `.fspart.fsmeta`。第二件同参数重投，必须从 256 KiB 起跑。
+/// 引擎自己写的 `.fspart`（一个分块）+ `.fspart.fsmeta`。第二件同参数重投，必须从 一个分块 起跑。
 /// 这同时钉住了两条不变量：失败**不得**清掉身份记录（否则续传永远续不上），
 /// 以及成功提交**必须**清掉它（否则目录里堆垃圾）。
 #[tokio::test]
 async fn resume_downloads_from_offset() {
     let fs = Arc::new(FakeFs::default());
-    // 700 000 字节 = 3 个分块（256 KiB / 256 KiB / 171 712）
+    // 700 000 字节 = 3 个分块（CHUNK / CHUNK / 余下 177 760）
     let payload: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
     fs.files
         .lock()
         .unwrap()
         .insert("/big.bin".into(), payload.clone());
-    // 读流水：#0 @0 成功 → #1 @262144 失败（重试）→ #2 @262144 失败 → #3 @262144 失败（终态）
+    // 读流水：#0 @0 成功 → #1 @CHUNK 失败（重试）→ #2 @CHUNK 失败 → #3 @CHUNK 失败（终态）
     *fs.fail_read_indices.lock().unwrap() = vec![1, 2, 3];
     let mgr = TransferManager::spawn(fs.clone(), 1);
     let root = temp_subdir(); // 下载沙箱根（submit 前必须已存在）
@@ -679,8 +780,8 @@ async fn resume_downloads_from_offset() {
     }
     assert_eq!(
         std::fs::metadata(&part).map(|m| m.len()).ok(),
-        Some(262_144),
-        "第一件应留下一个 256 KiB 的半成品（否则第二件续的不是同一个局面）"
+        Some(CHUNK as u64),
+        "第一件应留下一个 一个分块 的半成品（否则第二件续的不是同一个局面）"
     );
     assert!(
         meta.exists(),
@@ -699,13 +800,13 @@ async fn resume_downloads_from_offset() {
     let reads = fs.reads();
     assert_eq!(
         reads.first().map(|r| r.1),
-        Some(262_144),
-        "续传的第一次数据读必须落在断点 256 KiB 上，从 0 起跑即为退化成全量重传（实得流水 {reads:?}）"
+        Some(CHUNK as u64),
+        "续传的第一次数据读必须落在断点 一个分块 上，从 0 起跑即为退化成全量重传（实得流水 {reads:?}）"
     );
     assert_eq!(
         std::fs::read(&dest).unwrap(),
         payload,
-        "续传后本地文件须与远端逐字节一致（已落盘的前 256 KiB 不得被重写或截断）"
+        "续传后本地文件须与远端逐字节一致（已落盘的前 一个分块 不得被重写或截断）"
     );
     assert!(
         !part.exists(),
@@ -805,7 +906,7 @@ async fn complete_part_with_matching_identity_commits_without_refetching() {
             .append(true)
             .open(&part)
             .unwrap();
-        f.write_all(&payload[524_288..]).unwrap();
+        f.write_all(&payload[2 * CHUNK..]).unwrap();
     }
     assert_eq!(std::fs::metadata(&part).unwrap().len(), 700_000);
 
@@ -920,7 +1021,7 @@ async fn source_grown_during_download_yields_the_opening_snapshot() {
 /// 审计2 #15 的要害一格：长度没变、内容被**就地改写**。
 ///
 /// 长度这一维在这里完全瞎掉——开工 700 000 字节、收工 700 000 字节，②「临时件长度 == total」
-/// 那关也照过不误。而临时件里躺着的是 `旧内容[0..524288] + 新内容[524288..700000]`，
+/// 那关也照过不误。而临时件里躺着的是 `旧内容[0..2*CHUNK] + 新内容[2*CHUNK..700000]`，
 /// 一份货真价实的混合物：能打开、长度对、结构大概率还合法，用户拿到手要到很久以后才发现。
 /// 抓住它的唯一廉价证据就是 mtime，故本用例的判别式是 mtime 那一格。
 ///
@@ -1119,7 +1220,7 @@ async fn swallowed_tail_write_is_caught_by_part_length_before_commit() {
     );
     assert_eq!(
         fs.get("/tail.bin.fspart").map(|v| v.len()),
-        Some(524_288),
+        Some(2 * CHUNK),
         "缺了一截的临时件留在原地，不得静默提交，也不得静默删除"
     );
 }
@@ -1127,8 +1228,8 @@ async fn swallowed_tail_write_is_caught_by_part_length_before_commit() {
 /// 提交前闸门第三关（**上传侧**）：内容哈希不符必须否决提交（审计2 #10）。
 ///
 /// 被吞掉的这次换成**中间**那一块。SFTP 的写带偏移，后一块照样写在 524 288 处，服务端
-/// 于是把中间那 256 KiB 零填出来——临时件长度**恰好** 700 000，第二关一路放行。
-/// 这一格只有内容这一维看得见：文件长度对、能打开、中间躺着 256 KiB 的 0。
+/// 于是把中间那 一个分块 零填出来——临时件长度**恰好** 700 000，第二关一路放行。
+/// 这一格只有内容这一维看得见：文件长度对、能打开、中间躺着 一个分块 的 0。
 ///
 /// 上传方向的哈希要一条 exec 通道去远端算；通道缺席时这一关是直接跳过的，所以它此前
 /// 从未被执行过——`spawn_with_verifier` 这条构造路径在整个测试套件里也没有第二个调用点。
@@ -1173,8 +1274,8 @@ async fn swallowed_middle_write_is_caught_by_upload_hash_before_commit() {
         "长度恰好对得上，这正是第二关拦不住它的原因"
     );
     assert_eq!(
-        &leftover[262_144..524_288],
-        &vec![0u8; 262_144][..],
+        &leftover[CHUNK..2 * CHUNK],
+        &vec![0u8; CHUNK][..],
         "中间那一块应当是服务端零填出来的洞——这就是被拦下的那份静默损坏"
     );
 }
@@ -2570,16 +2671,16 @@ async fn retry_resumes_from_achieved_offset() {
     let log = fs.write_log.lock().unwrap().clone();
     assert_eq!(log[0].0, 0, "首块必须从 0 起（流水基线）");
     assert_eq!(
-        log[1].0, 262_144,
-        "第二块（注入失败的那次）应落在 256 KiB 处"
+        log[1].0, CHUNK as u64,
+        "第二块（注入失败的那次）应落在 一个分块 处"
     );
     assert_eq!(
-        log[2].0, 262_144,
-        "重试必须从已完成的 256 KiB 续跑，不得退回 0（实得流水 {log:?}）"
+        log[2].0, CHUNK as u64,
+        "重试必须从已完成的 一个分块 续跑，不得退回 0（实得流水 {log:?}）"
     );
     assert_eq!(
         retry_bytes_done,
-        Some(262_144),
+        Some(CHUNK as u64),
         "Retrying 事件的 bytes_done 须报实际进度，报 0 会让 UI 进度条假摔回起点"
     );
     assert_eq!(

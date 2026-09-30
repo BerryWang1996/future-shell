@@ -2043,6 +2043,9 @@ mod tests {
         async fn truncate(&self, _: &str, _: u64) -> Result<(), fs_sshengine::Error> {
             never().await
         }
+        async fn sync(&self, _: &str) -> Result<(), fs_sshengine::Error> {
+            never().await
+        }
         async fn mkdir(&self, _: &str) -> Result<(), fs_sshengine::Error> {
             never().await
         }

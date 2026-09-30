@@ -9,6 +9,15 @@
 //!   「SFTP ≥20MB/s」的载体。此前这里只有一条 300s 的墙钟下限（≈0.2 MiB/s），
 //!   比出口原文松两个数量级，等于那半句没有任何断言背书。
 //!   为什么是合计而不是单向、以及为什么不再加单向闸，见该用例内的推导与实测数据。
+//!
+//!   **2026-09-30 复查**（1.0.0 候选首次 CI 的 ubuntu runner 三次 14.3/19.2/18.9 MB/s 未过闸）：
+//!   本机同代码复测只有 9–15 MB/s，而 08-23 定闸时的旧提交在同机同环境交替复测同样 9–15——
+//!   环境（Docker Desktop 转发）变慢了，不是回归。但同环境 OpenSSH 顺序写读（`sftp -R 1`）
+//!   有 34–56 MB/s，差距是真的，两处根因已修：① `write_at` 用 `flush()` 收尾，russh-sftp 的
+//!   `flush` 在服务端支持 `fsync@openssh.com` 时**每块都 fsync**（上行 4.5–9 → 17–27 MB/s）；
+//!   ② 分块 256 KiB 被 OpenSSH 的 261 120 字节读写上限切成两个请求，下行每块多一次往返
+//!   （对齐到 255 KiB 后下行 13–15 → 18–20 MB/s）。剩下的差距在每块一次 OPEN/CLOSE 往返，
+//!   要跨块复用句柄，属结构改动，留在 1.0.0 之后。
 //!   其余上限类断言（冷启动、内存）仍留在 perf.rs 的自查线：共享 runner 上测那些只会制造噪声。
 //!
 //! 与 perf.rs 同口径：需 `FS_ITEST=1` + Docker，未设时打印 skip 并返回。
@@ -136,7 +145,9 @@ async fn large_file_roundtrip_integrity_and_throughput() {
         eprintln!("skip: set FS_ITEST=1");
         return;
     }
-    const CHUNK: usize = 256 * 1024;
+    // 与传输引擎同一个分块（255 KiB，见 `fs_sshengine::transfer::CHUNK` 的说明）：
+    // 这条用例是「SFTP ≥20 MB/s」的载体，测的必须是产品实际的切法，而不是另写一个数。
+    const CHUNK: usize = fs_sshengine::transfer::CHUNK;
     const N: u64 = 256; // 64 MiB
     const TOTAL: f64 = (CHUNK as u64 * N) as f64;
     /// 出口标准原文的数字（十进制 MB/s）。
@@ -202,9 +213,7 @@ async fn large_file_roundtrip_integrity_and_throughput() {
     assert!(
         total_mbps >= MIN_MB_PER_SEC,
         "SFTP 合计吞吐 {total_mbps:.1} MB/s 低于出口标准 {MIN_MB_PER_SEC} MB/s\
-         （上行 {up:?} / 下行 {down:?}）。本机实测区间 24.1–34.4 MB/s（11 连跑），\
-         跌破即两种可能：真实回归，或 runner 比开发机慢一个档——\
-         后者的正确动作是如实记录并重估出口标准，不是把闸调低"
+         （上行 {up:?} / 下行 {down:?}）。定闸时（2026-08-23）本机 24.1–34.4 MB/s；\n         2026-09-30 修掉逐块 fsync 与分块错位后，本机（环境已变慢）17.8–21.9 MB/s。\n         跌破即两种可能：真实回归，或环境比定闸时慢一个档——\n         后者的正确动作是如实记录并重估出口标准，不是把闸调低"
     );
     // 这里**不再**加单向闸。原本写了一条 5 MB/s 的「病态闸」防「一向塌了、另一向富余」，
     // 变异验证时发现它**永远不可能触发**——合计闸已经蕴含了单向下界：

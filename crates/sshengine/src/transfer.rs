@@ -22,7 +22,15 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 pub type TransferId = u64;
-const CHUNK: usize = 256 * 1024;
+/// 传输分块：255 KiB（261 120 字节），不是 256 KiB。
+///
+/// OpenSSH 的 sftp-server 通过 `limits@openssh.com` 通告单次读写上限 261 120 字节
+///（`SFTP_MAX_MSG_LENGTH` 256 KiB 减去 1024 字节头部余量），russh-sftp 按它切请求。
+/// 分块取 256 KiB 时每块都被切成「255 KiB + 1 KiB」两个请求：读是顺序的，于是每块
+/// 白白多一次往返（1.0.0 候选实测下行 13–15 MB/s → 对齐后 18.7–19.8 MB/s）。
+/// 服务端通告更小的上限时仍会被切分——对齐的是事实上最常见的那一种服务端。
+/// 测试引用本常量而不是写死字节数：分块改了，断点、偏移类断言要跟着一起变。
+pub const CHUNK: usize = 261_120;
 
 /// 临时件后缀。刻意选一个不像常规扩展名的串：它会短暂出现在用户的下载目录/远端目录里，
 /// 得让人一眼看出「这是没传完的半成品」，而不是误当成正经文件双击打开。
@@ -1236,6 +1244,16 @@ async fn commit(
     match job.direction {
         Direction::Up => {
             let part = remote_part(&job.remote);
+            // 先落盘、再改名——「写临时件 → fsync → rename」的原子替换次序（与 vault 的
+            // 原子写同一个道理）。`write_at` 为了吞吐不再逐块 fsync（见其实现注释），
+            // 于是整个文件的持久性就系于这一次：少了它，提交后服务器断电可能留下一个
+            // 名字是新的、内容却残缺的文件，而用户的旧文件已经被改名顶替掉了。
+            // 落盘失败即不提交：临时件原样留着，续传与重试都还有路可走。
+            ops.sync(&part).await.map_err(|e| {
+                crate::Error::Transfer(format!(
+                    "提交前落盘失败（{part}）：{e}；未改名，最终目标未被触碰"
+                ))
+            })?;
             let first = match ops.rename(&part, &job.remote).await {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
@@ -1502,6 +1520,16 @@ async fn exec_once(
                 state: TransferState::Running,
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    /// 分块对齐 OpenSSH `limits@openssh.com` 通告的单次读写上限（261 120 字节）。
+    /// 大于它就被切成两个请求、下行每块多一次往返；这件事只在真服务端的吞吐上看得见。
+    #[test]
+    fn chunk_matches_the_openssh_sftp_read_write_limit() {
+        assert_eq!(super::CHUNK, 256 * 1024 - 1024);
     }
 }
 
@@ -1782,6 +1810,9 @@ mod tests {
         }
         async fn truncate(&self, _: &str, _: u64) -> Result<(), crate::Error> {
             unreachable!("算锁键不该截断")
+        }
+        async fn sync(&self, _: &str) -> Result<(), crate::Error> {
+            unreachable!("算锁键不该落盘")
         }
         async fn mkdir(&self, _: &str) -> Result<(), crate::Error> {
             unreachable!("算锁键不该建目录")
