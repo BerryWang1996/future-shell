@@ -168,6 +168,9 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    路径（msi + nsis、deb + AppImage），下载后按公共父目录保留子目录（`artifacts/msi/…`），smoke 却只在
    `artifacts/` 根下找。Windows 上拿到空值后 `msiexec /i ""` 静默什么都不装，错误拖到「安装后目录不存在」
    才冒出。PR #4 改为三平台都递归查找、找不到即报错，并检查 msiexec 的退出码（此前三次调用都不看）。
+6. **run 36702772941**（PR #4 分支 `dd0f161`，含以上全部修复）：**整轮通过**。五个关卡一次全绿；
+   三平台安装包构建成功；三平台 smoke 全部通过——Windows MSI 与 NSIS、macOS DMG、Linux deb 与
+   AppImage 的安装、启动（`--smoke-exit-ms`）、覆盖重装、卸载。release 任务按设计跳过（无 tag）。
 
 ## 正式发版前仍需完成
 
