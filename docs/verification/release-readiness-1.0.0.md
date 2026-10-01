@@ -196,4 +196,10 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
   1.0.1（PR #5）改测产品的流水线传输路径，本机 100 MB/s 以上。打 tag 若撞上，如实记录后重跑。
 - 按 [人工核验清单](manual-checklist-1.0.0.md) 记录真实环境结果，尤其是 Windows NLA、
   输入法、音频（本次修复后首次可验）、RDP 目录共享、物理串口，以及真实 AI provider/MCP 客户端。
-- PR 合入 `main` 后在该提交上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。
+- 在 `main` 上打 `v1.0.0` tag，审阅 draft Release（正文含未签名说明）后发布。**顺序约束**：必须在 1.0.1 的
+  PR #5 合入**之前**打——PR #5 含升版，合入后 `main` 的版本号即为 1.0.1，版本门禁会拒绝 `v1.0.0`
+  （本地以 `GITHUB_REF=refs/tags/v1.0.0` 模拟：「tag: expected 1.0.1, got 1.0.0」，退出码 1）。
+  之后合入 PR #5，再在其合并提交上打 `v1.0.1`。
+- 2026-10-01 补齐安装包元数据（PR #11）：此前 deb 的 Description 为 `(none)`、MSI 发布者为由标识符
+  推导的 `futureshell`；分支试跑 run 36802193222 整轮通过，UpgradeCode 不变。版权字段未填：仓库未写明
+  版权持有人，需维护者决定。
