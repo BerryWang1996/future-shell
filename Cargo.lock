@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "fs_ai"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fs_policy",
  "reqwest 0.12.28",
@@ -1930,11 +1930,11 @@ dependencies = [
 
 [[package]]
 name = "fs_audit"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "fs_connmgr"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1954,7 +1954,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fs_itest"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "fs_mcpbridge"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fs_ai",
  "fs_policy",
@@ -1991,11 +1991,11 @@ dependencies = [
 
 [[package]]
 name = "fs_policy"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "fs_rdpproto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "fs_serial"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fs_terminal",
  "serde",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "fs_sshengine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "fs_terminal"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "encoding_rs",
  "serde",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "fs_vault"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "argon2 0.5.3",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "future-shell-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arboard",
  "async-trait",

@@ -5,7 +5,7 @@
 //! 生产常量本身（`CONTROL_TIMEOUT` / `DATA_TIMEOUT` / `EXEC_TOTAL_TIMEOUT`），只是时间
 //! 走得快。把常量改小来迁就测试则会让用例对**真实**预算失去约束力。
 use bytes::Bytes;
-use fs_sshengine::sftp::{Entry, FileMeta, FileType, SftpOps};
+use fs_sshengine::sftp::{Entry, FileMeta, FileType, RemoteReader, RemoteWriter, SftpOps};
 use fs_sshengine::timeouts::{
     TimedExec, TimedSftp, CONTROL_TIMEOUT, DATA_TIMEOUT, EXEC_HARD_TIMEOUT, EXEC_TOTAL_TIMEOUT,
 };
@@ -70,6 +70,53 @@ impl Fake {
     }
 }
 
+struct FakeReader<'a> {
+    fake: &'a Fake,
+    path: &'a str,
+}
+
+#[async_trait::async_trait]
+impl RemoteReader for FakeReader<'_> {
+    async fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+        self.fake
+            .enter(format!("reader_read {} {offset} {len}", self.path))
+            .await;
+        Ok(format!("r|{}|{offset}|{len}", self.path).into_bytes())
+    }
+}
+
+struct FakeWriter<'a> {
+    fake: &'a Fake,
+    path: &'a str,
+    queued: u64,
+}
+
+#[async_trait::async_trait]
+impl RemoteWriter for FakeWriter<'_> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.fake
+            .enter(format!(
+                "writer_write {} {} {}",
+                self.path,
+                self.queued,
+                data.len()
+            ))
+            .await;
+        self.queued += data.len() as u64;
+        Ok(())
+    }
+    /// 故意与 `queued` 不同：装饰器必须原样转交内层的「已确认」，而不是自己另算一个。
+    fn confirmed(&self) -> u64 {
+        self.queued / 2
+    }
+    async fn finish(self: Box<Self>) -> Result<(), Error> {
+        self.fake
+            .enter(format!("writer_finish {} {}", self.path, self.queued))
+            .await;
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl SftpOps for Fake {
     async fn list(&self, path: &str) -> Result<fs_sshengine::sftp::ListResult, Error> {
@@ -107,6 +154,27 @@ impl SftpOps for Fake {
     async fn sync(&self, path: &str) -> Result<(), Error> {
         self.enter(format!("sync {path}")).await;
         Ok(())
+    }
+    /// 覆写而不用默认实现，理由同 `open_writer`：自带的读取器记下 `reader_read`，
+    /// 与「装饰器没覆写、退回默认实现经 `read_range` 读」分得开。
+    async fn open_reader<'a>(&'a self, path: &'a str) -> Result<Box<dyn RemoteReader + 'a>, Error> {
+        self.enter(format!("open_reader {path}")).await;
+        Ok(Box::new(FakeReader { fake: self, path }))
+    }
+    /// 覆写而不用默认实现：默认实现逐块调 `write_at`，于是「装饰器把 `open_writer` 转交给了
+    /// 内层」和「装饰器没覆写、退回了自己的默认实现（经自己的 `write_at` 逐块写）」在这里
+    /// 看起来一模一样——都落到 `write_at`。自带的写入器记下的是 `writer_write`，两者才分得开。
+    async fn open_writer<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        self.enter(format!("open_writer {path} {offset}")).await;
+        Ok(Box::new(FakeWriter {
+            fake: self,
+            path,
+            queued: offset,
+        }))
     }
     async fn truncate(&self, path: &str, size: u64) -> Result<(), Error> {
         self.enter(format!("truncate {path} {size}")).await;
@@ -341,6 +409,119 @@ async fn a_healthy_channel_forwards_arguments_and_results_verbatim() {
 
     assert_eq!(fake.calls(), 14, "14 个方法应当各自真的到达了对端");
     assert!(!t.is_poisoned(), "全程没有超时，不该判死");
+}
+
+/// 装饰器必须把 `open_writer` **转交给内层**（1.0.1）。
+///
+/// 没覆写时装饰器会用 trait 的默认实现：经自己的 `write_at` 逐块同步写。功能完全正确、
+/// 超时也照常生效，所有别的用例都绿——但生产上内层是 `RemoteSftp`，它的流水线写入器
+/// 从此不会被调用，1.0.1 的上传提速在生产路径上等于没发生。
+#[tokio::test(start_paused = true)]
+async fn open_writer_is_handed_to_the_inner_writer_verbatim() {
+    let fake = Fake::new(Mode::Ready);
+    let t = TimedSftp::new(fake.clone());
+
+    let mut w = t.open_writer("/w", 7).await.unwrap();
+    assert_eq!(fake.last(), "open_writer /w 7");
+    w.write(b"abcd").await.unwrap();
+    assert_eq!(
+        fake.last(),
+        "writer_write /w 7 4",
+        "写没有落到内层的写入器上：装饰器退回了默认的逐块写"
+    );
+    w.write(b"efghij").await.unwrap();
+    assert_eq!(fake.last(), "writer_write /w 11 6");
+    assert_eq!(w.confirmed(), 17 / 2, "「已确认」必须原样取内层写入器的");
+    w.finish().await.unwrap();
+    assert_eq!(fake.last(), "writer_finish /w 17");
+    assert_eq!(fake.calls(), 4);
+    assert!(!t.is_poisoned());
+}
+
+/// 装饰器必须把 `open_reader` **转交给内层**（1.0.1），读的两个实参按原序到达。
+///
+/// 没覆写时退回默认实现：经本层的 `read_range` 逐块读，每块重新 OPEN——功能对、超时也照常，
+/// 但生产上 `RemoteSftp` 的句柄复用从此不会被调用。
+#[tokio::test(start_paused = true)]
+async fn open_reader_is_handed_to_the_inner_reader_verbatim() {
+    let fake = Fake::new(Mode::Ready);
+    let t = TimedSftp::new(fake.clone());
+    let mut r = t.open_reader("/r").await.unwrap();
+    assert_eq!(fake.last(), "open_reader /r");
+    assert_eq!(
+        r.read_at(262144, 4096).await.unwrap(),
+        b"r|/r|262144|4096".to_vec()
+    );
+    assert_eq!(
+        fake.last(),
+        "reader_read /r 262144 4096",
+        "读没有落到内层的读取器上：装饰器退回了默认的逐块 read_range"
+    );
+    assert_eq!(fake.calls(), 2);
+    assert!(!t.is_poisoned());
+}
+
+/// 读取器的 `read_at` 与 `read_range` 同档：数据面预算，超时判死整条通道。
+#[tokio::test(start_paused = true)]
+async fn a_hung_reader_is_bounded_on_the_data_budget_and_kills_the_channel() {
+    let fake = Fake::new(Mode::Slow(Duration::from_secs(60)));
+    let t = TimedSftp::new(fake.clone());
+    let mut r = t
+        .open_reader("/r")
+        .await
+        .expect("打开读取器按数据面预算，60 s 应放行");
+    r.read_at(0, 1).await.expect("读按数据面预算，60 s 应放行");
+    assert!(!t.is_poisoned());
+
+    let fake = Fake::new(Mode::Ready);
+    let t = TimedSftp::new(fake.clone());
+    let mut r = t.open_reader("/r").await.unwrap();
+    fake.set(Mode::Hang);
+    let e = r.read_at(0, 1).await.expect_err("对端从不回话，读不该成功");
+    assert!(
+        matches!(e, Error::Timeout { .. }),
+        "读取器的 read_at 没有超时上限：{e}"
+    );
+    assert!(t.is_poisoned(), "读取器超时之后没有把这条通道判死");
+}
+
+/// 写入器的 `write` / `finish` 与 `write_at` 同档：数据面预算，超时判死整条通道。
+#[tokio::test(start_paused = true)]
+async fn a_hung_writer_is_bounded_on_the_data_budget_and_kills_the_channel() {
+    // 60 秒一次往返：数据面（120 s）放行
+    let fake = Fake::new(Mode::Slow(Duration::from_secs(60)));
+    let t = TimedSftp::new(fake.clone());
+    let mut w = t
+        .open_writer("/w", 0)
+        .await
+        .expect("打开写入器按数据面预算，60 s 应放行");
+    w.write(b"x").await.expect("写按数据面预算，60 s 应放行");
+    w.finish().await.expect("收尾按数据面预算，60 s 应放行");
+    assert!(!t.is_poisoned());
+
+    // 对端挂死：write 超时并判死通道
+    let fake = Fake::new(Mode::Ready);
+    let t = TimedSftp::new(fake.clone());
+    let mut w = t.open_writer("/w", 0).await.unwrap();
+    fake.set(Mode::Hang);
+    let e = w.write(b"x").await.expect_err("对端从不回话，写不该成功");
+    assert!(
+        matches!(e, Error::Timeout { .. }),
+        "写入器的 write 没有超时上限：{e}"
+    );
+    assert!(t.is_poisoned(), "写入器超时之后没有把这条通道判死");
+
+    // finish 同理：收尾时等最后一批确认，对端挂死也必须有上限
+    let fake = Fake::new(Mode::Ready);
+    let t = TimedSftp::new(fake.clone());
+    let w = t.open_writer("/w", 0).await.unwrap();
+    fake.set(Mode::Hang);
+    let e = w.finish().await.expect_err("对端从不回话，收尾不该成功");
+    assert!(
+        matches!(e, Error::Timeout { .. }),
+        "写入器的 finish 没有超时上限：{e}"
+    );
+    assert!(t.is_poisoned(), "收尾超时之后没有把这条通道判死");
 }
 
 // ───────────────────────────── exec 的时间边界 ─────────────────────────────

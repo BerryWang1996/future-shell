@@ -193,6 +193,16 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    macOS smoke 的 `codesign --verify --deep --strict` 从「只在 tag」改为每次都验，分支试跑
    run 36725162385 整轮通过，ad-hoc 签名产物输出 `valid on disk` / `satisfies its Designated Requirement`。
 
+## 发布结果
+
+- **v1.0.0 已发布**（2026-10-01）：<https://github.com/BerryWang1996/future-shell/releases/tag/v1.0.0>。
+  发布流程 run 36845820896 整轮一次通过（tag 版本门禁、三平台关卡、三平台安装包与 smoke、release 任务）——
+  release 任务首次实际运行即成功，摊平步骤（PR #8）生效。发布前逐项核对：23 个附件齐全（5 个安装包、
+  14 份 SBOM、3 份许可材料、`SHA256SUMS.txt`）；下载后 `sha256sum -c` 22/22 OK；`gh attestation verify`
+  抽查 MSI / DMG / deb 均通过，证明由 `release.yml@refs/tags/v1.0.0` 签发、覆盖全部 23 个附件且摘要一致。
+  Release 正文写明未签名平台、核对方法与尚未人工核验的真机项目。
+- **1.0.1** 随本 PR 合入后打 `v1.0.1`，结果记于 CHANGELOG 与 Release 页。
+
 ## 正式发版前的待办（2026-10-01 状态）
 
 - ~~推送修复~~：`release/1.0.0` 已推送，PR #2 于 2026-09-30 合入 `main`，#1 已关闭。
