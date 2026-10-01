@@ -20,7 +20,7 @@ members = [
 exclude = ["rdp-helper"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 rust-version = "1.94"   # 依赖图 MSRV 底线：sqlx 0.9.0（高于 keyring 4.1.5 的 1.88 与 russh 0.62.4 的 1.85）；edition 保持 2021 不动
 license = "Apache-2.0"
