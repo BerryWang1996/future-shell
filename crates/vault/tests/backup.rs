@@ -102,12 +102,33 @@ fn a_second_export_never_overwrites_the_first() {
         names.contains(&first) && names.contains(&second),
         "两份备份都必须在列表里，实际为 {names:?}"
     );
-    // 第一份必须停在导出那一刻的内容上（不含后加的 two）
+    // 第一份必须停在导出那一刻的内容上（不含后加的 two）。
+    //
+    // 比的是解析出来的**标签集合**，不是在整份 JSON 里搜子串：备份里有 base64 的盐、
+    // 密文与口令校验串，随机串里出现 "two" 的概率约 0.08%——2026-10-01 PR #5 的 macOS
+    // runner 上本断言红过一次，而两份文件名不同、写入各自原子完成，没有任何能把
+    // 第二份内容写进第一份的路径。
     let dir_b = dir.join(fs_vault::BACKUP_DIR);
-    let a = String::from_utf8(read(&dir_b.join(&first))).unwrap();
-    let b = String::from_utf8(read(&dir_b.join(&second))).unwrap();
-    assert!(!a.contains("two"), "第一份备份被后来的改动污染了");
-    assert!(b.contains("two"), "第二份备份没有包含导出时的最新记录");
+    let labels = |name: &str| -> std::collections::BTreeSet<String> {
+        let v: serde_json::Value = serde_json::from_slice(&read(&dir_b.join(name)))
+            .unwrap_or_else(|e| panic!("备份 {name} 不是合法 JSON：{e}"));
+        v["records"]
+            .as_object()
+            .unwrap_or_else(|| panic!("备份 {name} 里没有 records"))
+            .values()
+            .map(|r| r["label"].as_str().expect("记录缺 label").to_string())
+            .collect()
+    };
+    assert_eq!(
+        labels(&first),
+        ["one".to_string()].into(),
+        "第一份备份被后来的改动污染了"
+    );
+    assert_eq!(
+        labels(&second),
+        ["one".to_string(), "two".to_string()].into(),
+        "第二份备份没有包含导出时的最新记录"
+    );
 }
 
 /// 列表只报本程序自己导出的文件。

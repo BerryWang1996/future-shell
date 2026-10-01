@@ -244,14 +244,20 @@ async fn a_slow_consumer_cannot_push_the_render_queue_past_the_watermark() {
 
     // 反向自检：本用例的前提是「确实压出了背压」，否则上面那条 `q <= cap` 什么也没验证。
     //
+    // 判据是流控自己记的**触发次数**，而不是采样到的峰值水位：读任务在 ≥ high 处停读，
+    // 下一次 ack 就排掉一大帧（慢消费下帧可达几百 KiB），采样间隔里可能一次都看不到 ≥ high
+    //（2026-10-01 PR #5 的 ubuntu runner：峰值字节 2064384 / high 2097152，差恰好两个读块）。
+    // 峰值仍打印出来供诊断。以下为原判据的来历，保留作背景：
+    //
     // 判据必须是**双维**的。第一版只写了 `peak >= high`（字节维），3 连跑红了 1 次——
     // 不是产品的问题，是自检写错了：背压是双维的，`queue_frames_high` 默认只有 16，
     // 而慢消费下合批出来的帧有几十 KiB，**帧维远早于字节维触发**。
     // 字节水位因此可以合法地一直停在 high 之下（本机实测 1.49 MB / high 2.10 MB），
     // 而背压其实一直在起作用。只看字节维就会把「背压正常工作」误判成「测试没压出背压」。
+    let episodes = pipe.backpressure_episodes();
     assert!(
-        peak >= high || peak_frames >= frames_high,
-        "两个维度都没摸到 high（字节 {peak}/{high}、帧 {peak_frames}/{frames_high}）：\
+        episodes > 0,
+        "背压一次都没有触发（采样峰值：字节 {peak}/{high}、帧 {peak_frames}/{frames_high}）：\
          消费者不够慢或链路太慢，水位断言这一跑没有验证任何东西\
          （对照：关掉背压时第 4 帧就会冲到 4.0 MB）"
     );

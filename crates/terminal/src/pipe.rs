@@ -429,6 +429,11 @@ impl SessionPipe {
     /// `queue_bytes_high` 与 `queue_frames_high`），哪一维先到就先触发。帧维默认只有 16，
     /// 大帧场景下它会**远早于**字节维触发——只看字节水位会得出「背压从没起过作用」的
     /// 错误结论（itest `render_pipeline.rs` 的水位自检就在此翻过一次）。
+    /// 背压累计触发次数（转发 [`crate::flow::BatcherIn::backpressure_episodes`]，诊断用）。
+    pub fn backpressure_episodes(&self) -> u64 {
+        self.batcher_in.backpressure_episodes()
+    }
+
     pub fn frames_pending(&self) -> usize {
         self.batcher_in.frames_pending()
     }
