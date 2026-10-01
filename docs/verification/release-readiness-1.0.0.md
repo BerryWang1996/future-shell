@@ -1,13 +1,21 @@
 # 1.0.0 发版检查记录
 
-检查日期：2026-09-05（Asia/Shanghai）。基础提交：`e549664`。
-本记录随 1.0.0 候选代码提交保存；Git 提交与候选分支不等同于正式 tag 或公开 Release。
+检查日期：2026-09-05 起，2026-10-01 定稿（Asia/Shanghai）。
 
 ## 范围与结论
 
-版本已统一为 1.0.0。Windows MSI/NSIS 候选包已生成，MSI 提取产物两次启动成功；尚不能宣布三平台正式发版就绪。
-本机证据覆盖 Windows 构建与提取后启动；Linux 集成测试通过 Docker 验证，未构建 Linux 安装包；
-macOS 和公开发行签名需对应环境。
+**2026-10-01 发布决定**：以 `main` 定稿提交打 `v1.0.0` 并公开发布（维护者授权自主决策）。依据：
+三平台安装包由发布流水线构建，Windows MSI/NSIS、macOS DMG、Linux deb/AppImage 的安装、启动、
+覆盖重装与卸载冒烟在 `main` 上整轮通过（见「2026-09-30 发布试跑」第 7 条及之后的分支试跑）；
+三平台 CI（含 Linux 容器 itest）全绿；只在 tag 时执行的 release 任务已审查并用真实产物模拟。
+安装包不使用商业签名（维护者裁定，Release 正文写明核对方法）。
+
+**未覆盖、如实列出**：[人工核验清单](manual-checklist-1.0.0.md) 中依赖真机与真实外部服务的项目
+（Windows NLA、输入法、音频实际出声、RDP 目录共享、物理串口、真实 AI provider 与 MCP 客户端、
+macOS 真机监控采集）尚未逐项人工核验，Release 正文同样写明。
+
+以下为 2026-09-05 起的历史记录：Windows MSI/NSIS 候选包已生成，MSI 提取产物两次启动成功；
+当时 Linux 安装包未构建，macOS 与公开发行签名需对应环境——这几项均已由上述发布流水线补齐。
 
 ## 已修复的发布问题
 
@@ -185,7 +193,7 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
    macOS smoke 的 `codesign --verify --deep --strict` 从「只在 tag」改为每次都验，分支试跑
    run 36725162385 整轮通过，ad-hoc 签名产物输出 `valid on disk` / `satisfies its Designated Requirement`。
 
-## 正式发版前仍需完成
+## 正式发版前的待办（2026-10-01 状态）
 
 - ~~推送修复~~：`release/1.0.0` 已推送，PR #2 于 2026-09-30 合入 `main`，#1 已关闭。
 - ~~三平台 CI~~：PR #2、#3 的 Windows/macOS/Linux runner 全绿（含 Linux `FS_ITEST=1` 容器 itest）。
