@@ -20,6 +20,7 @@
   "bundle": {
     "active": true,
     "publisher": "FutureShell",
+    "copyright": "Copyright © 2026 BerryWang1996",
     "homepage": "https://github.com/BerryWang1996/future-shell",
     "category": "DeveloperTool",
     "shortDescription": "支持 SSH/SFTP、RDP 与串口的桌面终端工具",
