@@ -201,7 +201,9 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
   14 份 SBOM、3 份许可材料、`SHA256SUMS.txt`）；下载后 `sha256sum -c` 22/22 OK；`gh attestation verify`
   抽查 MSI / DMG / deb 均通过，证明由 `release.yml@refs/tags/v1.0.0` 签发、覆盖全部 23 个附件且摘要一致。
   Release 正文写明未签名平台、核对方法与尚未人工核验的真机项目。
-- **1.0.1** 随本 PR 合入后打 `v1.0.1`，结果记于 CHANGELOG 与 Release 页。
+- **v1.0.1 已发布**（2026-10-01，Latest 至 1.0.2 发布前）：<https://github.com/BerryWang1996/future-shell/releases/tag/v1.0.1>。
+  发布流程 run 36852325582 整轮一次通过；23 个附件，`sha256sum -c` 22/22 OK，五个安装包的构建来源证明均通过。
+- **1.0.2**：只含安装包版权信息（维护者裁定 `Copyright © 2026 BerryWang1996`），本 PR 合入后打 `v1.0.2`。
 
 ## 正式发版前的待办（2026-10-01 状态）
 
