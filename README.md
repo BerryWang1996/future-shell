@@ -2,7 +2,7 @@
 
 支持 SSH/SFTP、RDP 与串口的桌面终端工具，采用 Rust、Tauri 2、Svelte 5 和 xterm.js。Apache-2.0。
 
-当前版本为 **1.0.0**（2026-10-01）。三平台安装包（Windows MSI/NSIS、macOS DMG、Linux deb/AppImage）
+当前版本为 **1.0.1**（2026-10-01）。三平台安装包（Windows MSI/NSIS、macOS DMG、Linux deb/AppImage）
 由发布流水线构建，并通过安装、启动、覆盖重装与卸载的冒烟验证；安装包未使用商业签名（见下文
 「安装包签名」），部分真机交互项仍在人工核验中，详见 [发版检查记录](docs/verification/release-readiness-1.0.0.md)。
 
