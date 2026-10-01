@@ -219,5 +219,6 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
   （本地以 `GITHUB_REF=refs/tags/v1.0.0` 模拟：「tag: expected 1.0.1, got 1.0.0」，退出码 1）。
   之后合入 PR #5，再在其合并提交上打 `v1.0.1`。
 - 2026-10-01 补齐安装包元数据（PR #11）：此前 deb 的 Description 为 `(none)`、MSI 发布者为由标识符
-  推导的 `futureshell`；分支试跑 run 36802193222 整轮通过，UpgradeCode 不变。版权字段未填：仓库未写明
-  版权持有人，需维护者决定。
+  推导的 `futureshell`；分支试跑 run 36802193222 整轮通过，UpgradeCode 不变。版权字段当时未填（仓库未写明
+  版权持有人）；维护者于同日裁定为 BerryWang1996，`Copyright © 2026 BerryWang1996` 随下一个版本生效
+  （已发布的 1.0.0 / 1.0.1 安装包不含版权信息）。
