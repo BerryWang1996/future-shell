@@ -121,12 +121,14 @@ async fn backpressure_hysteresis_engages_at_high_releases_at_low() {
     let (out_tx, mut out_rx) = mpsc::channel::<(u64, Vec<u8>)>(64);
     let (inn, _h) = Batcher::new(cfg(), out_tx);
     assert!(!inn.backpressure_active());
+    assert_eq!(inn.backpressure_episodes(), 0);
     // 20 帧 × 100 B = 2000 > high(1024)。逐帧成帧（见 push_frames 注①）：
     // 字节维滞回要在 high 与 low 之间取中间水位，必须有多个 seq 可分段确认；
     // 整批并成一帧的话只有 seq 0，ack 它即全排空，滞回区间无从落点。
     let seqs = push_frames(&inn, &mut out_rx, &[100; 20]).await;
     assert_eq!(inn.queue_bytes(), 2000, "前置：收帧不排水，水位仍为 pushed");
     assert!(inn.backpressure_active(), "超 high-water 必须触发背压");
+    assert_eq!(inn.backpressure_episodes(), 1, "触发一次即计一次");
     inn.ack(seqs[11]); // 前 12 帧 = 1200 → 余 800：处于 low(512) 与 high(1024) 之间
     assert_eq!(inn.queue_bytes(), 800, "累计确认前 12 帧恰排 1200");
     assert!(
@@ -135,6 +137,15 @@ async fn backpressure_hysteresis_engages_at_high_releases_at_low() {
     );
     inn.ack(seqs[15]); // 再 4 帧 = 400 → 余 400 < low(512)
     assert!(!inn.backpressure_active(), "排至 low-water 以下解除");
+    assert_eq!(
+        inn.backpressure_episodes(),
+        1,
+        "滞回区间里反复判定、以及解除，都不得增加触发次数"
+    );
+    // 再越过 high：第二次触发
+    push_frames(&inn, &mut out_rx, &[100; 7]).await; // 400 + 700 = 1100 ≥ high(1024)
+    assert!(inn.backpressure_active());
+    assert_eq!(inn.backpressure_episodes(), 2, "第二次越过 high 计第二次");
 }
 
 #[tokio::test(start_paused = true)]

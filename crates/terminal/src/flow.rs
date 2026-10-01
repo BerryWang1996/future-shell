@@ -149,6 +149,10 @@ pub struct BatcherIn {
     ack_calls: Arc<std::sync::atomic::AtomicU64>,
     /// 背压滞回状态位（双水位记忆：high 触发，双维低于 low/frames-high 解除）
     bp_active: Arc<std::sync::atomic::AtomicBool>,
+    /// 背压**触发**的次数（未触发 → 触发 的翻转计数；诊断用，非判据，同 `ack_calls`）。
+    /// 集成测试据此确认「这一跑确实压出了背压」：只靠采样队列水位会错过暂停点——
+    /// 读任务在 ≥ high 处停读、下一次 ack 就排掉一大帧，采样间隔里可能一次都看不到 ≥ high。
+    bp_episodes: Arc<std::sync::atomic::AtomicU64>,
     /// 关停请求标志（S87 兜底，防御纵深）：tokio 1.53.1 的 notify_one 语义下
     /// 已武装并投递的许可于 `Notified` drop 时转发/存储（`drop_notified` →
     /// `notify_locked`，State::Waiting / Notification::One 为限），不存在许可
@@ -208,6 +212,7 @@ impl BatcherIn {
             }
         } else if bytes >= self.cfg.queue_bytes_high || frames >= self.cfg.queue_frames_high {
             self.bp_active.store(true, Ordering::Relaxed);
+            self.bp_episodes.fetch_add(1, Ordering::Relaxed);
         }
         self.bp_active.load(Ordering::Relaxed)
     }
@@ -281,6 +286,12 @@ impl BatcherIn {
     /// 直接区分「前端停发 ack」与「前端在 ack 但排不动队首」。
     pub fn ack_calls(&self) -> u64 {
         self.ack_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 背压累计触发次数（诊断用，非判据）：每次「未触发 → 触发」计一次，
+    /// 滞回区间里反复判定不重复计数。
+    pub fn backpressure_episodes(&self) -> u64 {
+        self.bp_episodes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 背压滞留超时（已消毒的 `FlowConfig::stall_timeout`；读任务据此判定 ack 停发）。
@@ -399,6 +410,7 @@ impl Batcher {
             sent_frames: Arc::new(Mutex::new(VecDeque::new())),
             ack_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bp_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bp_episodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cfg: cfg.clone(),
             notify: Arc::new(tokio::sync::Notify::new()),
