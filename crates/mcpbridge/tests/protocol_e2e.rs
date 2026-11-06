@@ -158,6 +158,7 @@ impl McpContextSource for Ctx {
                 // WithConfirm 是默认档，也是唯一能把「确认四出口」跑到的档：
                 // Disabled 连确认框都不弹，ReadOnlyOnly 直接拒写。
                 mode: AiMode::WithConfirm,
+                skip_confirmation: false,
                 known_secrets: vec!["hunter2".into()],
             }
         })

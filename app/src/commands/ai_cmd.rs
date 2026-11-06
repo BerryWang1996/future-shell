@@ -648,24 +648,11 @@ pub async fn ai_suggest_command(
         &command,
         session_id.as_deref(),
         verdict.tier,
-        // Confirm/StrongConfirm 这两档此刻**还没执行**——用户还没点。
-        //
-        // 这里曾记 `Approved`，注释写着「不准确但枚举里没有『待确认』档」。
-        // 那句话是错的：`RequestOnly` 的语义正是「只是一次请求，没有要执行的
-        // 东西」，Agent 侧的双行制早就用它表达「发起了、未执行」（dispatch.rs
-        // 的第 1 行）。记 Approved 的实际后果是——**一条被用户拒绝的危险建议
-        // 在审计里永远显示为已批准**，且 `Verdict::executed()` 对它返回真。
-        // 链在密码学上完整、在语义上是错的，而审计的全部价值就在语义。
-        //
-        // 真正的执行结果由执行路径另记一条（Approved/Rejected），两条按 action
-        // 与时间对得上：一次「建议 → 被拒」在链上是 RequestOnly + Rejected 两行，
-        // 而不是一行谎称已批准。
-        match decision {
-            fs_policy::gate::Decision::AutoRun => fs_connmgr::audit_repo::Verdict::AutoRun,
-            fs_policy::gate::Decision::Confirm | fs_policy::gate::Decision::StrongConfirm => {
-                fs_connmgr::audit_repo::Verdict::RequestOnly
-            }
-            fs_policy::gate::Decision::Deny(_) => fs_connmgr::audit_repo::Verdict::Denied,
+        // 这里只生成建议。即使裁决允许直接执行，也要等执行路径记下实际结果。
+        if matches!(decision, fs_policy::gate::Decision::Deny(_)) {
+            fs_connmgr::audit_repo::Verdict::Denied
+        } else {
+            fs_connmgr::audit_repo::Verdict::RequestOnly
         },
     )
     .await;

@@ -38,7 +38,7 @@ type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ── 上下文源 ────────────────────────────────────────────────────────────────
 
-/// 每次调用现读档位与机密。见 [`McpContextSource`] 的文档——不缓存。
+/// 每次调用现读档位、免确认设置与机密。见 [`McpContextSource`] 的文档——不缓存。
 pub struct McpAppContext {
     pub state: Arc<AppState>,
     pub caller: String,
@@ -49,10 +49,15 @@ impl McpContextSource for McpAppContext {
         Box::pin(async move {
             // 与 AI 面板同一份读法：同一个键、同一个逆函数、同一个缺省档。
             let mode = crate::commands::ai_cmd::read_mode(&self.state).await;
+            let skip_confirmation = self
+                .state
+                .settings_bool("mcp.skipConfirmation", false)
+                .await;
             let known_secrets = crate::commands::ai_cmd::known_secrets(&self.state).await;
             CallContext {
                 caller: self.caller.clone(),
                 mode,
+                skip_confirmation,
                 known_secrets,
             }
         })

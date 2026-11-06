@@ -347,11 +347,11 @@ fn redact_named_assignments(text: &str) -> (String, usize) {
                 continue;
             }
             // 键 = 分隔符左边那一串「标识符字符」
-            let key_start = rest[..sep_at]
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let key = &rest[key_start..sep_at];
+            let before_sep = &rest[..sep_at];
+            let key_start = before_sep
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                .len();
+            let key = &before_sep[key_start..];
             let key_l = key.to_ascii_lowercase().replace('-', "_");
             let looks_secret = !key.is_empty()
                 && SECRET_NAME_HINTS
@@ -567,6 +567,16 @@ mod tests {
             );
             assert!(out.any(), "{input} 应命中规则");
         }
+    }
+
+    #[test]
+    fn named_assignments_keep_utf8_boundaries() {
+        let out = r("总数量: 4\n备注=正常\n提示🔒PASSWORD=样例口令");
+        assert_eq!(
+            out.text,
+            "总数量: 4\n备注=正常\n提示🔒PASSWORD=[[redacted:named-secret]]"
+        );
+        assert_eq!(out.total(), 1);
     }
 
     #[test]

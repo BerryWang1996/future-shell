@@ -25,7 +25,7 @@ pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// AI 执行档位。
 ///
-/// 顺序即严格程度：`Disabled` 最严，`WithConfirm` 最松。
+/// 顺序即严格程度：`Disabled` 最严，`WithoutConfirm` 最松。
 /// [`Ord`] 的方向刻意让「更严」= 更小，这样「取更严者」就是 [`Ord::min`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AiMode {
@@ -41,6 +41,8 @@ pub enum AiMode {
     ReadOnlyOnly,
     /// 默认档：只读自动放行、write 单次确认、dangerous 强确认。
     WithConfirm,
+    /// 所有风险级别都直接执行。
+    WithoutConfirm,
 }
 
 impl AiMode {
@@ -50,6 +52,7 @@ impl AiMode {
             Self::Disabled => "disabled",
             Self::ReadOnlyOnly => "read_only",
             Self::WithConfirm => "with_confirm",
+            Self::WithoutConfirm => "without_confirm",
         }
     }
 
@@ -58,6 +61,7 @@ impl AiMode {
             "disabled" => Some(Self::Disabled),
             "read_only" => Some(Self::ReadOnlyOnly),
             "with_confirm" => Some(Self::WithConfirm),
+            "without_confirm" => Some(Self::WithoutConfirm),
             _ => None,
         }
     }
@@ -146,6 +150,7 @@ pub fn decide(tier: Tier, mode: AiMode) -> Decision {
             Tier::Write => Decision::Confirm,
             Tier::Dangerous => Decision::StrongConfirm,
         },
+        AiMode::WithoutConfirm => Decision::AutoRun,
     }
 }
 
@@ -328,6 +333,7 @@ mod tests {
         // apply_session_override 用 min 取更严者，所以这个方向必须成立
         assert!(AiMode::Disabled < AiMode::ReadOnlyOnly);
         assert!(AiMode::ReadOnlyOnly < AiMode::WithConfirm);
+        assert!(AiMode::WithConfirm < AiMode::WithoutConfirm);
     }
 
     #[test]
@@ -391,7 +397,12 @@ mod tests {
 
     #[test]
     fn stable_strings_round_trip_and_reject_variants() {
-        for m in [AiMode::Disabled, AiMode::ReadOnlyOnly, AiMode::WithConfirm] {
+        for m in [
+            AiMode::Disabled,
+            AiMode::ReadOnlyOnly,
+            AiMode::WithConfirm,
+            AiMode::WithoutConfirm,
+        ] {
             assert_eq!(AiMode::from_str_exact(m.as_str()), Some(m));
         }
         // 大小写与近似写法不得放宽——settings 里存错一个字就该报错而不是静默取默认
@@ -414,13 +425,18 @@ mod tests {
 
     #[test]
     fn every_tier_mode_pair_has_a_decision() {
-        // 穷举 3×3：任何一格漏掉都会在这里现形（match 的编译期穷尽性
+        // 穷举 3×4：任何一格漏掉都会在这里现形（match 的编译期穷尽性
         // 保证不了「语义上是否合理」，但保证得了「有返回值」）
         let mut auto = 0;
         let mut ask = 0;
         let mut deny = 0;
         for t in [Tier::ReadOnly, Tier::Write, Tier::Dangerous] {
-            for m in [AiMode::Disabled, AiMode::ReadOnlyOnly, AiMode::WithConfirm] {
+            for m in [
+                AiMode::Disabled,
+                AiMode::ReadOnlyOnly,
+                AiMode::WithConfirm,
+                AiMode::WithoutConfirm,
+            ] {
                 match decide(t, m) {
                     Decision::AutoRun => auto += 1,
                     Decision::Confirm | Decision::StrongConfirm => ask += 1,
@@ -428,7 +444,6 @@ mod tests {
                 }
             }
         }
-        // 2 个自动（只读×两个非禁用档）、2 个询问（write/dangerous×默认档）、5 个拒绝
-        assert_eq!((auto, ask, deny), (2, 2, 5), "3×3 裁决表的形状变了");
+        assert_eq!((auto, ask, deny), (5, 2, 5), "3×4 裁决表的形状变了");
     }
 }

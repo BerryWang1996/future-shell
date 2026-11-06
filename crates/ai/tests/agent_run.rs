@@ -1034,6 +1034,46 @@ async fn c5_a_dangerous_command_needs_strong_confirm_and_rejection_stops() {
     assert_eq!(r.registry.count(), 0);
 }
 
+#[tokio::test]
+async fn without_confirm_executes_dangerous_commands_without_a_ticket() {
+    let r = rig(
+        vec![
+            resp(
+                "",
+                vec![("run_command", r#"{"command":"rm -rf /"}"#)],
+                Some((5, 5)),
+            ),
+            resp("done", vec![], Some((5, 5))),
+        ],
+        vec![],
+        vec![],
+    );
+    let mut conv = fs_ai::agent::run::initial_conversation("执行测试命令");
+    let mut ledger = BudgetLedger::new(Budgets::defaults(), r.abort.clone());
+    let report = run_loop(
+        &mut conv,
+        cfg(),
+        &mut ledger,
+        &r.ports,
+        &r.clock,
+        fs_policy::AiMode::WithoutConfirm,
+        &ExternalToolTiers::default(),
+        &[],
+        &[],
+    )
+    .await;
+
+    assert!(r.confirm.seen_strong.lock().unwrap().is_empty());
+    assert_eq!(report.budget.human_touchpoints, 0);
+    assert!(r
+        .audit
+        .rows
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(v, _)| *v == "auto_run"));
+}
+
 /* ── F3：未知工具回喂重试 ────────────────────────────────────────── */
 
 #[tokio::test]

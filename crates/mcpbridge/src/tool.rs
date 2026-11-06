@@ -97,7 +97,8 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "sessions.open",
-        description: "按 profile 打开一个新的 SSH 会话。会消耗本机保险箱里的凭据，需用户授权。",
+        description:
+            "使用本机保险箱凭据打开已允许 MCP 访问的 SSH 连接，按 MCP 设置决定是否提示确认。",
         schema_json: r#"{"type":"object","properties":{"profile_id":{"type":"string"}},"required":["profile_id"],"additionalProperties":false}"#,
         gated: true,
         vault_class: false,
@@ -118,7 +119,7 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "terminal.send_raw",
-        description: "向终端发送原始控制序列（Ctrl-C、ANSI CSI 等）。恒按危险处理，需强确认。",
+        description: "向终端发送原始控制序列（Ctrl-C、ANSI CSI 等）。恒按危险处理，默认需强确认。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"payload":{"type":"string"}},"required":["session_id","payload"],"additionalProperties":false}"#,
         gated: true,
         vault_class: false,

@@ -109,10 +109,40 @@ async function flush() {
   await tick();
 }
 
+describe("SettingsDialog MCP 免逐次确认", () => {
+  it("默认关闭，开启后重新加载仍生效", async () => {
+    store.clear();
+    await openAt("AI");
+    await flush();
+    expect(screen.getByTestId("set-mcp-skip-confirmation")).toHaveProperty("checked", false);
+    await fireEvent.click(screen.getByTestId("set-mcp-skip-confirmation"));
+    await waitFor(() => expect(store.get("mcp.skipConfirmation")).toBe(true));
+
+    cleanup();
+    await openAt("AI");
+    await flush();
+    expect(screen.getByTestId("set-mcp-skip-confirmation")).toHaveProperty("checked", true);
+  });
+});
+
 describe("SettingsDialog 设置回读", () => {
   beforeEach(() => {
     store.clear();
     writes.length = 0;
+  });
+
+  it("AI 默认需确认，选择无需确认后重新打开仍能读回", async () => {
+    await openAt("AI");
+    await flush();
+    expect(screen.getByTestId("set-ai-mode")).toHaveProperty("value", "with_confirm");
+    await fireEvent.change(screen.getByTestId("set-ai-mode"), {
+      target: { value: "without_confirm" },
+    });
+    await waitFor(() => expect(store.get("ai.mode")).toBe("without_confirm"));
+    cleanup();
+    await openAt("AI");
+    await flush();
+    expect(screen.getByTestId("set-ai-mode")).toHaveProperty("value", "without_confirm");
   });
 
   // ── 结构性门禁 ──────────────────────────────────────────────────────────
@@ -157,6 +187,7 @@ describe("SettingsDialog 设置回读", () => {
       // （开关本身见上面的 28 → 27 注记。）
       "mcp.caller",
       "mcp.mounts",
+      "mcp.skipConfirmation",
       "mcp.tools",
       "update.manifestUrl",
       "term.customSchemes",
