@@ -60,6 +60,8 @@ pub struct CallContext {
     pub caller: String,
     /// 全局 AI 档位（已经过会话级覆盖）。
     pub mode: AiMode,
+    /// 外部 MCP 工具是否免逐次确认。
+    pub skip_confirmation: bool,
     /// 已知机密，进脱敏。
     pub known_secrets: Vec<String>,
 }
@@ -201,10 +203,12 @@ pub async fn call(
     // ── ⑤ 裁决 ────────────────────────────────────────────────────────
     let mut decision = decide_for_mcp(&gated, ctx.mode);
 
-    // 首次 (client, profile) 提级到强确认。**只提不降**：`escalates_to_strong`
-    // 为假时什么也不做，而不是把裁决降成 AutoRun。
-    if open_authz.as_ref().is_some_and(|a| a.escalates_to_strong()) && decision == Decision::Confirm
+    if ctx.skip_confirmation && decision.needs_user() {
+        decision = Decision::AutoRun;
+    } else if decision == Decision::Confirm
+        && open_authz.as_ref().is_some_and(|a| a.escalates_to_strong())
     {
+        // 默认策略下，首次打开该连接需要强确认。
         decision = Decision::StrongConfirm;
     }
 
@@ -864,6 +868,7 @@ mod tests {
                 ctx: CallContext {
                     caller: "claude-desktop".into(),
                     mode: AiMode::WithConfirm,
+                    skip_confirmation: false,
                     known_secrets: vec![SECRET.to_string()],
                 },
                 authz: Authorization::new(crate::tool::MCP_MANIFEST.iter().map(|m| m.name)),
@@ -1108,6 +1113,31 @@ mod tests {
             )
             .await;
         assert!(!r2.conf.last_strong(), "普通写不该是强确认");
+    }
+
+    #[tokio::test]
+    async fn skipping_confirmation_only_promotes_calls_that_could_be_confirmed() {
+        let mut r = Rig::new();
+        r.ctx.skip_confirmation = true;
+        r.conf = Conf::forbidden();
+
+        let args = r#"{"session_id":"s1","path":"/tmp/a","content":"x"}"#;
+        assert!(!r.call("sftp.write", args).await.is_err());
+        assert!(!r.run_cmd("rm -rf /").await.is_err());
+        r.calls.only(&[("sftp_write", 1), ("run", 1)]);
+        assert_eq!(r.audit.verdicts(), vec![McpVerdict::AutoRun; 4]);
+
+        r.ctx.mode = AiMode::ReadOnlyOnly;
+        assert_eq!(
+            r.call("sftp.write", args).await.error_code(),
+            Some("FS_POLICY_DENIED")
+        );
+        r.ctx.mode = AiMode::Disabled;
+        assert_eq!(
+            r.call("sessions.list", "{}").await.error_code(),
+            Some("FS_POLICY_DENIED")
+        );
+        r.calls.only(&[("sftp_write", 1), ("run", 1)]);
     }
 
     // ══ ③ 确认四出口 ══════════════════════════════════════════════════
@@ -1438,12 +1468,25 @@ mod tests {
     #[tokio::test]
     async fn an_unflagged_profile_is_refused_without_ever_asking_the_user() {
         let mut r = Rig::new();
+        r.ctx.skip_confirmation = true;
         r.conf = Conf::forbidden();
         r.dir.allowed.lock().unwrap().insert("p1".into(), false);
         let out = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
         assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
         assert_eq!(r.calls.open.load(SeqCst), 0);
         assert_eq!(r.calls.confirm.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn skipping_confirmation_allows_first_open_for_an_allowed_profile() {
+        let mut r = Rig::new();
+        r.ctx.skip_confirmation = true;
+        r.conf = Conf::forbidden();
+        r.dir.allowed.lock().unwrap().insert("p1".into(), true);
+        let out = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
+        assert!(!out.is_err(), "{out:?}");
+        r.calls.only(&[("open", 1)]);
+        assert_eq!(r.audit.verdicts(), vec![McpVerdict::AutoRun; 2]);
     }
 
     /// G2/G3 首次提级到强确认；打开成功后第二次回落到单次确认。

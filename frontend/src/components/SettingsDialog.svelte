@@ -90,6 +90,7 @@
       if (key === "keyboard.bindings") { keyBindings = value as KeyBindings; setKeyBindings(keyBindings); }
       if (key === "term.highlights") highlightRules = value as HighlightRule[];
       if (key === "term.customSchemes") customSchemes = value as StoredCustomScheme[];
+      if (key === "mcp.skipConfirmation") mcpSkipConfirmation = value === true;
     }
   }
   async function copyMcp(value: string, label: string) {
@@ -237,6 +238,7 @@
   };
   let mcpEnabled = $state(false);
   let mcpCaller = $state("mcp");
+  let mcpSkipConfirmation = $state<boolean | null>(null);
   let mcpTools = $state<string[]>([]);
   /** MCP 区的局部错误（开关/轮换失败时显示在本区内，不弹全局 toast）。 */
   let mcpError = $state("");
@@ -495,6 +497,7 @@
     // MCP：默认关、空名单、缺省调用方标签（与 app/src/mcp 的缺省口径一致）。
     mcpEnabled = await settingGet<boolean>("mcp.enabled", false);
     mcpCaller = await settingGet<string>("mcp.caller", "mcp");
+    mcpSkipConfirmation = await settingGet<boolean>("mcp.skipConfirmation", false);
     mcpTools = await settingGet<string[]>("mcp.tools", []);
     mcpMounts = await settingGet<McpMount[]>("mcp.mounts", []);
     restoreUnclosed = await settingGet<boolean>("ui.restoreUnclosed", true);
@@ -784,14 +787,15 @@
                 <option value="disabled">关闭（全部 AI 功能不可用）</option>
                 <option value="read_only">只读：只允许只读命令，改动类一律不给执行</option>
                 <option value="with_confirm">需确认：改动类命令执行前逐条确认</option>
+                <option value="without_confirm">无需确认（直接执行，危险）</option>
               </select>
             </label>
             <p class="hint">
-              程序会根据命令内容检查风险。执行前请核对目标会话和命令；模型生成的建议可能有误。
+              选择「无需确认」后，AI Agent 和已启用的对外 MCP 工具可直接执行危险操作。
             </p>
 
             <!-- ② 对外 MCP：本程序作为服务端。默认关闭；外部客户端经它操作会话，
-                 与内置 Agent 同一道策略闸门，改动类逐条弹确认（§4.5 阻塞式人机回路）。 -->
+                 与内置 Agent 共用风险分类和全局执行档位。 -->
             <h4 class="grp" data-testid="ai-grp-server">② 对外 MCP 服务（外部 AI 客户端 → 本程序）</h4>
             <p class="hint">
               开启后，Claude Desktop 等外部 MCP 客户端可以把本程序的终端、文件能力
@@ -819,9 +823,20 @@
               <input data-testid="set-mcp-caller" value={mcpCaller}
                      onchange={(e) => { mcpCaller = (e.currentTarget as HTMLInputElement).value.trim() || "mcp"; void settingSet("mcp.caller", mcpCaller); }} />
             </label>
+            <label>
+              <input type="checkbox" checked={mcpSkipConfirmation === true} data-testid="set-mcp-skip-confirmation"
+                     disabled={mcpSkipConfirmation === null || pendingSaves > 0}
+                     onchange={async (e) => {
+                       const input = e.currentTarget;
+                       const next = input.checked;
+                       if (await settingSet("mcp.skipConfirmation", next)) mcpSkipConfirmation = next;
+                       else input.checked = mcpSkipConfirmation === true;
+                     }} />
+              MCP 工具免逐次确认
+            </label>
             <p class="hint">
-              授权给外部客户端的工具。<strong>没勾选的工具，对方连枚举都枚举不到</strong>；
-              改动类（写入/发送/执行）调用时仍会逐条弹确认框。
+              在「需确认」档位下，开启此项可让已勾选的 MCP 工具直接执行，包括危险命令。仍需访问令牌。
+              <strong>未勾选的工具对外部客户端不可用。</strong>
             </p>
             <div class="mcp-tools" data-testid="set-mcp-tools">
               {#each MCP_TOOL_CHOICES as tool}

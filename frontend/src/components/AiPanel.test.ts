@@ -116,7 +116,7 @@ describe("裁决来自后端，面板只显示（出口第 12 项的安全前提
     // 给用户看的是同一句话。
     const seen = new Set<string>();
     for (const [decision, expected] of [
-      ["auto", "只读命令，可直接执行"],
+      ["auto", "可直接执行，无需确认"],
       ["confirm", "执行前会问你一次"],
       ["strong-confirm", "危险操作，执行前需要强确认"],
       ["deny", "当前档位不允许执行这条命令"],

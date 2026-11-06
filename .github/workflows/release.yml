@@ -199,7 +199,7 @@ jobs:
             artifact_glob: |
               target/release/bundle/msi/*.msi
               target/release/bundle/nsis/*.exe
-          - os: macos-14
+          - os: macos-15
             name: macos-universal
             # 通用二进制一次覆盖 Intel 与 Apple Silicon，省掉一条矩阵分支，
             # 也省掉「用户下错架构」这一整类支持成本
@@ -577,7 +577,7 @@ jobs:
         include:
           - os: windows-2025
             name: windows-x86_64
-          - os: macos-14
+          - os: macos-15
             name: macos-universal
           - os: ubuntu-22.04
             name: linux-x86_64

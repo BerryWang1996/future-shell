@@ -101,6 +101,22 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "同 RUSTSEC-2025-0075 组（unic-char-property）" },
     { id = "RUSTSEC-2025-0098", reason = "同 RUSTSEC-2025-0075 组（unic-ucd-version）" },
     { id = "RUSTSEC-2025-0100", reason = "同 RUSTSEC-2025-0075 组（unic-ucd-ident）" },
+    # testcontainers 0.27 和 0.28 都依赖 astral-tokio-tar。此依赖仅用于 fs_itest 的
+    # 容器测试，未进入桌面包。上游公告为停止维护。testcontainers 替换后移除本条。
+    # 复查期限：2027-02-01。
+    { id = "RUSTSEC-2026-0440", reason = "仅 fs_itest 的 testcontainers 使用，不进安装包；待 testcontainers 替换 tar 依赖" },
+
+    # zbus 6 已接管以下三个 crate 的维护，但 Linux Secret Service 和 Tauri opener
+    # 仍依赖 zbus 5。公告为停止独立维护。待上游迁移到 zbus 6 后删除本组。
+    # 复查期限：2027-02-01。
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 已并入 zbus 6；Linux Secret Service 和 Tauri opener 仍依赖 zbus 5，待上游迁移" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 已并入 zbus 6；同 RUSTSEC-2026-0370" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 已并入 zbus 6；同 RUSTSEC-2026-0370" },
+
+    # RDP helper 的 macOS DNS-SD 依赖链通过 async-dnssd 使用 pin-utils 投影宏。
+    # 最新 async-dnssd 仍依赖该库。公告为停止维护，待上游换用 pin-project 后删除。
+    # 复查期限：2027-02-01。
+    { id = "RUSTSEC-2026-0441", reason = "仅 macOS RDP helper 的 async-dnssd 间接使用投影宏；待上游替换 pin-utils" },
 ]
 
 [bans]

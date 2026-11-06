@@ -34,13 +34,13 @@ use crate::ports::{
 };
 use crate::server::{list_tools, CallContext, CallOutput, Ports};
 
-/// 每次调用前给出**当下**的上下文（全局档位 / 已知机密 / 客户端标签）。
+/// 每次调用前给出**当下**的上下文（全局档位 / 免确认设置 / 已知机密 / 客户端标签）。
 ///
-/// 抽成 trait 是因为这三样都随运行态变：档位可能被用户在设置里改，机密集随
-/// Vault 解锁状态变。传输层不该自己缓存它们——缓存一份过期的档位，等于让一次
+/// 档位和免确认设置可能在连接期间修改，机密集随 Vault 解锁状态变。
+/// 传输层不该自己缓存它们——缓存一份过期的策略，等于让一次
 /// 已被用户收紧的授权继续放行。由 app 层实现，每次现读。
 ///
-/// **异步**：读档位要走 SQLite、读机密要拿 Vault 锁，都是 await。做成手写
+/// **异步**：读设置要走 SQLite、读机密要拿 Vault 锁，都是 await。做成手写
 /// boxed future（与 `ports.rs` 同口径），保住 `Arc<dyn McpContextSource>` 的
 /// dyn 兼容。
 pub trait McpContextSource: Send + Sync {
@@ -135,10 +135,10 @@ impl ServerHandler for McpServer {
             None => "{}".to_string(),
         };
 
-        let ctx = self.ctx_source.current().await;
         // 锁只罩住这一次调用；拿到结果立刻放，别在持有锁期间做别的。
         let out = {
             let mut ledger = self.ledger.lock().await;
+            let ctx = self.ctx_source.current().await;
             let ports = Ports {
                 sessions: &*self.sessions,
                 terminal: &*self.terminal,

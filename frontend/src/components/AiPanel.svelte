@@ -279,7 +279,7 @@
     dangerous: "危险",
   };
   const DECISION_TEXT: Record<string, string> = {
-    auto: "只读命令，可直接执行",
+    auto: "可直接执行，无需确认",
     confirm: "执行前会问你一次",
     "strong-confirm": "危险操作，执行前需要强确认",
     deny: "当前档位不允许执行这条命令",

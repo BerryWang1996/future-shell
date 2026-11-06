@@ -102,7 +102,7 @@ pub enum GateOutcome {
     },
 }
 
-/// `fs_policy::gate::decide` 的全仓唯一生产调用点。3×3 裁决表唯一持有者仍是 gate.rs。
+/// 使用 `fs_policy::gate::decide` 把风险级别和执行档位合成为裁决。
 pub fn gate_check(g: &Gated, mode: AiMode) -> GateOutcome {
     match gate::decide(g.verdict.tier, mode) {
         Decision::AutoRun => GateOutcome::Auto,

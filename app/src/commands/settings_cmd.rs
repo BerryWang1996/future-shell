@@ -95,7 +95,7 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     // 而「导出设置」「贴日志求助」是用户每天都在做的两件事。
     // 校验分支里有一条黑名单挡住 api_key/token/secret 这些字段名，见下方。
     "ai.providers",
-    // AI 执行档位（总设计 §4.3 总开关）：disabled / read_only / with_confirm。
+    // AI 执行档位（总设计 §4.3 总开关）。
     // 串与 `fs_policy::AiMode::as_str()` 逐字一致（**下划线版**，不是连字符版）。
     "ai.mode",
     "hostkey.defaultPolicy",
@@ -110,6 +110,7 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     //   mcp.caller   调用方标签（进审计 `mcp:{client}`，展示用、非安全边界）。
     //   mcp.tools    授权工具名单（字符串数组，元素为线上工具名）。
     "mcp.enabled",
+    "mcp.skipConfirmation",
     "mcp.caller",
     "mcp.tools",
     // 外部 MCP server 挂载表（M3 出口 6）：`[{server_id,command,args}]`。
@@ -237,7 +238,11 @@ pub(crate) fn validate_setting(key: &str, value_json: &str) -> Result<(), String
     match key {
         // 档位串必须与 fs_policy 的稳定串一致。写成连字符版（read-only）的话
         // from_str_exact 认不出、回落 Disabled——症状是「选了只读，AI 却整个不能用」。
-        "ai.mode" => check_str(&v, &["disabled", "read_only", "with_confirm"], "ai.mode"),
+        "ai.mode" => match v.as_str() {
+            Some(s) if fs_policy::AiMode::from_str_exact(s).is_some() => Ok(()),
+            Some(s) => Err(format!("ai.mode 取值非法：{s}")),
+            None => Err("ai.mode 必须是字符串".into()),
+        },
         // provider 列表：形状 + 包络。**不校验 base_url 能不能连通**（那是网络问题，
         // 不是形状问题），但校验它是 http(s)——一个 file:// 的 base_url 会让 reqwest
         // 报一句与配置完全无关的错，而用户会去查网络。
@@ -348,7 +353,7 @@ pub(crate) fn validate_setting(key: &str, value_json: &str) -> Result<(), String
         // 字符串数组。**不在这里校验工具名是否真实存在**——`Authorization::new`
         // 会把不存在的名字归入 unknown 而不生效，此处只挡坏形状（与 quick.commands
         // 「后端挡形状、语义归消费侧」同一分工）。
-        "mcp.enabled" => check_bool(&v, "mcp.enabled"),
+        "mcp.enabled" | "mcp.skipConfirmation" => check_bool(&v, key),
         "mcp.caller" => check_str_len(&v, 64, "mcp.caller"),
         "mcp.tools" => {
             let arr = v.as_array().ok_or("mcp.tools 必须是数组")?;
@@ -766,6 +771,7 @@ mod tests {
             ),
             ("keyboard.mode", r#""local""#),
             ("mcp.enabled", "true"),
+            ("mcp.skipConfirmation", "true"),
             ("mcp.caller", r#""claude-desktop""#),
             ("mcp.tools", r#"["sessions.list","command.run"]"#),
             (
@@ -1108,13 +1114,20 @@ mod tests {
     /// 「选了只读，AI 却整个不能用」，而设置页上那一项看着是选中的。
     #[test]
     fn ai_mode_accepts_only_the_underscore_form() {
-        for ok in ["disabled", "read_only", "with_confirm"] {
+        for ok in ["disabled", "read_only", "with_confirm", "without_confirm"] {
             assert!(
                 validate_setting("ai.mode", &format!("\"{ok}\"")).is_ok(),
                 "{ok} 本该被接受"
             );
         }
-        for bad in ["read-only", "with-confirm", "readonly", "off", ""] {
+        for bad in [
+            "read-only",
+            "with-confirm",
+            "without-confirm",
+            "readonly",
+            "off",
+            "",
+        ] {
             assert!(
                 validate_setting("ai.mode", &format!("\"{bad}\"")).is_err(),
                 "{bad} 本该被拒"
