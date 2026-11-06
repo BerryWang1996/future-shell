@@ -22,12 +22,20 @@ env:
 # 和「CI 验过的依赖树」不是同一棵，cargo-deny 的结论也就不适用于实际产物。
 jobs:
   check:
+    name: check (${{ matrix.check_name }})
     strategy:
       fail-fast: false
       matrix:
         # 审计2 #4：钉具体镜像版本而非 *-latest——runner 镜像升级（新 SDK/系统库/编译器）
         # 会让相同源码在不同日期得到不同产物。升级 = 显式 PR 改这里的标签并重跑门禁。
-        os: [windows-2025, macos-14, ubuntu-24.04]
+        include:
+          - os: windows-2025
+            check_name: windows-2025
+          - os: macos-15
+            # 保留 main 分支保护已登记的必过检查名称。
+            check_name: macos-14
+          - os: ubuntu-24.04
+            check_name: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
