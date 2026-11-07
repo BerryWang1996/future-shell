@@ -55,9 +55,8 @@ pub struct McpServer {
     management: Arc<dyn crate::managed::ManagementPort>,
     ctx_source: Arc<dyn McpContextSource>,
     authz: Authorization,
-    /// `server::call` 要 `&mut OpenLedger`；stdio 上多个请求可能并发到达，故加锁。
-    /// 用 `tokio::sync::Mutex` 而非 std 的：守卫要**跨过** `server::call` 的 await，
-    /// std 锁守卫非 Send，会让整个 `call_tool` 的 future 不满足 `MaybeSendFuture`。
+    /// 并发请求各取快照；只在复制和合并成功记录时持锁。
+    /// 并发首次打开可能各自需要强确认，但不会跳过应有的确认。
     ledger: tokio::sync::Mutex<OpenLedger>,
     sessions: Arc<dyn SessionDirectory>,
     terminal: Arc<dyn TerminalPort>,
@@ -104,6 +103,7 @@ impl ServerHandler for McpServer {
                 "FutureShell",
                 env!("CARGO_PKG_VERSION"),
             ))
+            .with_instructions("sessions.list 为空不代表没有可连接配置；调用 profiles.list 查找已允许的 SSH 配置，再用 sessions.open 的 profile_id 创建会话，无需预先手动打开服务器。同一配置每次成功打开都会产生独立 session_id，后续操作使用各自返回的 ID；结果不明时先查 sessions.list，不盲目重发。SSH exec 和 SFTP 使用原始连接端点；交互终端中经堡垒机或嵌套 SSH 进入的主机不会改变该端点。command.run 及旧 sftp.list/read 使用独立无 PTY exec 通道。需要操作交互目标时，先用 terminal.read 查看，再用 terminal.send 的 press_enter 提交；source=screen 是可见屏，all/scrollback 可读取最新尾部。单项操作失败时先用 sessions.details 核对连接状态和端点；结果不明时先检查状态，不要自动重复执行。工具授权与远端文件系统权限分别检查。")
     }
 
     /// `tools/list`：**从授权层过滤后的清单**生成，不另写一份。未授权工具在这里
@@ -138,9 +138,9 @@ impl ServerHandler for McpServer {
             None => "{}".to_string(),
         };
 
-        // 锁只罩住这一次调用；拿到结果立刻放，别在持有锁期间做别的。
+        // 不能在人工确认、网络操作或审计期间持有全局台账锁。
+        let mut ledger = self.ledger.lock().await.clone();
         let out = {
-            let mut ledger = self.ledger.lock().await;
             let ctx = self.ctx_source.current().await;
             let ports = Ports {
                 management: &*self.management,
@@ -161,6 +161,9 @@ impl ServerHandler for McpServer {
             )
             .await
         };
+        // 服务器在打开成功后即记账，即使后续 settled 审计失败也必须合并。
+        // 若此处拿锁前请求被取消，可能丢失记账，下次只会多一次首次确认；不重开会话。
+        self.ledger.lock().await.merge(ledger);
         Ok(to_response(out))
     }
 }

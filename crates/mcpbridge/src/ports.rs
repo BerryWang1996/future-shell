@@ -25,6 +25,8 @@ use crate::tool::ReadSource;
 /// 把两者混为一谈会让审计里「被拦下」与「试过但失败」不可区分，
 /// 而这两件事在事后追查时的意义完全相反。
 pub type PortResult<T> = Result<T, String>;
+pub const SESSION_FORBIDDEN: &str = "该会话不可通过 MCP 使用";
+pub const SESSION_UNAVAILABLE: &str = "会话不可用或已变化";
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -74,6 +76,9 @@ pub trait SessionDirectory: Send + Sync {
     /// 「用户刚取消许可、MCP 仍能开」，后者是卡住事件循环，都不可接受。
     fn mcp_allowed(&self, profile_id: &str) -> Fut<'_, Option<bool>>;
 
+    /// 当前会话绑定的原始 SSH 配置是否仍允许 MCP；错误或缺失均拒绝。
+    fn session_allowed(&self, session_id: &str) -> Fut<'_, bool>;
+
     /// 打开一个新会话，成功则给出新会话 id。
     fn open(&self, profile_id: &str) -> Fut<'_, PortResult<String>>;
 }
@@ -89,29 +94,52 @@ pub trait TerminalPort: Send + Sync {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>>;
 
     /// 往终端写 payload（像用户敲进去一样）。
-    fn send(&self, session_id: &str, payload: &str) -> Fut<'_, PortResult<()>>;
+    fn send(
+        &self,
+        session_id: &str,
+        payload: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>>;
 }
 
 /// 命令执行。走 §4.4 `run_command` 契约（超时/截断/观察值），
 /// **实现只有一份**（`fs_ai::exec::run_command`），由 app 层的端口转调。
 pub trait CommandPort: Send + Sync {
-    fn run(&self, session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>>;
+    fn run(
+        &self,
+        session_id: &str,
+        command: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>>;
 }
 
 /// SFTP 三件事。
 pub trait SftpPort: Send + Sync {
-    fn list(&self, session_id: &str, path: &str) -> Fut<'_, PortResult<String>>;
+    fn list(
+        &self,
+        session_id: &str,
+        path: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>>;
     fn read(
         &self,
         session_id: &str,
         path: &str,
         max_bytes: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>>;
     /// 内容内联。与 Agent 的 `sftp_put`（本地源 → 远端目的）不是同一个操作。
-    fn write(&self, session_id: &str, path: &str, content: &str) -> Fut<'_, PortResult<()>>;
+    fn write(
+        &self,
+        session_id: &str,
+        path: &str,
+        content: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>>;
 }
 
 /// 用户在确认框上做了什么。

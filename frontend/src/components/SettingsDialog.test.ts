@@ -30,6 +30,10 @@ let mcpStatusReply: unknown = { enabled: false, listening: false, port: 0, conne
 /** openExternal 收到的 URL——「打开发布页」按钮的落点。 */
 const opened: string[] = [];
 let failSettingWrites = false;
+let mcpReadFails = false;
+let mcpRawOverride: string | null | undefined;
+let mcpWriteWait: Promise<void> | null = null;
+let mcpReadWait: Promise<void> | null = null;
 
 vi.mock("../lib/ipc", () => ({
   // mcp:status 监听（2026-08-28 对外 MCP 状态点）：onMount 就调 listen，
@@ -44,7 +48,9 @@ vi.mock("../lib/ipc", () => ({
   settingGet: async <T>(key: string, fallback: T): Promise<T> =>
     store.has(key) ? (store.get(key) as T) : fallback,
   settingSet: async (key: string, value: unknown): Promise<void | boolean> => {
+    if (key === "mcp.tools" && mcpWriteWait) await mcpWriteWait;
     if (failSettingWrites) return false;
+    if (key === "mcp.tools" && (value as unknown[]).length > 64) return false;
     // 桩会**拒绝**后端白名单拒绝的值。一个永远成功的桩会让「保存失败要告诉用户」
     // 这条路径无法被测到——而那条路径正是这里最容易写错的一处（`void settingSet(…)`
     // 把 rejection 吞掉，界面显示的与库里存的从此各说各话）。
@@ -61,8 +67,13 @@ vi.mock("../lib/ipc", () => ({
   // undefined，调用直接抛 TypeError（不是 rejected promise，`.catch` 挂不住），
   // onMount 整条 await 链就此中断，后面十几个 settingGet 一个都不跑——
   // 于是「重启后显示库里的值」那一组会集体红在一个与它们无关的原因上。
-  invoke: async <T>(cmd: string): Promise<T> => {
+  invoke: async <T>(cmd: string, args?: { key?: string }): Promise<T> => {
     invoked.push({ cmd });
+    if (cmd === "settings_get" && args?.key === "mcp.tools") {
+      if (mcpReadWait) await mcpReadWait;
+      if (mcpReadFails) throw new Error("settings unavailable");
+      return (mcpRawOverride !== undefined ? mcpRawOverride : store.has("mcp.tools") ? JSON.stringify(store.get("mcp.tools")) : null) as T;
+    }
     if (cmd === "app_version") return "0.5.0" as T;
     if (cmd === "update_check") return updateCheckReply as T;
     // MCP 区（2026-08-28）：状态/指引/token 三条命令，回复由用例设定
@@ -90,6 +101,7 @@ function keysOf(re: RegExp): Set<string> {
 }
 const WRITTEN = keysOf(/settingSet\(\s*"([^"]+)"/g);
 const READ = keysOf(/settingGet(?:<[^>]*>)?\(\s*"([^"]+)"/g);
+for (const m of SOURCE.matchAll(/invoke<[^>]+>\(\s*"settings_get"\s*,\s*\{\s*key:\s*"([^"]+)"/g)) READ.add(m[1]);
 
 async function openAt(tab?: string) {
   render(SettingsDialog, { props: { open: true } });
@@ -139,6 +151,117 @@ describe("SettingsDialog MCP 免逐次确认", () => {
     await openAt("AI");
     await flush();
     expect(screen.getByTestId("set-mcp-skip-confirmation")).toHaveProperty("checked", true);
+  });
+});
+
+describe("SettingsDialog MCP 工具批量选择", () => {
+  beforeEach(() => {
+    store.clear(); writes.length = 0; invoked.length = 0; failSettingWrites = false;
+    mcpReadFails = false; mcpRawOverride = undefined; mcpWriteWait = null; mcpReadWait = null;
+  });
+
+  it("空名单全选一次，重新打开后反选清空", async () => {
+    await openAt("AI"); await flush();
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 25");
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(25));
+    expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(1);
+    cleanup(); await openAt("AI"); await flush();
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25");
+    await fireEvent.click(screen.getByRole("button", { name: "反选" }));
+    await waitFor(() => expect(store.get("mcp.tools")).toEqual([]));
+  });
+
+  it("部分选择反选可见工具，保留未知项；全选不重复添加", async () => {
+    store.set("mcp.tools", ["future.tool", "terminal.read", "sftp.delete"]);
+    await openAt("AI"); await flush();
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("2 / 25");
+    await fireEvent.click(screen.getByRole("button", { name: "反选" }));
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(24));
+    const inverted = store.get("mcp.tools") as string[];
+    expect(inverted).toContain("future.tool");
+    expect(inverted).not.toContain("terminal.read");
+    expect(inverted).not.toContain("sftp.delete");
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(26));
+    expect(new Set(store.get("mcp.tools") as string[]).size).toBe(26);
+  });
+
+  it("保存失败保持旧值，重试成功才同步选择", async () => {
+    store.set("mcp.tools", ["terminal.read"]);
+    await openAt("AI"); await flush();
+    failSettingWrites = true;
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "重试保存" })).toBeTruthy());
+    expect(store.get("mcp.tools")).toEqual(["terminal.read"]);
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("1 / 25");
+    failSettingWrites = false;
+    await fireEvent.click(screen.getByRole("button", { name: "重试保存" }));
+    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25"));
+    expect((store.get("mcp.tools") as string[]).length).toBe(25);
+  });
+
+  it("慢保存期间禁用单项及批量按钮，阻止乱序写入", async () => {
+    await openAt("AI"); await flush();
+    let release!: () => void;
+    mcpWriteWait = new Promise<void>((resolve) => { release = resolve; });
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "反选" })).toHaveProperty("disabled", true));
+    expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("disabled", true);
+    await fireEvent.click(screen.getByRole("button", { name: "反选" }));
+    release();
+    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25"));
+    expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(1);
+  });
+
+  it("读取完成前禁止早点击，加载后保留原有授权", async () => {
+    store.set("mcp.tools", ["terminal.read"]);
+    let release!: () => void;
+    mcpReadWait = new Promise<void>((resolve) => { release = resolve; });
+    await openAt("AI");
+    await waitFor(() => expect(invoked.some((item) => item.cmd === "settings_get")).toBe(true));
+    expect(screen.getByRole("button", { name: "全选" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("disabled", true);
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("工具名单未读取");
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(0);
+    release();
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("checked", true));
+    expect(store.get("mcp.tools")).toEqual(["terminal.read"]);
+  });
+
+  it("单项写入失败时复原勾选状态", async () => {
+    store.set("mcp.tools", ["terminal.read"]);
+    await openAt("AI"); await flush();
+    failSettingWrites = true;
+    await fireEvent.click(screen.getByRole("checkbox", { name: /terminal\.read/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "重试保存" })).toBeTruthy());
+    expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("checked", true);
+    expect(store.get("mcp.tools")).toEqual(["terminal.read"]);
+  });
+
+  it.each(["ipc", "bad-json", "wrong-shape"])("读取 %s 失败时禁用，重试成功后恢复原名单", async (failure) => {
+    store.set("mcp.tools", ["terminal.read"]);
+    if (failure === "ipc") mcpReadFails = true;
+    else mcpRawOverride = failure === "bad-json" ? "{" : '["terminal.read", 42]';
+    await openAt("AI"); await flush();
+    expect(screen.getByRole("button", { name: "全选" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("disabled", true);
+    expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(0);
+    mcpReadFails = false; mcpRawOverride = undefined;
+    await fireEvent.click(screen.getByRole("button", { name: "重试读取" }));
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("checked", true));
+    expect(screen.getByRole("button", { name: "全选" })).toHaveProperty("disabled", false);
+  });
+
+  it("超过 64 条的全选写入被拒绝时不改变当前授权", async () => {
+    const unknown = Array.from({ length: 40 }, (_, i) => `unknown.${i}`);
+    store.set("mcp.tools", unknown);
+    await openAt("AI"); await flush();
+    await fireEvent.click(screen.getByRole("button", { name: "全选" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "重试保存" })).toBeTruthy());
+    expect(store.get("mcp.tools")).toEqual(unknown);
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 25");
   });
 });
 

@@ -23,7 +23,7 @@
 //! 这个状态：现在它跑过了，且任何一处翻译写反都会在这里转红。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fs_ai::exec::Observation;
@@ -48,20 +48,41 @@ type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send +
 // 只做到「能把协议跑起来」的最小程度。裁决逻辑本身由 server.rs 的 102 个
 // 测试覆盖，这里要验的是协议那一层，故端口一律给确定的、好断言的返回。
 
-struct Management;
+struct Management(Arc<Dir>);
 impl fs_mcpbridge::managed::ManagementPort for Management {
     fn generation(&self, _: &str) -> Option<u64> {
         Some(1)
     }
     fn run<'a>(
         &'a self,
-        _: &'a fs_mcpbridge::managed::ManagedTool,
+        tool: &'a fs_mcpbridge::managed::ManagedTool,
         _: Option<u64>,
     ) -> Fut<'a, Result<serde_json::Value, fs_mcpbridge::managed::ManagementError>> {
-        Box::pin(async { Ok(serde_json::json!({})) })
+        Box::pin(async move {
+            if let fs_mcpbridge::managed::ManagedTool::Close { session_id } = tool {
+                self.0.sessions.lock().unwrap().remove(session_id);
+            }
+            Ok(serde_json::json!({}))
+        })
     }
 }
-struct Dir;
+struct Dir {
+    sessions: Mutex<std::collections::BTreeSet<String>>,
+    next: AtomicUsize,
+}
+impl Dir {
+    fn new(initial: bool) -> Self {
+        let sessions = if initial {
+            ["s-1".to_string()].into_iter().collect()
+        } else {
+            Default::default()
+        };
+        Self {
+            sessions: Mutex::new(sessions),
+            next: AtomicUsize::new(2),
+        }
+    }
+}
 impl SessionDirectory for Dir {
     fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
         Box::pin(async {
@@ -73,23 +94,40 @@ impl SessionDirectory for Dir {
     }
 
     fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
-        Box::pin(async {
-            vec![SessionSummary {
-                id: "s-1".into(),
-                name: "生产机".into(),
-                host: "example.internal".into(),
-                connected: true,
-            }]
+        Box::pin(async move {
+            self.sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|id| SessionSummary {
+                    id: id.clone(),
+                    name: "生产机".into(),
+                    host: "example.internal".into(),
+                    connected: true,
+                })
+                .collect()
         })
     }
     fn is_alive(&self, session_id: &str) -> bool {
-        session_id == "s-1"
+        self.sessions.lock().unwrap().contains(session_id)
     }
-    fn mcp_allowed(&self, _profile_id: &str) -> Fut<'_, Option<bool>> {
-        Box::pin(async { Some(true) })
+    fn mcp_allowed(&self, profile_id: &str) -> Fut<'_, Option<bool>> {
+        let allowed = match profile_id {
+            "missing" => None,
+            "unallowed" => Some(false),
+            _ => Some(true),
+        };
+        Box::pin(async move { allowed })
+    }
+    fn session_allowed(&self, _session_id: &str) -> Fut<'_, bool> {
+        Box::pin(async { true })
     }
     fn open(&self, _profile_id: &str) -> Fut<'_, PortResult<String>> {
-        Box::pin(async { Ok("s-2".to_string()) })
+        Box::pin(async move {
+            let id = format!("s-{}", self.next.fetch_add(1, Ordering::SeqCst));
+            self.sessions.lock().unwrap().insert(id.clone());
+            Ok(id)
+        })
     }
 }
 
@@ -100,6 +138,7 @@ impl TerminalPort for Term {
         _session_id: &str,
         _source: ReadSource,
         _max_lines: Option<usize>,
+        _generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         // 故意回吐一个已知机密：脱敏必须发生在字节**离开本进程之前**。
         // 端口自己不脱敏（ports.rs 明写脱敏统一在 server.rs 做，
@@ -107,14 +146,24 @@ impl TerminalPort for Term {
         // 由协议对面收到的东西来判断那个唯一的脱敏点在不在。
         Box::pin(async { Ok("$ echo hunter2\nhunter2\n".to_string()) })
     }
-    fn send(&self, _session_id: &str, _payload: &str) -> Fut<'_, PortResult<()>> {
+    fn send(
+        &self,
+        _session_id: &str,
+        _payload: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
 
 struct Cmd;
 impl CommandPort for Cmd {
-    fn run(&self, _session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>> {
+    fn run(
+        &self,
+        _session_id: &str,
+        command: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>> {
         let c = command.to_string();
         Box::pin(async move {
             Ok(Observation {
@@ -130,13 +179,25 @@ impl CommandPort for Cmd {
 
 struct Sftp;
 impl SftpPort for Sftp {
-    fn list(&self, _s: &str, _p: &str) -> Fut<'_, PortResult<String>> {
+    fn list(&self, _s: &str, _p: &str, _generation: Option<u64>) -> Fut<'_, PortResult<String>> {
         Box::pin(async { Ok("a.txt\n".to_string()) })
     }
-    fn read(&self, _s: &str, _p: &str, _m: Option<usize>) -> Fut<'_, PortResult<String>> {
+    fn read(
+        &self,
+        _s: &str,
+        _p: &str,
+        _m: Option<usize>,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>> {
         Box::pin(async { Ok("body".to_string()) })
     }
-    fn write(&self, _s: &str, _p: &str, _c: &str) -> Fut<'_, PortResult<()>> {
+    fn write(
+        &self,
+        _s: &str,
+        _p: &str,
+        _c: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -194,11 +255,20 @@ impl McpContextSource for Ctx {
 /// 必须持有返回的 `RunningService` 本体——传输与服务循环挂在它上面，
 /// 提前析构连接就断了（client.rs 的测试里同一条注释，同一个坑）。
 async fn paired(tools: &[&str], answer: Option<bool>) -> RunningService<RoleClient, ()> {
+    paired_with_sessions(tools, answer, true).await
+}
+
+async fn paired_with_sessions(
+    tools: &[&str],
+    answer: Option<bool>,
+    initial: bool,
+) -> RunningService<RoleClient, ()> {
+    let directory = Arc::new(Dir::new(initial));
     let server = McpServer::new(
         Arc::new(Ctx),
-        Arc::new(Management),
+        Arc::new(Management(directory.clone())),
         Authorization::new(tools.iter().copied()),
-        Arc::new(Dir),
+        directory,
         Arc::new(Term),
         Arc::new(Cmd),
         Arc::new(Sftp),
@@ -485,4 +555,520 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
     );
     let ident = info.server_info.as_ref().expect("握手要报出服务端身份");
     assert_eq!(ident.name, "FutureShell");
+    let instructions = info.instructions.as_deref().expect("握手应说明操作边界");
+    for expected in [
+        "sessions.list 为空",
+        "无需预先手动打开服务器",
+        "同一配置每次成功打开",
+        "不盲目重发",
+        "原始连接端点",
+        "无 PTY",
+        "sessions.details",
+        "all/scrollback",
+        "不要自动重复执行",
+    ] {
+        assert!(instructions.contains(expected), "缺少协议说明: {expected}");
+    }
+}
+
+#[tokio::test]
+async fn empty_registry_allows_two_parallel_opens_and_independent_close() {
+    let peer = paired_with_sessions(
+        &[
+            "profiles.list",
+            "sessions.list",
+            "sessions.open",
+            "sessions.close",
+            "terminal.read",
+        ],
+        Some(true),
+        false,
+    )
+    .await;
+    let (err, value, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    assert!(!err);
+    assert_eq!(value.unwrap(), serde_json::json!([]));
+    let (err, value, _) = call(&peer, "profiles.list", serde_json::json!({})).await;
+    assert!(!err);
+    let profile = value.unwrap()["profiles"][0]["profile_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (a, b) = tokio::join!(
+        call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":profile})
+        ),
+        call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":profile})
+        ),
+    );
+    assert!(!a.0 && !b.0);
+    let a = a.1.unwrap()["session_id"].as_str().unwrap().to_owned();
+    let b = b.1.unwrap()["session_id"].as_str().unwrap().to_owned();
+    assert_ne!(a, b);
+    let (_, list, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    let list = list.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(list.as_array().unwrap().iter().any(|s| s["id"] == a));
+    assert!(list.as_array().unwrap().iter().any(|s| s["id"] == b));
+    assert!(
+        !call(&peer, "sessions.close", serde_json::json!({"session_id":a}))
+            .await
+            .0
+    );
+    let (_, list, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    let list = list.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], b);
+    assert!(
+        !call(
+            &peer,
+            "terminal.read",
+            serde_json::json!({"session_id":b,"source":"screen"})
+        )
+        .await
+        .0
+    );
+}
+
+#[tokio::test]
+async fn session_guidance_is_discoverable_and_refusals_keep_generic_codes() {
+    let peer = paired_with_sessions(
+        &[
+            "profiles.list",
+            "sessions.list",
+            "sessions.open",
+            "sessions.details",
+            "terminal.read",
+        ],
+        Some(true),
+        false,
+    )
+    .await;
+    let listed = peer.list_all_tools().await.unwrap();
+    let description = |name: &str| {
+        listed
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .to_string()
+    };
+    assert!(description("sessions.list").contains("空列表不代表没有可连接配置"));
+    let open = description("sessions.open");
+    for phrase in [
+        "profiles.list",
+        "无需先在 FutureShell 手动打开",
+        "独立会话",
+        "不要盲目重发",
+    ] {
+        assert!(open.contains(phrase), "missing guidance: {phrase}");
+    }
+    let missing_session = call(
+        &peer,
+        "terminal.read",
+        serde_json::json!({"session_id":"missing","source":"screen"}),
+    )
+    .await;
+    assert!(missing_session.0);
+    let err = missing_session.1.unwrap();
+    assert_eq!(err["code"], "FS_POLICY_FORBIDDEN");
+    assert!(err["message"].as_str().unwrap().contains("profiles.list"));
+    assert!(!err["message"].as_str().unwrap().contains("已断开"));
+    let missing_managed = call(
+        &peer,
+        "sessions.details",
+        serde_json::json!({"session_id":"missing"}),
+    )
+    .await;
+    assert!(missing_managed.0);
+    let managed_error = missing_managed.1.unwrap();
+    assert_eq!(managed_error["code"], "FS_MCP_TARGET_UNAVAILABLE");
+    assert!(managed_error["message"]
+        .as_str()
+        .unwrap()
+        .contains("profiles.list"));
+    let missing = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"missing"}),
+    )
+    .await;
+    let denied = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"unallowed"}),
+    )
+    .await;
+    assert!(missing.0 && denied.0);
+    assert_eq!(missing.1, denied.1);
+    let err = missing.1.unwrap();
+    assert_eq!(err["code"], "FS_POLICY_FORBIDDEN");
+    assert!(err["message"].as_str().unwrap().contains("profiles.list"));
+}
+
+struct ProbeDir {
+    inner: Dir,
+    open_barrier: Option<Arc<tokio::sync::Barrier>>,
+    barrier_calls: AtomicUsize,
+}
+impl SessionDirectory for ProbeDir {
+    fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
+        self.inner.list_profiles()
+    }
+    fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
+        self.inner.list()
+    }
+    fn is_alive(&self, id: &str) -> bool {
+        self.inner.is_alive(id)
+    }
+    fn mcp_allowed(&self, id: &str) -> Fut<'_, Option<bool>> {
+        self.inner.mcp_allowed(id)
+    }
+    fn session_allowed(&self, id: &str) -> Fut<'_, bool> {
+        self.inner.session_allowed(id)
+    }
+    fn open(&self, id: &str) -> Fut<'_, PortResult<String>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            if let Some(barrier) = &self.open_barrier {
+                if self.barrier_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait().await;
+                }
+            }
+            if id == "failed-open" {
+                return Err("synthetic open failure 中文 hunter2".into());
+            }
+            self.inner.open(&id).await
+        })
+    }
+}
+struct ProbeCommand {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+impl CommandPort for ProbeCommand {
+    fn run(&self, _: &str, _: &str, _: Option<u64>) -> Fut<'_, PortResult<Observation>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Observation {
+                stdout: "done".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                truncated: false,
+                timed_out: false,
+            })
+        })
+    }
+}
+#[derive(Default)]
+struct ProbeConfirm {
+    strong: Mutex<Vec<bool>>,
+    reject: std::sync::atomic::AtomicBool,
+}
+impl McpConfirmPort for ProbeConfirm {
+    fn confirm(&self, ticket: ConfirmTicket) -> Fut<'_, ConfirmReply> {
+        self.strong.lock().unwrap().push(ticket.strong);
+        let answer = !self.reject.load(Ordering::SeqCst);
+        Box::pin(async move {
+            ConfirmReply {
+                answer: Some(answer),
+                elapsed: Duration::from_secs(1),
+                context_alive: true,
+            }
+        })
+    }
+}
+#[derive(Default)]
+struct ProbeAudit {
+    fail_settled: std::sync::atomic::AtomicBool,
+}
+impl McpAuditPort for ProbeAudit {
+    fn append(&self, r: McpCallRecord) -> Fut<'_, PortResult<()>> {
+        let fail = r.tool_name == "sessions.open"
+            && r.phase == fs_mcpbridge::ports::RecordPhase::Settled
+            && self.fail_settled.swap(false, Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                Err("synthetic settled failure 中文 hunter2".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+async fn concurrency_peer(
+    dir: Arc<ProbeDir>,
+    command: Arc<ProbeCommand>,
+    conf: Arc<ProbeConfirm>,
+    audit: Arc<ProbeAudit>,
+) -> RunningService<RoleClient, ()> {
+    let server = McpServer::new(
+        Arc::new(Ctx),
+        Arc::new(Management(Arc::new(Dir::new(true)))),
+        Authorization::new(["sessions.list", "sessions.open", "command.run"]),
+        dir,
+        Arc::new(Term),
+        command,
+        Arc::new(Sftp),
+        conf,
+        audit,
+    );
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let (sr, sw) = tokio::io::split(server_io);
+    let (cr, cw) = tokio::io::split(client_io);
+    tokio::spawn(async move {
+        let _ = server.serve((sr, sw)).await.unwrap().waiting().await;
+    });
+    serve_client((), (cr, cw)).await.unwrap()
+}
+fn probe_dir(barrier: bool) -> Arc<ProbeDir> {
+    Arc::new(ProbeDir {
+        inner: Dir::new(true),
+        open_barrier: barrier.then(|| Arc::new(tokio::sync::Barrier::new(2))),
+        barrier_calls: AtomicUsize::new(0),
+    })
+}
+fn probe_command() -> Arc<ProbeCommand> {
+    Arc::new(ProbeCommand {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    })
+}
+
+#[tokio::test]
+async fn same_peer_read_is_not_blocked_by_running_command() {
+    let command = probe_command();
+    let peer = concurrency_peer(
+        probe_dir(false),
+        command.clone(),
+        Arc::new(ProbeConfirm::default()),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    let command_call = call(
+        &peer,
+        "command.run",
+        serde_json::json!({"session_id":"s-1","command":"sleep 10"}),
+    );
+    let read_while_blocked = async {
+        command.entered.notified().await;
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            call(&peer, "sessions.list", serde_json::json!({})),
+        )
+        .await;
+        command.release.notify_one();
+        assert!(!read.expect("read blocked behind command").0);
+    };
+    let (command_result, _) = tokio::join!(command_call, read_while_blocked);
+    assert!(!command_result.0);
+}
+
+#[tokio::test]
+async fn same_peer_first_opens_run_concurrently_and_merge_seen_profiles() {
+    let confirm = Arc::new(ProbeConfirm::default());
+    let peer = concurrency_peer(
+        probe_dir(true),
+        probe_command(),
+        confirm.clone(),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    let both = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            call(
+                &peer,
+                "sessions.open",
+                serde_json::json!({"profile_id":"p1"})
+            ),
+            call(
+                &peer,
+                "sessions.open",
+                serde_json::json!({"profile_id":"p2"})
+            )
+        )
+    })
+    .await
+    .expect("both opens must enter barrier concurrently");
+    assert!(!both.0 .0 && !both.1 .0);
+    assert_ne!(
+        both.0 .1.unwrap()["session_id"],
+        both.1 .1.unwrap()["session_id"]
+    );
+    for id in ["p1", "p2"] {
+        assert!(
+            !call(&peer, "sessions.open", serde_json::json!({"profile_id":id}))
+                .await
+                .0
+        );
+    }
+    assert_eq!(
+        *confirm.strong.lock().unwrap(),
+        vec![true, true, false, false]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_opens_for_same_profile_both_confirm_and_create_sessions() {
+    let confirm = Arc::new(ProbeConfirm::default());
+    let peer = concurrency_peer(
+        probe_dir(true),
+        probe_command(),
+        confirm.clone(),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            call(
+                &peer,
+                "sessions.open",
+                serde_json::json!({"profile_id":"p1"})
+            ),
+            call(
+                &peer,
+                "sessions.open",
+                serde_json::json!({"profile_id":"p1"})
+            )
+        )
+    })
+    .await
+    .expect("both same-profile opens must enter barrier");
+    assert!(!a.0 && !b.0);
+    assert_ne!(a.1.unwrap()["session_id"], b.1.unwrap()["session_id"]);
+    assert!(
+        !call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":"p1"})
+        )
+        .await
+        .0
+    );
+    assert_eq!(*confirm.strong.lock().unwrap(), vec![true, true, false]);
+}
+
+#[tokio::test]
+async fn failed_and_rejected_opens_do_not_enter_seen_ledger() {
+    let confirm = Arc::new(ProbeConfirm::default());
+    let peer = concurrency_peer(
+        probe_dir(false),
+        probe_command(),
+        confirm.clone(),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    for _ in 0..2 {
+        let (is_error, structured, text) = call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":"failed-open"}),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(structured.unwrap()["code"], "FS_MCP_OPERATION_FAILED");
+        assert!(text.contains("synthetic open failure"));
+    }
+    confirm.reject.store(true, Ordering::SeqCst);
+    assert!(
+        call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":"rejected"})
+        )
+        .await
+        .0
+    );
+    confirm.reject.store(false, Ordering::SeqCst);
+    assert!(
+        !call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":"rejected"})
+        )
+        .await
+        .0
+    );
+    assert_eq!(
+        *confirm.strong.lock().unwrap(),
+        vec![true, true, true, true]
+    );
+}
+
+#[tokio::test]
+async fn successful_open_is_remembered_when_settled_audit_fails() {
+    let confirm = Arc::new(ProbeConfirm::default());
+    let audit = Arc::new(ProbeAudit::default());
+    audit.fail_settled.store(true, Ordering::SeqCst);
+    let dir = probe_dir(false);
+    let peer = concurrency_peer(dir.clone(), probe_command(), confirm.clone(), audit).await;
+    let first = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"audit-failure"}),
+    )
+    .await;
+    assert!(first.0);
+    let error = first.1.unwrap();
+    assert_eq!(error["code"], "FS_MCP_AUDIT_FAILED");
+    assert_eq!(error["details"]["stage"], "settled");
+    assert_eq!(error["details"]["operation_attempted"], true);
+    assert!(!error.to_string().contains("hunter2"));
+    assert!(error["message"].as_str().unwrap().contains("中文"));
+    assert!(error["message"].as_str().unwrap().contains("redacted"));
+    assert!(error["details"]["operation_result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("s-"));
+    assert_eq!(
+        dir.inner.sessions.lock().unwrap().len(),
+        2,
+        "first open actually succeeded despite audit failure"
+    );
+    assert!(
+        !call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":"audit-failure"})
+        )
+        .await
+        .0
+    );
+    assert_eq!(*confirm.strong.lock().unwrap(), vec![true, false]);
+}
+
+#[tokio::test]
+async fn port_failure_is_a_tool_level_error_over_rmcp() {
+    let dir = probe_dir(false);
+    let peer = concurrency_peer(
+        dir,
+        probe_command(),
+        Arc::new(ProbeConfirm::default()),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    let (is_error, structured, _) = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"failed-open"}),
+    )
+    .await;
+    assert!(is_error);
+    let error = structured.unwrap();
+    assert_eq!(error["code"], "FS_MCP_OPERATION_FAILED");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("synthetic open failure"));
+    assert!(error["message"].as_str().unwrap().contains("中文"));
+    assert!(error["message"].as_str().unwrap().contains("redacted"));
+    assert!(!error.to_string().contains("hunter2"));
 }

@@ -33,7 +33,35 @@ fn session_failed(error: crate::commands::session_cmd::SessionControlError) -> M
 
 fn remote_failed(error: fs_sshengine::Error) -> ManagementError {
     let code = remote_failed_ref(&error, "FS_MCP_OPERATION_FAILED");
-    ManagementError::new(code, error.to_string())
+    ManagementError::new(code, remote_message(&error))
+}
+
+fn remote_message(error: &fs_sshengine::Error) -> String {
+    let scope = match error {
+        fs_sshengine::Error::SftpStatus { code: 2, .. } => {
+            "原 SSH 端点的远端路径不存在；请核对路径与 sessions.details 中的端点"
+        }
+        fs_sshengine::Error::SftpStatus { code: 3, .. } => {
+            "原 SSH 端点的远端文件系统拒绝访问；请核对远端文件权限（与 MCP 连接授权不同）"
+        }
+        fs_sshengine::Error::Unsupported(_) | fs_sshengine::Error::SftpStatus { code: 8, .. } => {
+            "原 SSH 端点或客户端不支持该文件操作；请核对端点及服务端能力"
+        }
+        _ => return error.to_string(),
+    };
+    format!("{scope}：{error}")
+}
+
+fn remote_partial(
+    error: fs_sshengine::Error,
+    partial: Value,
+    fallback: &'static str,
+) -> ManagementError {
+    ManagementError {
+        code: remote_failed_ref(&error, fallback),
+        message: remote_message(&error),
+        partial: Some(partial),
+    }
 }
 
 fn remote_failed_ref(error: &fs_sshengine::Error, fallback: &'static str) -> &'static str {
@@ -53,7 +81,7 @@ pub(crate) fn upload_root_key(profile_id: &str) -> String {
     format!("mcp.uploadRoot.{profile_id}")
 }
 
-async fn allowed(state: &AppState, profile_id: &str) -> bool {
+pub(crate) async fn allowed(state: &AppState, profile_id: &str) -> bool {
     let Ok(id) = uuid::Uuid::parse_str(profile_id) else {
         return false;
     };
@@ -349,20 +377,16 @@ impl McpManagement {
             ManagedTool::Copy { from, to, .. } => {
                 fs_sshengine::managed_fileops::copy(ops.as_ref(), from, to)
                     .await
-                    .map_err(|(error, partial)| ManagementError {
-                        code: remote_failed_ref(&error, "FS_MCP_COPY_FAILED"),
-                        message: error.to_string(),
-                        partial: Some(partial),
+                    .map_err(|(error, partial)| {
+                        remote_partial(error, partial, "FS_MCP_COPY_FAILED")
                     })?
             }
             ManagedTool::Delete {
                 path, recursive, ..
             } => fs_sshengine::managed_fileops::delete(ops.as_ref(), path, *recursive)
                 .await
-                .map_err(|(error, partial)| ManagementError {
-                    code: remote_failed_ref(&error, "FS_MCP_DELETE_FAILED"),
-                    message: error.to_string(),
-                    partial: Some(partial),
+                .map_err(|(error, partial)| {
+                    remote_partial(error, partial, "FS_MCP_DELETE_FAILED")
                 })?,
             _ => unreachable!(),
         };
@@ -388,6 +412,36 @@ impl ManagementPort for McpManagement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_errors_identify_file_scope_and_preserve_partial_results() {
+        for (status, code, text) in [
+            (2, "FS_MCP_TARGET_UNAVAILABLE", "远端路径不存在"),
+            (3, "FS_MCP_REMOTE_PERMISSION_DENIED", "远端文件系统拒绝访问"),
+            (8, "FS_MCP_UNSUPPORTED", "不支持该文件操作"),
+        ] {
+            let error = fs_sshengine::Error::SftpStatus {
+                code: status,
+                message: "original context".into(),
+            };
+            let out = remote_failed(error);
+            assert_eq!(out.code, code);
+            assert!(out.message.contains(text));
+            assert!(out.message.contains("original context"));
+            for fallback in ["FS_MCP_COPY_FAILED", "FS_MCP_DELETE_FAILED"] {
+                let error = fs_sshengine::Error::SftpStatus {
+                    code: status,
+                    message: "original context".into(),
+                };
+                let partial = json!({"completed": 2});
+                let out = remote_partial(error, partial.clone(), fallback);
+                assert_eq!(out.code, code);
+                assert!(out.message.contains(text));
+                assert!(out.message.contains("original context"));
+                assert_eq!(out.partial, Some(partial));
+            }
+        }
+    }
 
     #[test]
     fn upload_requires_explicit_root_and_pins_the_opened_file() {

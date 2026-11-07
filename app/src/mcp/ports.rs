@@ -32,9 +32,31 @@ use tokio::sync::oneshot;
 use fs_sshengine::sftp::SftpOps;
 
 use crate::agent::exec_port::RusshExecPort;
+use crate::sessions::LiveSession;
 use crate::state::AppState;
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+async fn authorized_session(
+    state: &AppState,
+    session_id: &str,
+    expected_generation: Option<u64>,
+) -> PortResult<(Arc<LiveSession>, tokio::sync::OwnedMutexGuard<()>)> {
+    let (generation, live) = state
+        .registry
+        .get_with_generation(session_id)
+        .ok_or_else(|| fs_mcpbridge::ports::SESSION_UNAVAILABLE.to_string())?;
+    let guard = live.operation_gate.clone().lock_owned().await;
+    if expected_generation != Some(generation)
+        || state.registry.generation_of(session_id) != Some(generation)
+    {
+        return Err(fs_mcpbridge::ports::SESSION_UNAVAILABLE.into());
+    }
+    if !super::management::allowed(state, &live.profile_id).await {
+        return Err(fs_mcpbridge::ports::SESSION_FORBIDDEN.into());
+    }
+    Ok((live, guard))
+}
 
 // ── 上下文源 ────────────────────────────────────────────────────────────────
 
@@ -68,20 +90,6 @@ impl McpContextSource for McpAppContext {
 
 pub struct McpSessions {
     pub state: Arc<AppState>,
-}
-
-/// 注册表里那条会话记着的 profile_id → 连接名。
-///
-/// 从**注册表反查**而不是信任调用方给的 id（同 `ai_cmd::profile_facts_of` 的
-/// 理由）：MCP 调用方给什么都可能，而「这个会话是谁」只能以本端事实为准。
-async fn profile_name(state: &AppState, profile_id: &str) -> String {
-    let Ok(uuid) = uuid::Uuid::parse_str(profile_id) else {
-        return String::new();
-    };
-    match ProfileRepo::new(state.db.pool()).get(uuid).await {
-        Ok(p) => p.name,
-        Err(_) => String::new(),
-    }
 }
 
 impl SessionDirectory for McpSessions {
@@ -118,10 +126,27 @@ impl SessionDirectory for McpSessions {
             };
             let mut out = Vec::with_capacity(pairs.len());
             for (id, live) in pairs {
-                let name = profile_name(&self.state, &live.profile_id).await;
+                let Ok(profile_id) = uuid::Uuid::parse_str(&live.profile_id) else {
+                    continue;
+                };
+                let Ok(profile) = ProfileRepo::new(self.state.db.pool()).get(profile_id).await
+                else {
+                    continue;
+                };
+                if !profile.allows_mcp_ssh() {
+                    continue;
+                }
+                if !self
+                    .state
+                    .registry
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &live))
+                {
+                    continue;
+                }
                 out.push(SessionSummary {
                     id,
-                    name,
+                    name: profile.name,
                     host: live.connection_profile.host.clone(),
                     connected: live.connection_state() == "connected",
                 });
@@ -144,6 +169,18 @@ impl SessionDirectory for McpSessions {
                 Ok(p) => Some(p.allows_mcp_ssh()),
                 Err(_) => None,
             }
+        })
+    }
+
+    fn session_allowed(&self, session_id: &str) -> Fut<'_, bool> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let Some((generation, live)) = self.state.registry.get_with_generation(&session_id)
+            else {
+                return false;
+            };
+            super::management::allowed(&self.state, &live.profile_id).await
+                && self.state.registry.generation_of(&session_id) == Some(generation)
         })
     }
 
@@ -172,12 +209,12 @@ impl TerminalPort for McpTerminal {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         Box::pin(async move {
-            let Some(session) = self.state.registry.get(&session_id) else {
-                return Err("会话不存在或已关闭".into());
-            };
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             // screen = 当前可见屏；scrollback/all = 回看+可见屏的末尾 N 行
             //（网格侧没有「纯回看不含当前屏」的取法，见 fs_terminal::pipe 文档）。
             Ok(match source {
@@ -189,13 +226,17 @@ impl TerminalPort for McpTerminal {
         })
     }
 
-    fn send(&self, session_id: &str, payload: &str) -> Fut<'_, PortResult<()>> {
+    fn send(
+        &self,
+        session_id: &str,
+        payload: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         let session_id = session_id.to_string();
         let payload = payload.as_bytes().to_vec();
         Box::pin(async move {
-            let Some(session) = self.state.registry.get(&session_id) else {
-                return Err("会话不存在或已关闭".into());
-            };
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             // 与 term_input 同一条写半部（Mutex 串行化保字节顺序）。
             let w = session.write.lock().await;
             w.data_bytes(payload)
@@ -226,10 +267,13 @@ pub struct McpCommand {
 }
 
 impl McpCommand {
-    async fn exec(&self, session_id: &str, tool: Tool) -> PortResult<Observation> {
-        let Some(session) = self.state.registry.get(session_id) else {
-            return Err("会话不存在或已关闭".into());
-        };
+    async fn exec(
+        &self,
+        session_id: &str,
+        tool: Tool,
+        generation: Option<u64>,
+    ) -> PortResult<Observation> {
+        let (session, _guard) = authorized_session(&self.state, session_id, generation).await?;
         // 复用 Agent 的 RusshExecPort：同一条 `run_command` 契约、同一套
         // kill-before-close 与心跳读。ChannelRegistry 在这里只起「通道计数」的
         // 诊断作用，每次调用给一个新的即可。
@@ -245,7 +289,12 @@ impl McpCommand {
 }
 
 impl CommandPort for McpCommand {
-    fn run(&self, session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>> {
+    fn run(
+        &self,
+        session_id: &str,
+        command: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>> {
         let session_id = session_id.to_string();
         let command = command.to_string();
         Box::pin(async move {
@@ -255,6 +304,7 @@ impl CommandPort for McpCommand {
                     command,
                     mode: ExecMode::Exec,
                 },
+                generation,
             )
             .await
         })
@@ -288,25 +338,29 @@ impl McpSftp {
     /// 取该会话的 [`RusshExecPort`]。read/list 走它的**专用方法**
     ///（`read_remote_file`/`list_remote_dir`）——通用 `run` 只认 `RunCommand`，
     /// 其余工具喂进去会拿回一个空 `Observation`（exec_port 的 `_ =>` 兜底臂）。
-    async fn exec_port(&self, session_id: &str) -> PortResult<RusshExecPort> {
-        let Some(session) = self.state.registry.get(session_id) else {
-            return Err("会话不存在或已关闭".into());
-        };
-        Ok(RusshExecPort::new(
+    fn exec_port(&self, session: Arc<LiveSession>) -> RusshExecPort {
+        RusshExecPort::new(
             session,
             Arc::new(fs_ai::agent::ports::ChannelRegistry::default()),
             self.state.db.clone(),
-        ))
+        )
     }
 }
 
 impl SftpPort for McpSftp {
-    fn list(&self, session_id: &str, path: &str) -> Fut<'_, PortResult<String>> {
+    fn list(
+        &self,
+        session_id: &str,
+        path: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
-            let port = self.exec_port(&session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
+            let port = self.exec_port(session);
             obs_to_text(port.list_remote_dir(&path).await)
         })
     }
@@ -316,12 +370,15 @@ impl SftpPort for McpSftp {
         session_id: &str,
         path: &str,
         max_bytes: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
-            let port = self.exec_port(&session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
+            let port = self.exec_port(session);
             let obs = port
                 .read_remote_file(
                     &path,
@@ -332,13 +389,21 @@ impl SftpPort for McpSftp {
         })
     }
 
-    fn write(&self, session_id: &str, path: &str, content: &str) -> Fut<'_, PortResult<()>> {
+    fn write(
+        &self,
+        session_id: &str,
+        path: &str,
+        content: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         let content = content.as_bytes().to_vec();
         Box::pin(async move {
             // 走 SFTP 子系统（与传输/文件面板同一条通道管理），不走 exec：
             // 内容经 `cat >` 管道要过一层远端 shell 转义，二进制内容会被破坏。
+            let (_session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             let ops = self.state.sftp_ops_for(&session_id).await?;
             // write_at 带 CREATE 但**不截断**：先写到 0 偏移，再把文件截到内容长度，
             // 才是「替换」语义——否则新内容比旧文件短时，尾巴上会留着旧文件的残片。
