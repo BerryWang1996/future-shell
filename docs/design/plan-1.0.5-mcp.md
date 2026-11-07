@@ -305,4 +305,22 @@ S3 5e32465 独审/D2 原文：放行本地整合，未复跑。Intent 失败返�
 
 
 1.1.0 发布准备 04729ae 已独审放行推送候选与创建 PR，tag/publish 等待流水线；版本自检 2 正/23 反、模拟 tag 一致、两套 locked/offline metadata 通过，第三方依赖集合未变。
-1.1.0 完整前端测试：117 文件、1699 项通过（含 settings-wiring）；依赖复用只忽略预期的根版本差异，临时链接已清理。当前新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行，仍待核。
+1.1.0 完整前端测试：117 文件、1699 项通过（含 settings-wiring）；依赖复用只忽略预期的根版本差异，临时链接已清理。发布准备时新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行；最终结果见下节。
+
+### 1.1.0 正式发布验收（2026-11-07）
+
+PR [#20](https://github.com/BerryWang1996/future-shell/pull/20) 的十项必需检查通过后合并；main 为 `73ed9eff24321e8f28e2efac8d4ced516462eeb4`，与已审候选 `593f3d9` 的源码树一致。注解 tag `v1.1.0` 对象为 `1f788f3a2e7b90ae04f2b91c92e9db2c79b2d804`，指向该 main 提交，远端指针再次核实一致。
+
+[正式 Release 流水线 42382968295](https://github.com/BerryWang1996/future-shell/actions/runs/42382968295) 用时 48 分 55 秒，15 项任务全部成功，覆盖版本、原生三平台门禁、前端、文档、许可、SBOM、三平台 bundle/smoke 和 release。smoke 按脚本范围：MSI、macOS 和 deb 有同版重装；NSIS 为安装/启动/卸载，AppImage 为运行/删除，不声称每种安装器都验证了重装。
+
+发布前 D2 原文：放行按用户已授权发布 v1.1.0，前提草稿正文保留实际签名 notice 和经核实的验证边界。独立核原始 jobs：15/15 completed success，全部 run_id=42382968295、head_sha=73ed9ef，release 的 provenance 与 draft 两步 success。独立计算实际下载 SHA256SUMS 文件哈希并比对 22 行与 23 个 UI 资产记录（含自身）一致；五安装包、14 SBOM、三 notices 齐全。实际下载 DMG 哈希匹配，挂载内 app Info 1.1.0/标识正确、主程序和 helper 均双架构、codesign deep strict 通过。边界：Windows 未商业签名、macOS ad-hoc 且未公证；来源证明生成步骤成功，但未独立执行 gh attestation verify；真实历史报错根因、SFTP 同权限并发替换与取消后可能额外强确认仍保留。按脚本真实范围描述安装 smoke（NSIS/AppImage 未做同版重装），勿声称全覆盖。
+
+经理处置：保留原签名说明，并加入实际验证范围和上述已知边界后发布；未更改签名策略或本机已安装应用。macOS DMG SHA-256 为 `5e0fdafcc4c2a1653f1a084a704e778d8e7cdfa7a3e969049a29c51c94facfcd`；只读挂载核实版本 1.1.0、标识 io.futureshell.app、主程序和 helper 均 x86_64/arm64，严格签名完整性检查通过，实为 ad-hoc；挂载已卸载。
+
+[FutureShell 1.1.0](https://github.com/BerryWang1996/future-shell/releases/tag/v1.1.0) 于 2026-11-07 15:39:03 UTC 公开发布。匿名公共 API 确认 latest=v1.1.0、draft=false、prerelease=false；23 个附件名称和 digest 与发布前逐项一致，校验清单覆盖其余 22 件。公开下载 14 份 CycloneDX SBOM、3 份许可和校验清单，18 件逐一哈希通过，全部 SBOM 的根组件版本为 1.1.0。
+
+原始发布证据保留在当前检出的 `.cache/release-1.1.0-jobs.json`、`.cache/release-1.1.0-verification.json` 和 `.cache/release-1.1.0-public/`；它们是本次合成开发与公开发布材料，没有保存用户凭据。本节是发布后的本地验收记录，版本 tag 不包含本节后补记录。
+
+发布增量 D3 原文：补正文档时间口径后放行本地提交记录；无发版制品阻断。独立核公共 release-api.json：v1.1.0、非草稿/非预发布、发布时间与记录一致、23资产 digest 全部等于发布前；实际公开下载18个文件逐一算 SHA256 通过，14 SBOM 根版本1.1.0，22条实际校验清单匹配。公开正文保留 Windows/Apple 签名 notice，并明确历史根因、同权限路径竞态、取消后可能额外强确认及未另跑 gh attestation verify。tag 本地解引用为73ed9ef，当前工作树唯一未提交为计划记录；本次未重跑流水线。需改一处正文：新增正式验收前第306–309行仍写“当前新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行，仍待核”，与后续正式成功矛盾，改为“发布准备时尚未执行，最终结果见下节”。latest=v1.1.0 在 result.json 的采集结果中，release-api.json 本身为按 tag 的原始响应；如称‘原始 latest API 响应’需另有该原始证据，不应把派生结果冒充原始文件。无需改既有 tag/重跑发布。
+
+经理处置：已修正旧句的历史时间口径。采集请求实际为 `/repos/BerryWang1996/future-shell/releases/latest`；响应内的资源地址使用 tag，无法仅凭资源地址反推请求入口。latest 结论引用 `result.json` 和公开页面 Latest 标识，不将资源地址冒充请求入口证明。发布后记录仅本地提交，不改变已公开 tag 或重启发布。
