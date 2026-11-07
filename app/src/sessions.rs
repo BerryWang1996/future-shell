@@ -6,6 +6,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 pub struct LiveSession {
+    /// 串行化提交与关闭，避免关闭通过检查后又出现新传输。
+    pub operation_gate: Arc<tokio::sync::Mutex<()>>,
     pub pipe: Arc<SessionPipe>,
     /// 写半部：data_bytes / window_change / close。russh 0.62 的 Channel 非 Clone，
     /// split() 后写半部入注册表；Mutex 串行化保证 term_input 字节顺序（F5）。
@@ -18,6 +20,8 @@ pub struct LiveSession {
     #[allow(dead_code)]
     pub handle: tokio::sync::Mutex<russh::client::Handle<fs_sshengine::connect::Connector>>,
     pub profile_id: String,
+    /// 建连时的配置快照，MCP 重连用它核对目标和信任策略。
+    pub connection_profile: fs_connmgr::model::Profile,
     /// per-target 传输锁的端点键（`host:port`，见 `state::transfer_endpoint_of`）。
     ///
     /// 在**装配时**定格而不是提交传输时回查数据库：profile 是可改的，连接存活期间用户改掉

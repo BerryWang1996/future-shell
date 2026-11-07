@@ -9,6 +9,7 @@ license.workspace = true
 tauri-build = { version = "2.6.3", features = [] }   # 与 tauri 2.11.5 成对（tauri 2.11.5 自身 [build-dependencies] 声明的配套对，防 range 漂移）
 
 [dependencies]
+same-file = "=1.0.6"
 # 2026-07 基线 = 2.11.5：下限须 ≥2.11.1（修 CVE-2026-42184 / GHSA-7gmj-67g7-phm9），且不得停 2.11.4（其将 time 钉死 <0.3.52，2.11.5 才解钉）
 tauri = { version = "2.11.5", features = [] }
 tokio.workspace = true

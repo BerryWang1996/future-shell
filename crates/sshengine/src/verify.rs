@@ -195,9 +195,19 @@ pub struct VerifyEntry {
 
 /// 流式哈希（1 MiB 分块；传输校验面向大文件，禁止全量读入）。
 pub async fn file_sha256(path: &Path) -> std::io::Result<Sha256Hex> {
+    hash_file(tokio::fs::File::open(path).await?).await
+}
+
+pub async fn file_sha256_handle(file: &std::fs::File) -> std::io::Result<Sha256Hex> {
+    use std::io::{Seek, SeekFrom};
+    let mut copy = file.try_clone()?;
+    copy.seek(SeekFrom::Start(0))?;
+    hash_file(tokio::fs::File::from_std(copy)).await
+}
+
+async fn hash_file(mut f: tokio::fs::File) -> std::io::Result<Sha256Hex> {
     use tokio::io::AsyncReadExt;
     let mut hasher = Sha256::new();
-    let mut f = tokio::fs::File::open(path).await?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = f.read(&mut buf).await?;

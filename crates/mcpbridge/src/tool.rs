@@ -20,6 +20,7 @@ pub enum ReadSource {
 /// 对外暴露的全部 MCP 工具。⚠ 标记见 [`MCP_MANIFEST`] 的 `gated` 字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
+    Managed(crate::managed::ManagedTool),
     ProfilesList,
     /// 列出当前会话（只读；不含任何凭据字段——见 `ports::SessionSummary`）。
     SessionsList,
@@ -103,6 +104,112 @@ pub struct ManifestEntry {
 /// 对外 MCP 的完整工具清单。`tools/list` 从这里**过滤**生成（过滤器 = 授权层，
 /// 见 [`crate::authz::Authorization::enumerable`]），而不是另写一份。
 pub const MCP_MANIFEST: &[ManifestEntry] = &[
+    ManifestEntry {
+        name: "sftp.upload",
+        description: "上传已授权本地目录中的普通文件到 SSH 原始连接端点，支持二进制，拒绝覆盖。PTY 菜单切换主机不会改变 SFTP 目标。返回任务 ID 后用 transfer.status 查询结果。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"local_path":{"type":"string","description":"已授权上传目录内的相对路径或绝对路径"},"remote_path":{"type":"string","description":"远端目标文件路径，相对路径基于 SSH 登录目录"}},"required":["session_id","local_path","remote_path"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.download",
+        description: "从 SSH 原始连接端点下载普通文件到应用下载沙箱，拒绝覆盖。PTY 菜单不会改变 SFTP 目标。返回任务 ID，用 transfer.status 确认完成及校验结果。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"remote_path":{"type":"string","description":"远端源文件路径，相对路径基于 SSH 登录目录"}},"required":["session_id","remote_path"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "transfer.list",
+        description: "查询本次运行中已接收的 MCP 传输。提交超时时先查询任务，避免重复提交。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"可选会话 ID"}},"required":[],"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "transfer.status",
+        description: "查询任务进度、真实终态、错误和校验结果。完成前请等待并再次查询。",
+        schema_json: r#"{"type":"object","properties":{"transfer_id":{"type":"string","description":"上传或下载工具返回的任务 ID"}},"required":["transfer_id"],"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "transfer.cancel",
+        description: "请求取消指定传输。用 transfer.status 核实最终为取消或已完成。",
+        schema_json: r#"{"type":"object","properties":{"transfer_id":{"type":"string","description":"任务 ID"}},"required":["transfer_id"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.stat",
+        description: "在 SSH 原始连接端点读取条目的大小、类型、修改时间及软链接信息。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"path":{"type":"string","description":"远端路径"}},"required":["session_id","path"],"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.walk",
+        description: "在 SSH 原始连接端点有界递归列出文件与空目录。返回跳过的软链接，超限会报错。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"path":{"type":"string","description":"远端根目录"},"exclude":{"type":"string","description":"可选排除表达式"}},"required":["session_id","path"],"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.mkdir",
+        description: "在 SSH 原始连接端点创建一个目录。父目录必须存在，目标冲突时失败。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"path":{"type":"string","description":"远端目录路径"}},"required":["session_id","path"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.rename",
+        description: "在同一 SSH 原始连接端点重命名或移动条目。目标已存在时拒绝。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"from":{"type":"string","description":"源路径"},"to":{"type":"string","description":"目标路径"}},"required":["session_id","from","to"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.copy",
+        description: "在 SSH 原始连接端点内复制文件或目录，拒绝软链接和特殊文件。目标必须不存在，部分失败会报告已完成内容。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"from":{"type":"string","description":"源路径"},"to":{"type":"string","description":"目标路径"}},"required":["session_id","from","to"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.delete",
+        description: "删除 SSH 原始连接端点的文件、链接或空目录。非空目录必须明确传 recursive=true，根目录禁止删除。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"path":{"type":"string","description":"待删除远端路径"},"recursive":{"type":"boolean","description":"是否递归删除目录，默认 false","default":false}},"required":["session_id","path"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sftp.symlink",
+        description: "在 SSH 原始连接端点创建软链接。明确传入目标和新链接路径，目标路径不因创建链接而改变。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"target":{"type":"string","description":"链接指向的路径"},"link_path":{"type":"string","description":"新建链接路径"}},"required":["session_id","target","link_path"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sessions.details",
+        description: "查询真实 SSH 连接端点、状态与连接代次。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"}},"required":["session_id"],"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sessions.close",
+        description: "关闭指定 SSH 会话。有正在传输的文件时先取消或等待完成，再关闭。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"}},"required":["session_id"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+    ManifestEntry {
+        name: "sessions.reconnect",
+        description: "请求已断线 SSH 会话重连。使用 sessions.details 确认新连接代次和结果。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"}},"required":["session_id"],"additionalProperties":false}"#,
+        gated: true,
+        vault_class: false,
+    },
+
     ManifestEntry {
         name: "profiles.list",
         description: "查找用户已允许 MCP 打开的 SSH 连接配置。按名称选择，将返回的 profile_id 传给 sessions.open。名称重合时先请用户确认。",
@@ -190,6 +297,7 @@ impl McpTool {
     /// 线上名。与 [`MCP_MANIFEST`] 同源（`manifest()` 反查那一条）。
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Managed(tool) => tool.name(),
             Self::ProfilesList => "profiles.list",
             Self::SessionsList => "sessions.list",
             Self::SessionsOpen { .. } => "sessions.open",
@@ -206,6 +314,7 @@ impl McpTool {
     /// 这次调用作用于哪个会话（`sessions.list` / `sessions.open` 没有）。
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            Self::Managed(tool) => tool.session_id(),
             Self::ProfilesList | Self::SessionsList | Self::SessionsOpen { .. } => None,
             Self::TerminalRead { session_id, .. }
             | Self::TerminalSend { session_id, .. }
@@ -334,6 +443,40 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
     } else {
         args_json
     };
+    if matches!(
+        name,
+        "sftp.upload"
+            | "sftp.download"
+            | "transfer.list"
+            | "transfer.status"
+            | "transfer.cancel"
+            | "sftp.stat"
+            | "sftp.walk"
+            | "sftp.mkdir"
+            | "sftp.rename"
+            | "sftp.copy"
+            | "sftp.delete"
+            | "sftp.symlink"
+            | "sessions.details"
+            | "sessions.close"
+            | "sessions.reconnect"
+    ) {
+        let mut value: serde_json::Value = serde_json::from_str(args_json).map_err(bad)?;
+        let map = value.as_object_mut().ok_or_else(|| ParseError::BadArgs {
+            tool: name.into(),
+            detail: "参数必须是对象".into(),
+        })?;
+        if map.contains_key("operation") {
+            return Err(ParseError::BadArgs {
+                tool: name.into(),
+                detail: "未知参数 operation".into(),
+            });
+        }
+        map.insert("operation".into(), serde_json::Value::String(name.into()));
+        return serde_json::from_value(value)
+            .map(McpTool::Managed)
+            .map_err(bad);
+    }
     Ok(match name {
         "profiles.list" => {
             let _: Empty = serde_json::from_str(args_json).map_err(bad)?;
@@ -430,6 +573,21 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "sftp.upload",
+                "sftp.download",
+                "transfer.list",
+                "transfer.status",
+                "transfer.cancel",
+                "sftp.stat",
+                "sftp.walk",
+                "sftp.mkdir",
+                "sftp.rename",
+                "sftp.copy",
+                "sftp.delete",
+                "sftp.symlink",
+                "sessions.details",
+                "sessions.close",
+                "sessions.reconnect",
                 "profiles.list",
                 "sessions.list",
                 "sessions.open",
@@ -456,6 +614,16 @@ mod tests {
         assert_eq!(
             gated,
             vec![
+                "sftp.upload",
+                "sftp.download",
+                "transfer.cancel",
+                "sftp.mkdir",
+                "sftp.rename",
+                "sftp.copy",
+                "sftp.delete",
+                "sftp.symlink",
+                "sessions.close",
+                "sessions.reconnect",
                 "sessions.open",
                 "terminal.send",
                 "terminal.send_raw",
@@ -531,7 +699,7 @@ mod tests {
     /// 不在清单里」各能漏掉一个方向。
     #[test]
     fn enum_and_manifest_cover_each_other_exactly() {
-        let samples = [
+        let mut samples = vec![
             McpTool::ProfilesList,
             McpTool::SessionsList,
             McpTool::SessionsOpen {
@@ -569,6 +737,11 @@ mod tests {
                 content: "c".into(),
             },
         ];
+        samples.extend(
+            crate::managed::examples()
+                .into_iter()
+                .map(|(name, args)| parse_tool(name, &args.to_string()).unwrap()),
+        );
         assert_eq!(
             samples.len(),
             MCP_MANIFEST.len(),

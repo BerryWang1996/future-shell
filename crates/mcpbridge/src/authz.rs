@@ -252,8 +252,13 @@ mod tests {
     /// 配置里写了不存在的工具名，**要能报出来**，而不是静默丢弃。
     #[test]
     fn names_that_are_not_real_tools_are_reported_rather_than_silently_dropped() {
-        let a = Authorization::new(["sessions.list", "vault.read", "command.run", "sftp.delete"]);
-        assert_eq!(a.unknown_names(), &["vault.read", "sftp.delete"]);
+        let a = Authorization::new([
+            "sessions.list",
+            "vault.read",
+            "command.run",
+            "not.a.file.tool",
+        ]);
+        assert_eq!(a.unknown_names(), &["vault.read", "not.a.file.tool"]);
         // 它们没有混进白名单。
         assert!(!a.is_allowed("vault.read"));
         assert_eq!(a.enumerable().len(), 2);

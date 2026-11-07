@@ -136,3 +136,56 @@ pub async fn mcp_connection_info(
         "config": serve::connection_info(&exe, &token),
     }))
 }
+
+#[tauri::command]
+pub async fn mcp_upload_root_get(
+    profile_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    let id = uuid::Uuid::parse_str(&profile_id).map_err(|e| e.to_string())?;
+    fs_connmgr::ProfileRepo::new(state.db.pool())
+        .get(id)
+        .await
+        .map_err(|_| "连接配置不可用")?;
+    let raw = fs_connmgr::SettingsRepo::new(state.db.pool())
+        .get(&crate::mcp::management::upload_root_key(&id.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    raw.map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+        .transpose()
+}
+
+#[tauri::command]
+pub async fn mcp_upload_root_set(
+    profile_id: String,
+    root: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let id = uuid::Uuid::parse_str(&profile_id).map_err(|e| e.to_string())?;
+    let profile = fs_connmgr::ProfileRepo::new(state.db.pool())
+        .get(id)
+        .await
+        .map_err(|_| "连接配置不可用")?;
+    if profile.protocol != fs_connmgr::Protocol::Ssh {
+        return Err("仅 SSH 配置可授权上传目录".into());
+    }
+    let canonical = if root.trim().is_empty() {
+        String::new()
+    } else {
+        let path = std::path::Path::new(root.trim())
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !path.is_dir() {
+            return Err("上传根必须是已存在的目录".into());
+        }
+        path.to_str().ok_or("目录路径不是有效 UTF-8")?.to_string()
+    };
+    let stored = serde_json::to_string(&canonical).map_err(|e| e.to_string())?;
+    fs_connmgr::SettingsRepo::new(state.db.pool())
+        .set(
+            &crate::mcp::management::upload_root_key(&id.to_string()),
+            &stored,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}

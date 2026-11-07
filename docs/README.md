@@ -18,6 +18,7 @@
 |---|---|
 | [系统设计](design/architecture.md) | 架构、数据流、安全和分期设计基线 |
 | [1.0.4 开发计划](design/plan-1.0.4-mcp.md) | MCP 连接发现、交互终端与验收 |
+| [1.0.5 开发计划](design/plan-1.0.5-mcp.md) | MCP 文件传输、远端文件与 SSH 会话管理 |
 | [UI 规格](design/ui.md) | 界面布局、主题、快捷键和交互基线 |
 | [里程碑路线图](roadmap.md) | 范围、出口标准和历史实施记录 |
 | [主界面基线](mockups/index.html) / [SFTP 基线](mockups/sftp.html) | 用于人工界面对照的静态原型 |

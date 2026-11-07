@@ -22,6 +22,13 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 pub type TransferId = u64;
+
+/// 提交侧约束。GUI 默认沿用覆盖模式，MCP 使用不覆盖及已打开的上传源。
+#[derive(Clone, Default)]
+pub struct TransferOptions {
+    pub no_replace: bool,
+    pub upload_source: Option<Arc<std::fs::File>>,
+}
 /// 传输分块：255 KiB（261 120 字节），不是 256 KiB。
 ///
 /// OpenSSH 的 sftp-server 通过 `limits@openssh.com` 通告单次读写上限 261 120 字节
@@ -505,11 +512,15 @@ async fn source_identity(
     job: &TransferJob,
     local: &Path,
     ops: &Arc<dyn SftpOps>,
+    source: Option<&Arc<std::fs::File>>,
 ) -> Result<PartIdentity, crate::Error> {
     let hash = job.verify.as_ref().map(|h| h.0.clone());
     match job.direction {
         Direction::Up => {
-            let m = tokio::fs::metadata(local).await?;
+            let m = match source {
+                Some(file) => file.metadata()?,
+                None => tokio::fs::metadata(local).await?,
+            };
             Ok(PartIdentity {
                 v: 1,
                 dir: "up".into(),
@@ -636,7 +647,7 @@ async fn cleanup_identity(job: &TransferJob, local: &Path, ops: &Arc<dyn SftpOps
 }
 
 pub struct TransferManager {
-    tx: mpsc::Sender<(TransferId, TransferJob, Arc<AtomicBool>)>,
+    tx: mpsc::Sender<(TransferId, TransferJob, Arc<AtomicBool>, TransferOptions)>,
     events: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<TransferEvent>>>>,
     /// per-id 取消标志（用户单件取消）：分块循环边界检查此标志，
     /// 命中即发 Cancelled 终态事件并 return。同时兼作「在途集合」，`active_len` 读它。
@@ -665,14 +676,15 @@ impl TransferManager {
         concurrency: usize,
         exec: Option<Arc<dyn ExecChannel>>,
     ) -> Self {
-        let (job_tx, mut job_rx) = mpsc::channel::<(TransferId, TransferJob, Arc<AtomicBool>)>(256);
+        let (job_tx, mut job_rx) =
+            mpsc::channel::<(TransferId, TransferJob, Arc<AtomicBool>, TransferOptions)>(256);
         let (ev_tx, ev_rx) = mpsc::channel::<TransferEvent>(256);
         let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         let cancels: Arc<tokio::sync::Mutex<HashMap<TransferId, Arc<AtomicBool>>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let cancels_reaper = cancels.clone();
         tokio::spawn(async move {
-            while let Some((id, job, cancelled)) = job_rx.recv().await {
+            while let Some((id, job, cancelled, options)) = job_rx.recv().await {
                 let ops = ops.clone();
                 let ev = ev_tx.clone();
                 let cancels = cancels_reaper.clone();
@@ -680,7 +692,7 @@ impl TransferManager {
                 let permit = sem.clone().acquire_owned().await.unwrap();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    run_transfer(id, job, ops, exec, ev, cancelled).await;
+                    run_transfer(id, job, ops, exec, ev, cancelled, options).await;
                     // 终态即摘除取消标志。`submit` 只插不删会让 `cancels` 随会话寿命无界增长
                     //（Xftp 式批量传输单次可达十万件，每条 HashMap 表项 + Arc 分配常驻不释放
                     // ——S50）。摘除后 `cancel(id)` 退化为静默 no-op，语义正确：已达终态的
@@ -705,6 +717,36 @@ impl TransferManager {
     /// 天荒地老也等不到终态事件，退出确认框还会因为 `active_len > 0` 一直拦着他。发送失败必须
     /// 回滚 `cancels` 表项（否则那条幽灵登记会把 `active_len`/`shutdown` 永久卡住）并如实报错。
     pub async fn submit(&self, job: TransferJob) -> Result<TransferId, crate::Error> {
+        self.submit_with_options(job, TransferOptions::default())
+            .await
+    }
+
+    pub async fn submit_with_options(
+        &self,
+        job: TransferJob,
+        options: TransferOptions,
+    ) -> Result<TransferId, crate::Error> {
+        self.submit_tracked(job, options, |_| {}).await
+    }
+
+    pub async fn submit_tracked(
+        &self,
+        job: TransferJob,
+        options: TransferOptions,
+        register: impl FnOnce(TransferId),
+    ) -> Result<TransferId, crate::Error> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(crate::Error::Transfer(
+                "传输管理器已关停，拒绝新作业".into(),
+            ));
+        }
+        // 等容量时尚未登记。调用方取消 future 不会留下永远排队的作业。
+        let permit = self.tx.reserve().await.map_err(|_| {
+            crate::Error::Transfer(
+                "传输作业未能入队：派发任务已退出（会话正在关闭或已崩溃）".into(),
+            )
+        })?;
+        let mut cancels = self.cancels.lock().await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(crate::Error::Transfer(
                 "传输管理器已关停，拒绝新作业".into(),
@@ -712,13 +754,9 @@ impl TransferManager {
         }
         let id = next_transfer_id();
         let cancelled = Arc::new(AtomicBool::new(false));
-        self.cancels.lock().await.insert(id, cancelled.clone());
-        if self.tx.send((id, job, cancelled)).await.is_err() {
-            self.cancels.lock().await.remove(&id);
-            return Err(crate::Error::Transfer(
-                "传输作业未能入队：派发任务已退出（会话正在关闭或已崩溃）".into(),
-            ));
-        }
+        cancels.insert(id, cancelled.clone());
+        register(id);
+        permit.send((id, job, cancelled, options));
         Ok(id)
     }
 
@@ -791,6 +829,7 @@ async fn run_transfer(
     exec: Option<Arc<dyn ExecChannel>>,
     ev: mpsc::Sender<TransferEvent>,
     cancelled: Arc<AtomicBool>,
+    options: TransferOptions,
 ) {
     // 前置阶段（沙箱、目标锁、元数据、临时件）的失败出口都是同一套动作：发一条 Failed 终态
     // 事件再 return。抽成宏而不是函数，是因为它必须能 `return` 出**外层**函数——写成函数就得
@@ -863,7 +902,7 @@ async fn run_transfer(
     //
     // 这一次量取同时供三处使用：`total`、续传身份判据、以及提交前的「源变了没有」比对基准。
     // 它取代的是原先那次只拿 size 的往返，故身份记录没有多花任何一次 I/O。
-    let ident = match source_identity(&job, &local, &ops).await {
+    let ident = match source_identity(&job, &local, &ops, options.upload_source.as_ref()).await {
         Ok(i) => i,
         Err(e) => match job.direction {
             Direction::Up => fail!(0, "读取本地源文件元数据失败 {}: {e}", local.display()),
@@ -883,7 +922,19 @@ async fn run_transfer(
     // 9 GB 传到 8.9 GB 断一次就白扔 8.9 GB —— 断点续传是本 crate 的招牌能力，
     // 而重试恰是最需要它的时刻（S46）。
     for attempt in 0..3u32 {
-        match exec_once(id, &job, &local, &ops, total, &ev, &cancelled, &mut offset).await {
+        match exec_once(
+            id,
+            &job,
+            &local,
+            &ops,
+            total,
+            &ev,
+            &cancelled,
+            &mut offset,
+            &options,
+        )
+        .await
+        {
             // Cancelled 事件已由 exec_once 发出，不再追加 Done。
             // 注意此处**不提交**：临时件原样保留，下次带 resume 即从断点续跑。
             Ok(Attempt::Cancelled) => return,
@@ -892,7 +943,16 @@ async fn run_transfer(
                 // 发生，用户原有的文件就没了——校验只能在那之前说话，不然它只是给一个已经
                 // 造成的损失贴标签。任何**确凿**的不符都在这里终结本件传输：临时件原样保留，
                 // 最终目标一个字节都没被碰过。
-                if let Err(e) = precommit_gate(&job, &local, &ops, exec.as_ref(), &ident).await {
+                if let Err(e) = precommit_gate(
+                    &job,
+                    &local,
+                    &ops,
+                    exec.as_ref(),
+                    &ident,
+                    options.upload_source.as_ref(),
+                )
+                .await
+                {
                     let _ = ev
                         .send(TransferEvent {
                             id,
@@ -903,7 +963,7 @@ async fn run_transfer(
                         .await;
                     return;
                 }
-                if let Err(e) = commit(&job, &local, &ops).await {
+                if let Err(e) = commit(&job, &local, &ops, options.no_replace).await {
                     // 提交失败同样保留临时件：数据已经完整落在 `.fspart` 上，只是没能改名，
                     // 报 Failed 让用户重来一次远比丢掉一整轮传输好。
                     let _ = ev
@@ -1149,6 +1209,7 @@ async fn precommit_gate(
     ops: &Arc<dyn SftpOps>,
     exec: Option<&Arc<dyn ExecChannel>>,
     ident: &PartIdentity,
+    source: Option<&Arc<std::fs::File>>,
 ) -> Result<(), crate::Error> {
     let total = ident.size;
 
@@ -1169,11 +1230,13 @@ async fn precommit_gate(
     }
 
     // ② 源未被就地改写
-    let now = source_identity(job, local, ops).await.map_err(|e| {
-        crate::Error::Transfer(format!(
-            "提交前复核源文件失败「{e}」；最终目标未被触碰，数据保留在临时件"
-        ))
-    })?;
+    let now = source_identity(job, local, ops, source)
+        .await
+        .map_err(|e| {
+            crate::Error::Transfer(format!(
+                "提交前复核源文件失败「{e}」；最终目标未被触碰，数据保留在临时件"
+            ))
+        })?;
     if now.size < total {
         return Err(crate::Error::Transfer(format!(
             "提交前复核失败：源文件在传输途中变短（{} → {} 字节，{}）——\
@@ -1240,6 +1303,7 @@ async fn commit(
     job: &TransferJob,
     local: &Path,
     ops: &Arc<dyn SftpOps>,
+    no_replace: bool,
 ) -> Result<(), crate::Error> {
     match job.direction {
         Direction::Up => {
@@ -1254,6 +1318,9 @@ async fn commit(
                     "提交前落盘失败（{part}）：{e}；未改名，最终目标未被触碰"
                 ))
             })?;
+            if no_replace {
+                return ops.rename_no_replace(&part, &job.remote).await;
+            }
             let first = match ops.rename(&part, &job.remote).await {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
@@ -1325,6 +1392,23 @@ async fn commit(
         }
         Direction::Down => {
             let part = local_part(local);
+            if no_replace {
+                let root = job
+                    .sandbox_root
+                    .as_ref()
+                    .ok_or_else(|| crate::Error::Transfer("download sandbox missing".into()))?;
+                let checked = crate::sandbox::resolve_within(root, local)?;
+                if checked != local {
+                    return Err(crate::Error::Transfer(
+                        "download destination changed".into(),
+                    ));
+                }
+                crate::sandbox::reject_symlink_leaf(&part)?;
+                tokio::fs::hard_link(&part, local).await?;
+                // 交付已完成，残留临时件清理失败不能把结果改为失败。
+                let _ = tokio::fs::remove_file(&part).await;
+                return Ok(());
+            }
             // std/tokio 的 rename 在 Windows 上走 MoveFileEx + MOVEFILE_REPLACE_EXISTING，
             // 目标已存在也能覆盖；同目录同卷，因此是原子替换而非拷贝。
             tokio::fs::rename(&part, local).await.map_err(|e| {
@@ -1390,6 +1474,7 @@ async fn exec_once(
     ev: &mpsc::Sender<TransferEvent>,
     cancelled: &AtomicBool,
     offset: &mut u64,
+    options: &TransferOptions,
 ) -> Result<Attempt, crate::Error> {
     use tokio::io::AsyncSeekExt;
     // 本地句柄在循环**外**开一次并 seek 一次。原实现每 256 KiB 就重开 + 重 seek：
@@ -1398,7 +1483,10 @@ async fn exec_once(
     // 占满工作线程时连 SSH 会话自身的 I/O 任务都会挨饿（keepalive 超时 → 传输中途断线）；
     // 本 crate 其余处（verify.rs）早已是 tokio::fs，此处曾是唯一例外（S44）。
     let mut file = match job.direction {
-        Direction::Up => tokio::fs::File::open(local).await?,
+        Direction::Up => match &options.upload_source {
+            Some(source) => tokio::fs::File::from_std(source.try_clone()?),
+            None => tokio::fs::File::open(local).await?,
+        },
         Direction::Down => {
             let part = local_part(local);
             // 每次重入都重查一遍末段软链（审计 P2）：`prepare_part` 只在开工时查过一次，
@@ -2014,5 +2102,44 @@ mod tests {
         async fn symlink(&self, _: &str, _: &str) -> Result<(), crate::Error> {
             unreachable!("算锁键不该建软链")
         }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_admission_never_registers_a_ghost_transfer() {
+        let (tx, _rx) = mpsc::channel(1);
+        let job = TransferJob {
+            direction: Direction::Up,
+            local: PathBuf::from("unused"),
+            remote: "/synthetic".into(),
+            resume: false,
+            sandbox_root: None,
+            target_endpoint: "synthetic".into(),
+            endpoint_aliases: Vec::new(),
+            verify: None,
+        };
+        assert!(tx
+            .try_send((
+                1,
+                job.clone(),
+                Arc::new(AtomicBool::new(false)),
+                TransferOptions::default()
+            ))
+            .is_ok());
+        let manager = TransferManager {
+            tx,
+            events: Arc::new(tokio::sync::Mutex::new(None)),
+            cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let registered = AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.submit_tracked(job, TransferOptions::default(), |_| {
+                registered.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!registered.load(Ordering::SeqCst));
+        assert_eq!(manager.active_len().await, 0);
     }
 }

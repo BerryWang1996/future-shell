@@ -542,6 +542,85 @@ pub async fn transfer_submit(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<u64, String> {
+    submit_core(
+        TransferSpec {
+            session_id,
+            direction,
+            local,
+            remote,
+            resume_offset,
+            options: Default::default(),
+            registration: None,
+        },
+        &app,
+        state.inner(),
+    )
+    .await
+}
+
+pub(crate) struct McpSubmission {
+    pub handle: String,
+    pub profile_id: String,
+    pub generation: u64,
+    pub upload_root: Option<String>,
+}
+
+pub(crate) struct TransferSpec {
+    pub session_id: String,
+    pub direction: String,
+    pub local: String,
+    pub remote: String,
+    pub resume_offset: u64,
+    pub options: fs_sshengine::transfer::TransferOptions,
+    pub registration: Option<McpSubmission>,
+}
+
+pub(crate) async fn submit_core(
+    spec: TransferSpec,
+    app: &AppHandle,
+    state: &Arc<AppState>,
+) -> Result<u64, String> {
+    let TransferSpec {
+        session_id,
+        direction,
+        local,
+        remote,
+        resume_offset,
+        options,
+        registration,
+    } = spec;
+    let (generation, live) = state
+        .registry
+        .get_with_generation(&session_id)
+        .ok_or("no session")?;
+    let _operation = live.operation_gate.lock().await;
+    if state.registry.generation_of(&session_id) != Some(generation)
+        || registration
+            .as_ref()
+            .is_some_and(|r| r.generation != generation)
+    {
+        return Err("连接已发生变化，请重新查看会话".into());
+    }
+    if registration.is_some() {
+        let id = uuid::Uuid::parse_str(&live.profile_id).map_err(|e| e.to_string())?;
+        let profile = fs_connmgr::ProfileRepo::new(state.db.pool())
+            .get(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !profile.allows_mcp_ssh() {
+            return Err("该连接已撤销 MCP 授权".into());
+        }
+        if let Some(expected_root) = registration.as_ref().and_then(|r| r.upload_root.as_ref()) {
+            let current = fs_connmgr::SettingsRepo::new(state.db.pool())
+                .get(&crate::mcp::management::upload_root_key(&live.profile_id))
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|s| serde_json::from_str::<String>(&s).ok());
+            if current.as_ref() != Some(expected_root) {
+                return Err("上传目录授权已变化".into());
+            }
+        }
+    }
     // 端点键取自注册表里那条**活着的**连接（装配时定格），不回查数据库：profile 可改，
     // 回查会让同一条连接上的前后两件传输拿到两把锁（见 state::transfer_endpoint_of）。
     // 这一步同时兼作会话存在性校验——取不到 LiveSession 就没有可传的连接。
@@ -563,8 +642,11 @@ pub async fn transfer_submit(
     let (local_path, sandbox_root) = match direction {
         Direction::Up => {
             // 上传源必须位于本地浏览根（用户目录）内；相对路径以浏览根解析——与 local_list 共用 ensure_within（R55）
-            let src =
-                ensure_within(&browse_root(), &local).map_err(|e| format!("upload source: {e}"))?;
+            let src = if options.upload_source.is_some() {
+                PathBuf::from(&local)
+            } else {
+                ensure_within(&browse_root(), &local).map_err(|e| format!("upload source: {e}"))?
+            };
             (src, None)
         }
         Direction::Down => {
@@ -575,18 +657,7 @@ pub async fn transfer_submit(
             let root = state.download_sandbox_for(&session_id).await?;
             let rel = safe_relative_path(&remote)
                 .ok_or_else(|| format!("unsafe remote path: {remote}"))?;
-            let dest_raw = root.join(&rel);
-            // 先建父目录再校验：`resolve_within` 要 canonicalize 父目录，目录不存在必然失败。
-            // 建目录只会在沙箱根之下展开（rel 已剔除全部穿越段），随后的校验是对这一点的复核。
-            let parent = dest_raw.parent().ok_or_else(|| {
-                format!(
-                    "download destination has no parent dir: {}",
-                    dest_raw.display()
-                )
-            })?;
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create sandbox dir {}: {e}", parent.display()))?;
-            let dest = sandbox::resolve_within(&root, &dest_raw).map_err(|e| e.to_string())?;
+            let dest = sandbox::prepare_destination(&root, &rel).map_err(|e| e.to_string())?;
             (dest, Some(root))
         }
     };
@@ -598,9 +669,11 @@ pub async fn transfer_submit(
     {
         match direction {
             Direction::Up => {
-                let h = fs_sshengine::verify::file_sha256(&local_path)
-                    .await
-                    .map_err(|e| format!("hash local file: {e}"))?;
+                let h = match &options.upload_source {
+                    Some(file) => fs_sshengine::verify::file_sha256_handle(file).await,
+                    None => fs_sshengine::verify::file_sha256(&local_path).await,
+                }
+                .map_err(|e| format!("hash local file: {e}"))?;
                 (
                     Some(h.clone()),
                     Some(fs_sshengine::verify::VerifyPlan {
@@ -641,28 +714,69 @@ pub async fn transfer_submit(
         local: local_path.clone(),
         plan,
     });
+    let task_handle = registration.as_ref().map(|r| r.handle.clone());
+    let local_relative = sandbox_root
+        .as_ref()
+        .and_then(|root| local_path.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().into_owned());
+    let verify_state = if entry.is_some() {
+        "pending"
+    } else {
+        "unverified"
+    };
     let id = mgr
-        .submit(TransferJob {
-            direction,
-            local: local_path.clone(),
-            remote: remote.clone(),
-            // 引擎只收「想不想续传」（审计 P1-5）：真实起点由它按 `.fspart` 实际长度重算。
-            // 前端仍传 resumeOffset（0 = 新传、非 0 = 从抽屉里点重试续跑），此处折成布尔意愿。
-            resume: resume_offset > 0,
-            sandbox_root,
-            // per-target 锁的端点键（审计 P0-3 / P1）：精确到「哪台服务器」，**不含**会话身份——
-            // 同一台主机的两条连接必须共用一把锁，否则会交错写同一个 .fspart 且两件都报 Done。
-            // 见 state::transfer_endpoint_of 与 sessions::LiveSession::target_endpoint。
-            target_endpoint,
-            // 与上同源、同样在装配时定格的端点别名（审计2 #13）：域名与 IP 两种连法
-            // 在地址那一维重合，从而共用一把锁。走跳板或解析失败时为空。
-            endpoint_aliases,
-            verify, // 期望内容哈希；TransferManager 只携带，执行见 spawn_transfer_pump 的 Done 分支
-        })
+        .submit_tracked(
+            TransferJob {
+                direction,
+                local: local_path.clone(),
+                remote: remote.clone(),
+                // 引擎只收「想不想续传」（审计 P1-5）：真实起点由它按 `.fspart` 实际长度重算。
+                // 前端仍传 resumeOffset（0 = 新传、非 0 = 从抽屉里点重试续跑），此处折成布尔意愿。
+                resume: resume_offset > 0,
+                sandbox_root,
+                // per-target 锁的端点键（审计 P0-3 / P1）：精确到「哪台服务器」，**不含**会话身份——
+                // 同一台主机的两条连接必须共用一把锁，否则会交错写同一个 .fspart 且两件都报 Done。
+                // 见 state::transfer_endpoint_of 与 sessions::LiveSession::target_endpoint。
+                target_endpoint,
+                // 与上同源、同样在装配时定格的端点别名（审计2 #13）：域名与 IP 两种连法
+                // 在地址那一维重合，从而共用一把锁。走跳板或解析失败时为空。
+                endpoint_aliases,
+                verify,
+            },
+            options,
+            |id| {
+                if let Some(registration) = registration {
+                    state.mcp_tasks.register(crate::mcp::tasks::Task {
+                        snapshot: crate::mcp::tasks::Snapshot {
+                            transfer_id: registration.handle,
+                            session_id: session_id.clone(),
+                            direction: direction_str.clone(),
+                            state: "queued".into(),
+                            bytes_done: 0,
+                            bytes_total: None,
+                            error: None,
+                            verification: verify_state.into(),
+                            remote_path: Some(remote.clone()),
+                            local_relative_path: local_relative,
+                        },
+                        profile_id: registration.profile_id,
+                        generation,
+                        engine_id: id,
+                        manager: Arc::downgrade(&mgr),
+                        settled_at: None,
+                    });
+                }
+            },
+        )
         .await
         // P1-1：submit 现在会因「管理器已关停 / 派发任务已退出」拒收，拒收即如实报错——
         // 吞掉它就会在 UI 上留下一行永远 0% 的幽灵传输。
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if let Some(handle) = &task_handle {
+                state.mcp_tasks.remove(handle);
+            }
+            e.to_string()
+        })?;
     // 登记与终态的原子握手（审计 P1-2），判定见 `state::verify_register`。单锁内二选一：
     // ① 事件泵还没见到终态 → 落 Planned，由它稍后取走执行；
     // ② 终态已先到（小文件常见）→ 泵留下了 Settled 标记，此处取走并自行驱动校验。
@@ -681,7 +795,7 @@ pub async fn transfer_submit(
     if let crate::state::RegisterOutcome::AlreadySettled { done: true } = outcome {
         // 登记没发生（标记被取走），意图仍在手上——直接驱动校验。
         if let Some(entry) = entry.take() {
-            spawn_verify(app.clone(), id, session_id.clone(), entry);
+            spawn_verify(app.clone(), id, session_id.clone(), generation, entry);
         }
     }
     // 抽屉行参数（UI 规格 §1.4 重试按钮）：Down 方向 local = 沙箱定值（前端参数被忽略，spec §3.3）
@@ -728,22 +842,69 @@ fn spawn_verify(
     app: AppHandle,
     id: u64,
     session_id: String,
+    generation: u64,
     entry: fs_sshengine::verify::VerifyEntry,
 ) {
     use tauri::Manager; // app.state::<T>() 位于 Manager trait
     tauri::async_runtime::spawn(async move {
         let st: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
-        let outcome = match (
-            st.exec_adapter_for(&session_id).await,
-            st.sftp_ops_for(&session_id).await,
-        ) {
-            (Ok(exec), Ok(ops)) => fs_sshengine::verify::run_verify(&*exec, &*ops, &entry).await,
-            _ => fs_sshengine::verify::VerifyOutcome::Unverified, // 会话已丢失/已重连：显式「未核对」
+        let bound = st.registry.get_with_generation(&session_id);
+        let gate = bound.as_ref().map(|(_, live)| live.operation_gate.clone());
+        let _guard = match &gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
         };
+        let outcome = if st.registry.generation_of(&session_id) != Some(generation) {
+            fs_sshengine::verify::VerifyOutcome::Unverified
+        } else {
+            match (
+                st.exec_adapter_for(&session_id).await,
+                st.sftp_ops_for(&session_id).await,
+            ) {
+                (Ok(exec), Ok(ops)) => {
+                    fs_sshengine::verify::run_verify(&*exec, &*ops, &entry).await
+                }
+                _ => fs_sshengine::verify::VerifyOutcome::Unverified, // 会话已丢失/已重连：显式「未核对」
+            }
+        };
+        if let Some(snapshot) = st.mcp_tasks.verification(id, &outcome) {
+            audit_mcp_transfer(&st, snapshot);
+        }
         let _ = app.emit(
             "transfer_verified",
             serde_json::json!({ "id": id, "sessionId": session_id, "outcome": outcome }),
         );
+    });
+}
+
+fn audit_mcp_transfer(state: &AppState, snapshot: crate::mcp::tasks::Snapshot) {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        use fs_connmgr::audit_repo::{Actor, AuditRepo, NewAuditEntry, Verdict};
+        let result = AuditRepo::new(db.pool())
+            .append(&NewAuditEntry {
+                actor: Actor::Mcp {
+                    caller: "transfer".into(),
+                },
+                action: fs_ai::redact::redact(
+                    &format!(
+                        "[transfer.{}] {} verification={}",
+                        snapshot.state, snapshot.transfer_id, snapshot.verification
+                    ),
+                    &[],
+                )
+                .text,
+                target_session: Some(snapshot.session_id),
+                risk_level: "write".into(),
+                verdict: Verdict::AutoRun,
+                exit_code: None,
+                output_digest: None,
+                created_at: crate::commands::ai_cmd::now_rfc3339(),
+            })
+            .await;
+        if result.is_err() {
+            tracing::error!("MCP 传输结果审计写入失败");
+        }
     });
 }
 
@@ -756,6 +917,7 @@ fn spawn_verify(
 pub fn spawn_transfer_pump(
     app: AppHandle,
     session_id: String,
+    generation: u64,
     mut rx: tokio::sync::mpsc::Receiver<fs_sshengine::transfer::TransferEvent>,
 ) {
     use crate::state::SettleOutcome;
@@ -766,6 +928,11 @@ pub fn spawn_transfer_pump(
         // 流结束时按这批 id 回收，理由与「为什么不能按会话清」见 `state::verify_reap_settled`。
         let mut settled_here: Vec<u64> = Vec::new();
         while let Some(e) = rx.recv().await {
+            let shared: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
+            if let Some(snapshot) = shared.mcp_tasks.event(&e) {
+                audit_mcp_transfer(&shared, snapshot);
+            }
+
             // 载荷注入 sessionId（P0-1）。序列化后改对象而不是另建结构体：TransferEvent 的字段
             // 是引擎侧契约，另抄一份会在引擎加字段时静默漏传。
             let mut payload = serde_json::to_value(&e).unwrap_or_default();
@@ -807,12 +974,15 @@ pub fn spawn_transfer_pump(
             }
             // None = 本作业本就不做校验（`transfer.verifyAfterTransfer` 关）：槽位已取走即完事。
             let Some(entry) = pending.entry else { continue };
-            spawn_verify(app.clone(), id, pending.session_id, entry);
+            spawn_verify(app.clone(), id, pending.session_id, generation, entry);
         }
         // 事件流结束 = 管理器与它的全部 worker 都没了，本代次不会再有任何事件；
         // 此刻仍留在表里的标记就是确定的孤儿（审计 P2 路径二）。
+        let state: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
+        for snapshot in state.mcp_tasks.stream_ended(&session_id, generation) {
+            audit_mcp_transfer(&state, snapshot);
+        }
         if !settled_here.is_empty() {
-            let state: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
             let mut plans = state.verify_plans.lock().await;
             crate::state::verify_reap_settled(&mut plans, &settled_here);
         }

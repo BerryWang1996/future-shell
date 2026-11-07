@@ -48,6 +48,19 @@ type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send +
 // 只做到「能把协议跑起来」的最小程度。裁决逻辑本身由 server.rs 的 102 个
 // 测试覆盖，这里要验的是协议那一层，故端口一律给确定的、好断言的返回。
 
+struct Management;
+impl fs_mcpbridge::managed::ManagementPort for Management {
+    fn generation(&self, _: &str) -> Option<u64> {
+        Some(1)
+    }
+    fn run<'a>(
+        &'a self,
+        _: &'a fs_mcpbridge::managed::ManagedTool,
+        _: Option<u64>,
+    ) -> Fut<'a, Result<serde_json::Value, fs_mcpbridge::managed::ManagementError>> {
+        Box::pin(async { Ok(serde_json::json!({})) })
+    }
+}
 struct Dir;
 impl SessionDirectory for Dir {
     fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
@@ -183,6 +196,7 @@ impl McpContextSource for Ctx {
 async fn paired(tools: &[&str], answer: Option<bool>) -> RunningService<RoleClient, ()> {
     let server = McpServer::new(
         Arc::new(Ctx),
+        Arc::new(Management),
         Authorization::new(tools.iter().copied()),
         Arc::new(Dir),
         Arc::new(Term),

@@ -188,6 +188,7 @@ pub async fn shutdown_and_clear<T: SubsystemShutdown>(
 }
 
 pub struct AppState {
+    pub mcp_tasks: crate::mcp::tasks::TaskRegistry,
     /// 应用数据目录（由 lib.rs 在装配时经 `data_dir_or_err()` 解析注入）。
     /// S248 时期本字段无人读取、靠 `#[allow(dead_code)]` 压着；P1-15 之后 `download_sandbox_for`
     /// 的第三级兜底（`data_dir/downloads/<profile_id>`）实打实消费它，压制随之删除——
@@ -495,6 +496,7 @@ impl AppState {
                 crate::commands::sftp_cmd::spawn_transfer_pump(
                     self.app.clone(),
                     session_id.to_string(),
+                    generation,
                     rx,
                 );
                 Ok::<_, String>(mgr)

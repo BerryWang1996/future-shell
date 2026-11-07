@@ -46,6 +46,8 @@
   // default_port——那是 SSH 的语义，改它会让存量 profile 端口漂移。
   let protocol = $state<"ssh" | "rdp" | "serial">("ssh");
   let mcpAllowed = $state(false);
+  let mcpUploadRoot = $state<string | null>(null);
+  let originalMcpUploadRoot = "";
   // 串口（M7.4）。端口名可选可填：枚举列表是**便利**不是白名单——容器里的 socat 伪终端、
   // Linux 上没被 sysfs 扫到的虚拟口，用户自己打得出来就该能连。
   let serialPort = $state("");
@@ -261,6 +263,19 @@
     port = p?.port ?? 22;
     protocol = p?.protocol ?? "ssh";
     mcpAllowed = p?.ai_policy?.mcp_allowed === true;
+    mcpUploadRoot = null;
+    originalMcpUploadRoot = "";
+    if (p?.id) {
+      void invoke<string | null>("mcp_upload_root_get", { profileId: p.id }).then((root) => {
+        if (version !== backfillVersion) return;
+        originalMcpUploadRoot = root ?? "";
+        mcpUploadRoot = originalMcpUploadRoot;
+      }).catch(() => {
+        if (version === backfillVersion) formError = "上传目录授权读取失败，请重新打开连接属性后修改。";
+      });
+    } else {
+      mcpUploadRoot = "";
+    }
     serialPort = p?.serial?.port ?? "";
     serialBaud = p?.serial?.baud ?? 115200;
     serialDataBits = p?.serial?.data_bits ?? "eight";
@@ -419,6 +434,16 @@
       // 都会另存成一条新记录**（旧记录仍在，侧栏出现重影）。新建时发 null 才是「请生成 id」。
       const id = await invoke<string>("profile_save", { id: savedId, profile });
       savedId = id;
+      if (protocol === "ssh" && mcpUploadRoot !== null && mcpUploadRoot !== originalMcpUploadRoot) {
+        try {
+          await invoke("mcp_upload_root_set", { profileId: id, root: mcpUploadRoot });
+          originalMcpUploadRoot = mcpUploadRoot;
+        } catch (e) {
+          formError = `连接已保存，但上传目录未授权：${e}`;
+          tab = "ai";
+          return;
+        }
+      }
       // 专属密码在 profile 落库**之后**才写：新建连接时 id 是这一步才有的，
       // 而 profile_set_own_password 要靠 id 找到档案回写 vault_record。
       // 留空 = 不修改（已有的保持原样、没有的就让连接时弹框问）——
@@ -1156,6 +1181,13 @@
               允许 MCP 发现并打开此 SSH 连接
             </label>
             <p class="hint">外部客户端还需在「工具 → 选项（设置）→ AI」中获得对应工具的授权。</p>
+            <label>
+              MCP 本地上传目录
+              <input value={mcpUploadRoot ?? ""} disabled={mcpUploadRoot === null}
+                     placeholder="输入已存在目录的绝对路径，留空撤销授权"
+                     oninput={(e) => { mcpUploadRoot = e.currentTarget.value; }} />
+            </label>
+            <p class="hint">授权保存在本机。外部 MCP 只能上传此目录中的文件，下载使用本连接的下载沙箱。</p>
           {:else if tab === "env"}
             {#each envRows as row, i (i)}
               <div class="envrow">

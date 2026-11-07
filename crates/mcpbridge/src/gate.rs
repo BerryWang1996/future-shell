@@ -129,6 +129,7 @@ pub fn classify_for_mcp(tool: &McpTool, caller: &str) -> McpGated {
     use fs_ai::agent::tool::Tool as AgentTool;
 
     let verdict = match tool {
+        McpTool::Managed(op) => classify_managed(op),
         // ── 与 Agent 面同一个操作：借道同一个闸门 ──────────────────────
         McpTool::CommandRun { command, .. } => via_agent_gate(
             AgentTool::RunCommand {
@@ -180,7 +181,7 @@ pub fn classify_for_mcp(tool: &McpTool, caller: &str) -> McpGated {
         // 内联内容写远端：只有**远端目的路径**参与分级。
         // 与 Agent 的 `sftp_put` 不是同一个操作（那边收本地源路径、双向取严），
         // 所以这里不借道 Agent 闸门——名字对上而语义不对上比不对名字更坏。
-        McpTool::SftpWrite { path, .. } => fs_policy::classify_transfer(path),
+        McpTool::SftpWrite { path, .. } => classify_transfer_path(path),
     };
 
     McpGated {
@@ -210,6 +211,40 @@ pub fn deny_details(g: &McpGated, reason: DenyReason) -> Vec<String> {
 /// 命中的规则 id 列表，进审计行。
 pub fn rules_of(g: &McpGated) -> Vec<&'static str> {
     g.verdict.reasons.iter().map(|r| r.rule).collect()
+}
+
+fn classify_transfer_path(path: &str) -> Verdict {
+    fs_policy::classify_transfer(path)
+}
+
+pub(crate) fn classify_managed(tool: &crate::managed::ManagedTool) -> Verdict {
+    use crate::managed::ManagedTool as M;
+    let mut verdict = match tool {
+        M::Transfers { .. }
+        | M::Status { .. }
+        | M::Stat { .. }
+        | M::Walk { .. }
+        | M::Details { .. } => return read_only(),
+        M::Delete { .. } | M::Symlink { .. } => {
+            return one("mcp_managed_dangerous", Tier::Dangerous, tool.name())
+        }
+        M::Upload { remote_path, .. } => classify_transfer_path(remote_path),
+        M::Mkdir { path, .. } => classify_transfer_path(path),
+        M::Rename { from, to, .. } | M::Copy { from, to, .. } => {
+            let mut a = classify_transfer_path(from);
+            let b = classify_transfer_path(to);
+            a.tier = a.tier.max(b.tier);
+            a.reasons.extend(b.reasons);
+            a
+        }
+        M::Download { .. } | M::Cancel { .. } | M::Close { .. } | M::Reconnect { .. } => {
+            one("mcp_managed_write", Tier::Write, tool.name())
+        }
+    };
+    if verdict.tier < Tier::Write {
+        verdict = one("mcp_managed_write_floor", Tier::Write, tool.name());
+    }
+    verdict
 }
 
 #[cfg(test)]
@@ -462,7 +497,7 @@ mod tests {
     /// 每一支都能分类，且 tool_name 与清单对得上。
     #[test]
     fn every_tool_variant_can_be_classified() {
-        let all = [
+        let mut all = vec![
             McpTool::ProfilesList,
             McpTool::SessionsList,
             McpTool::SessionsOpen {
@@ -500,6 +535,11 @@ mod tests {
                 content: "c".into(),
             },
         ];
+        all.extend(
+            crate::managed::examples()
+                .into_iter()
+                .map(|(name, args)| crate::tool::parse_tool(name, &args.to_string()).unwrap()),
+        );
         assert_eq!(all.len(), crate::tool::MCP_MANIFEST.len());
         for t in &all {
             let g = classify_for_mcp(t, "test");
@@ -522,7 +562,7 @@ mod tests {
     #[test]
     fn the_warning_marks_match_what_the_gate_actually_does() {
         // ① 没标 ⚠ 的：换什么参数都是 ReadOnly。
-        let free: Vec<(&str, Vec<McpTool>)> = vec![
+        let mut free: Vec<(&str, Vec<McpTool>)> = vec![
             ("profiles.list", vec![McpTool::ProfilesList]),
             ("sessions.list", vec![McpTool::SessionsList]),
             (
@@ -578,7 +618,7 @@ mod tests {
         }
 
         // ② 标了 ⚠ 的：每个都给一个够得着「需要人」的见证输入。
-        let gated: Vec<(&str, McpTool)> = vec![
+        let mut gated: Vec<(&str, McpTool)> = vec![
             (
                 "sessions.open",
                 McpTool::SessionsOpen {
@@ -622,8 +662,16 @@ mod tests {
         }
 
         // ③ 做空防护 + 与清单对账：两组加起来正好是整张清单。
-        assert_eq!(free.len(), 5);
-        assert_eq!(gated.len(), 5);
+        for (name, args) in crate::managed::examples() {
+            let tool = crate::tool::parse_tool(name, &args.to_string()).unwrap();
+            if crate::tool::manifest_of(name).unwrap().gated {
+                gated.push((name, tool));
+            } else {
+                free.push((name, vec![tool]));
+            }
+        }
+        assert_eq!(free.len(), 10);
+        assert_eq!(gated.len(), 15);
         let covered: std::collections::BTreeSet<&str> = free
             .iter()
             .map(|(n, _)| *n)

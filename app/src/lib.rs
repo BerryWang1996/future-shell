@@ -225,6 +225,7 @@ fn run_inner(smoke_exit_ms: Option<u64>) -> Result<(), String> {
                     .map_err(|e| format!("无法打开数据库 {}：{e}", db_path.display()))
             })?;
             let state = Arc::new(AppState {
+                mcp_tasks: Default::default(),
                 data_dir: dir,
                 db: Arc::new(db),
                 vault: Arc::new(Mutex::new(None)),
@@ -467,6 +468,8 @@ fn run_inner(smoke_exit_ms: Option<u64>) -> Result<(), String> {
             commands::credential_cmd::credential_unshare,
             commands::credential_cmd::credential_is_shared,
             commands::conn_cmd::profile_set_own_password,
+            commands::mcp_cmd::mcp_upload_root_get,
+            commands::mcp_cmd::mcp_upload_root_set,
             commands::mcp_cmd::mcp_set_enabled,
             commands::mcp_cmd::mcp_status,
             commands::mcp_cmd::mcp_token_get,

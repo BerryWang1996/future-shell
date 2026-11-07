@@ -23,6 +23,10 @@ impl russh::client::Handler for AcceptAllKeys {
 /// 连接容器 → 密码认证 → 开 session channel → 请求 sftp 子系统 → 构造 RemoteSftp。
 /// 返回容器 guard（必须绑定变量保活）与 RemoteSftp。
 async fn open_sftp(tag: &str) -> (SshdContainer, RemoteSftp) {
+    open_sftp_with_command(tag, None).await
+}
+
+async fn open_sftp_with_command(tag: &str, command: Option<&str>) -> (SshdContainer, RemoteSftp) {
     let sshd = SshdContainer::start(tag).await.unwrap();
     let mut session = client::connect(
         Arc::new(client::Config::default()),
@@ -37,7 +41,10 @@ async fn open_sftp(tag: &str) -> (SshdContainer, RemoteSftp) {
         .unwrap();
     assert!(res.success(), "password auth failed: {res:?}");
     let channel = session.channel_open_session().await.unwrap();
-    channel.request_subsystem(true, "sftp").await.unwrap();
+    match command {
+        Some(command) => channel.exec(true, command).await.unwrap(),
+        None => channel.request_subsystem(true, "sftp").await.unwrap(),
+    }
     let sftp = RemoteSftp::new(channel).await.unwrap();
     (sshd, sftp)
 }
@@ -615,4 +622,114 @@ async fn truncate_sends_only_size_and_reports_success() {
         "truncate 不得把普通文件的类型位改成目录"
     );
     sftp.remove("t2.bin").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_files_preserve_destinations_links_and_empty_directories() {
+    if std::env::var("FS_ITEST").is_err() {
+        return;
+    }
+    use fs_sshengine::managed_fileops::{copy, delete, destination, walk};
+    let (sshd, ops) = open_sftp("managed").await;
+    let home = ops.canonicalize(".").await.unwrap();
+    ops.mkdir("source").await.unwrap();
+    ops.mkdir("source/empty").await.unwrap();
+    ops.mkdir("source/nested").await.unwrap();
+    let bytes: Vec<u8> = (0..512 * 1024).map(|n| (n % 256) as u8).collect();
+    ops.write_at("source/nested/a '中文.bin", 0, &bytes)
+        .await
+        .unwrap();
+    let result = copy(&ops, "source", "copied").await.unwrap();
+    assert_eq!(result["copied_files"], 1);
+    assert_eq!(
+        ops.read_range("copied/nested/a '中文.bin", 0, bytes.len())
+            .await
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        ops.lstat("copied/empty").await.unwrap().file_type,
+        fs_sshengine::sftp::FileType::Dir
+    );
+    let tree = walk(&ops, "copied", None).await.unwrap();
+    assert!(tree.dirs.iter().any(|p| p == "empty"));
+    assert!(tree.files.iter().any(|p| p == "nested/a '中文.bin"));
+    let (error, partial) = copy(&ops, "source", "copied").await.unwrap_err();
+    assert!(matches!(error, fs_sshengine::Error::Conflict(_)));
+    assert_eq!(partial["copied_files"], 0);
+    assert!(partial["staging_path"].is_null());
+    assert!(copy(&ops, "source", "source/child").await.is_err());
+
+    ops.symlink("source", "link").await.unwrap();
+    assert!(copy(&ops, "link", "link-copy").await.is_err());
+    delete(&ops, "link", true).await.unwrap();
+    assert!(ops.lstat("source/empty").await.is_ok());
+    ops.symlink("../source", "copied/outside-link")
+        .await
+        .unwrap();
+    assert!(copy(&ops, "copied", "links-copy").await.is_err());
+    assert!(delete(&ops, "copied", false).await.is_err());
+    let removed = delete(&ops, "copied", true).await.unwrap();
+    assert!(removed["removed"].as_u64().unwrap() >= 5);
+    assert!(ops.lstat("source/nested/a '中文.bin").await.is_ok());
+
+    ops.write_at("target", 0, b"keep").await.unwrap();
+    ops.write_at("rename-source", 0, b"move").await.unwrap();
+    assert!(matches!(
+        ops.rename_no_replace("rename-source", "target").await,
+        Err(fs_sshengine::Error::Conflict(_))
+    ));
+    assert_eq!(ops.read_range("target", 0, 100).await.unwrap(), b"keep");
+    assert!(ops.lstat("rename-source").await.is_ok());
+    ops.rename_no_replace("rename-source", "moved")
+        .await
+        .unwrap();
+    assert_eq!(ops.read_range("moved", 0, 100).await.unwrap(), b"move");
+    assert!(ops.create_exclusive("target").await.is_err());
+    assert_eq!(ops.read_range("target", 0, 100).await.unwrap(), b"keep");
+
+    for raw in ["/", ".", "..", "", "/tmp/..", "source/."] {
+        assert!(
+            destination(&ops, raw).await.is_err(),
+            "ambiguous path {raw:?}"
+        );
+    }
+    // 特殊文件预检必须在创建目标目录之前失败。
+    sshd.run("mkfifo /config/source/fifo; chown 1000:1000 /config/source/fifo")
+        .await
+        .unwrap();
+    let (error, partial) = copy(&ops, "source", "special-copy").await.unwrap_err();
+    assert!(error.to_string().contains("unsupported"));
+    assert!(partial["staging_path"].is_null());
+    assert!(ops.lstat(&format!("{home}/special-copy")).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_copy_reports_restricted_server_failure_without_publishing_target() {
+    if std::env::var("FS_ITEST").is_err() {
+        return;
+    }
+    let (_sshd, ops) =
+        open_sftp_with_command("restricted", Some("/usr/lib/ssh/sftp-server -P rename")).await;
+    ops.write_at("source", 0, b"complete bytes").await.unwrap();
+    let (error, partial) = fs_sshengine::managed_fileops::copy(&ops, "source", "target")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fs_sshengine::Error::SftpStatus { code: 3 | 8, .. }
+    ));
+    assert_eq!(partial["copied_files"], 1);
+    let staging = partial["staging_path"]
+        .as_str()
+        .expect("staging ownership must be reported");
+    assert_eq!(
+        ops.read_range(staging, 0, 100).await.unwrap(),
+        b"complete bytes"
+    );
+    assert!(ops.lstat("target").await.is_err());
+    assert_eq!(
+        ops.read_range("source", 0, 100).await.unwrap(),
+        b"complete bytes"
+    );
 }
