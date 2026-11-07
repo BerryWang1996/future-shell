@@ -6,6 +6,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 pub struct LiveSession {
+    /// 串行化提交与关闭，避免关闭通过检查后又出现新传输。
+    pub operation_gate: Arc<tokio::sync::Mutex<()>>,
     pub pipe: Arc<SessionPipe>,
     /// 写半部：data_bytes / window_change / close。russh 0.62 的 Channel 非 Clone，
     /// split() 后写半部入注册表；Mutex 串行化保证 term_input 字节顺序（F5）。
@@ -18,6 +20,8 @@ pub struct LiveSession {
     #[allow(dead_code)]
     pub handle: tokio::sync::Mutex<russh::client::Handle<fs_sshengine::connect::Connector>>,
     pub profile_id: String,
+    /// 建连时的配置快照，MCP 重连用它核对目标和信任策略。
+    pub connection_profile: fs_connmgr::model::Profile,
     /// per-target 传输锁的端点键（`host:port`，见 `state::transfer_endpoint_of`）。
     ///
     /// 在**装配时**定格而不是提交传输时回查数据库：profile 是可改的，连接存活期间用户改掉
@@ -41,6 +45,20 @@ pub struct LiveSession {
     /// 首断原因缓存（补丁 M-4）：watchdog 启动自动重连前置入；手动 `session_reconnect`（Task 22）
     /// 读取复用（None 时按 TransportEof）。std Mutex：持锁仅取值、无 await。
     pub last_reason: std::sync::Mutex<Option<DisconnectReason>>,
+}
+
+impl LiveSession {
+    pub fn connection_state(&self) -> &'static str {
+        if *self.stop.borrow() {
+            "disconnected"
+        } else if self.reconnecting.load(Ordering::Acquire) {
+            "reconnecting"
+        } else if self.last_reason.lock().unwrap().is_some() {
+            "disconnected"
+        } else {
+            "connected"
+        }
+    }
 }
 
 /// 进程级单调「连接代次」计数器（审计 P0-4）。
@@ -279,9 +297,9 @@ impl DisconnectReason {
 /// russh channel window 耗尽 → 传压到 TCP（spec §2.2）。
 /// `end_tx`（补丁 M-4 终结信号，置换 P2-16 裸 `Notify`）：通道终结时恰发一次 `LinkEnd`，
 /// 归类矩阵见 `classify_link_end`（正常退出 / 非零退出 / 信号死亡 / 传输级 EOF）——
-/// 通道级 Eof/Close 携 `ExitStatus`（shell 正常退出如键入 `exit` → `RemoteExitZero`；非零 →
+/// 通道 Close 前接收完整 `ExitStatus`（shell 正常退出如键入 `exit` → `RemoteExitZero`；非零 →
 /// `RemoteExitNonZero(code)`）；`ExitSignal`（远端被信号杀死，S290）→ `RemoteSignaled`；
-/// `wait()` 未经 Eof/Close 直接返回 None = 传输级 EOF（连接死亡，含 russh keepalive_max
+/// `wait()` 未经 Close 返回 None = 传输级 EOF（连接死亡，含 russh keepalive_max
 /// 超时——keepalive 回包连续失败达上限 russh 即终止连接任务）→ `TransportEof`。
 /// watchdog 持 `end_rx` 据 `LinkEnd` 决定事件语义（closed vs disconnected）。
 pub struct ChannelReader {
@@ -291,7 +309,19 @@ pub struct ChannelReader {
 }
 
 impl ChannelReader {
-    pub fn spawn(mut half: russh::ChannelReadHalf, end_tx: mpsc::Sender<LinkEnd>) -> Self {
+    pub fn spawn(half: russh::ChannelReadHalf, end_tx: mpsc::Sender<LinkEnd>) -> Self {
+        let messages = futures::stream::unfold(half, |mut half| async move {
+            half.wait().await.map(|message| (message, half))
+        });
+        Self::spawn_messages(messages, end_tx)
+    }
+
+    fn spawn_messages(
+        messages: impl futures::Stream<Item = russh::ChannelMsg> + Send + 'static,
+        end_tx: mpsc::Sender<LinkEnd>,
+    ) -> Self {
+        use futures::StreamExt;
+        let mut messages = Box::pin(messages);
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         tauri::async_runtime::spawn(async move {
             let mut graceful = false;
@@ -304,7 +334,7 @@ impl ChannelReader {
                     // 误走 tx.closed 丢弃优雅信号 → watchdog None 分支误判 TransportEof → 虚报
                     // 断线+重连（审计6）。偏置后优雅退出优先，panic+空闲时 tx.closed 仍即时触发。
                     biased;
-                    msg = half.wait() => match msg {
+                    msg = messages.next() => match msg {
                         Some(russh::ChannelMsg::Data { data }) => {
                             // send 失败 = reader 已 drop（session_close → pipe.shutdown）→ 静默退出：
                             // end_tx 随本任务 drop，watchdog recv 得 None 亦静默退出（用户主动关闭路径不发任何事件）
@@ -321,8 +351,9 @@ impl ChannelReader {
                             tracing::warn!(signal = ?signal_name, "remote shell terminated by signal");
                             signaled = true;
                         }
-                        // Eof/Close → 正常结束桥接，drop tx → reader 读到 EOF
-                        Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) => {
+                        // RFC 4254 §5.3/§6.10：EOF 后通道仍开放，退出状态可在 Close 前到达。
+                        Some(russh::ChannelMsg::Eof) => {},
+                        Some(russh::ChannelMsg::Close) => {
                             graceful = true;
                             break;
                         }
@@ -376,6 +407,44 @@ impl tokio::io::AsyncRead for ChannelReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reader_waits_for_exit_information_after_eof() {
+        use russh::ChannelMsg::{Close, Eof, ExitSignal, ExitStatus};
+        let cases = [
+            (
+                vec![Eof, ExitStatus { exit_status: 0 }, Close],
+                LinkEnd::RemoteExitZero,
+            ),
+            (
+                vec![Eof, ExitStatus { exit_status: 42 }, Close],
+                LinkEnd::RemoteExitNonZero(42),
+            ),
+            (
+                vec![
+                    Eof,
+                    ExitSignal {
+                        signal_name: russh::Sig::KILL,
+                        core_dumped: false,
+                        error_message: String::new(),
+                        lang_tag: String::new(),
+                    },
+                    Close,
+                ],
+                LinkEnd::RemoteSignaled,
+            ),
+            (vec![Eof], LinkEnd::TransportEof),
+        ];
+        for (messages, expected) in cases {
+            let (tx, mut rx) = mpsc::channel(1);
+            let _reader = ChannelReader::spawn_messages(futures::stream::iter(messages), tx);
+            let end = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(end, expected);
+        }
+    }
 
     /// 补丁 M-4 断线语义归类：通道 EOF + ExitStatus(0) → 正常结束（走 session:closed，无断线原因）；
     /// 非零退出 / 信号死亡 / 传输级 EOF → session:disconnected 原因枚举。

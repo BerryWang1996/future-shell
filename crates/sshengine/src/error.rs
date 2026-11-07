@@ -19,6 +19,12 @@ pub enum Error {
     HostKey(String),
     #[error("sftp: {0}")]
     Sftp(String),
+    #[error("sftp status {code}: {message}")]
+    SftpStatus { code: u32, message: String },
+    #[error("target already exists: {0}")]
+    Conflict(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
     #[error("transfer: {0}")]
     Transfer(String),
     /// 远程操作在预算内没有回音（审计2 #11/#25）。

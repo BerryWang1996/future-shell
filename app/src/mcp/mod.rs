@@ -11,8 +11,10 @@
 //! `serve_stdio` 只在 [`maybe_spawn`] 判定「设置里打开了 MCP」之后才被调用。
 //! 本模块**不**在启动链路上无条件拉起任何传输——总设计 §4.5「默认关闭」。
 
+pub(crate) mod management;
 mod ports;
 pub mod serve;
+pub(crate) mod tasks;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,6 +183,9 @@ pub async fn build_server(state: Arc<AppState>) -> McpServer {
         Arc::new(ports::McpAppContext {
             state: state.clone(),
             caller,
+        }),
+        Arc::new(management::McpManagement {
+            state: state.clone(),
         }),
         authz,
         Arc::new(ports::McpSessions {

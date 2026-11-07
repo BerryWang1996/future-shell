@@ -221,6 +221,22 @@
   // 这份清单与 `crates/mcpbridge/src/tool.rs` 的 MCP_MANIFEST 同名；两边漂移时
   // 「勾了一个不存在的工具」最坏只是被后端 `Authorization::new` 归入 unknown，不生效。
   const MCP_TOOL_CHOICES = [
+    "sftp.upload",
+    "sftp.download",
+    "transfer.list",
+    "transfer.status",
+    "transfer.cancel",
+    "sftp.stat",
+    "sftp.walk",
+    "sftp.mkdir",
+    "sftp.rename",
+    "sftp.copy",
+    "sftp.delete",
+    "sftp.symlink",
+    "sessions.details",
+    "sessions.close",
+    "sessions.reconnect",
+
     "profiles.list",
     "sessions.list",
     "sessions.open",
@@ -233,6 +249,22 @@
     "sftp.write",
   ] as const;
   const MCP_TOOL_LABELS: Record<string, string> = {
+    "sftp.upload": "上传本地文件",
+    "sftp.download": "下载远端文件",
+    "transfer.list": "查看 MCP 传输列表",
+    "transfer.status": "查看传输进度和结果",
+    "transfer.cancel": "取消传输",
+    "sftp.stat": "查看远端文件属性",
+    "sftp.walk": "递归查看远端目录",
+    "sftp.mkdir": "新建远端目录",
+    "sftp.rename": "重命名或移动远端文件",
+    "sftp.copy": "复制远端文件",
+    "sftp.delete": "删除远端文件（危险）",
+    "sftp.symlink": "创建远端软链接",
+    "sessions.details": "查看 SSH 连接详情",
+    "sessions.close": "关闭 SSH 会话",
+    "sessions.reconnect": "重连 SSH 会话",
+
     "profiles.list": "查找已授权的 SSH 连接配置",
     "sessions.list": "查看会话列表", "sessions.open": "打开连接", "terminal.read": "读取终端内容",
     "terminal.send": "输入终端文本（可按 Enter）", "terminal.send_raw": "发送原始按键数据", "command.run": "执行独立 SSH 命令",

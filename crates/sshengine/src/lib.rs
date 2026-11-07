@@ -9,6 +9,7 @@ pub mod fileops;
 pub mod filter;
 pub mod hostkey;
 pub mod keyinfo;
+pub mod managed_fileops;
 pub mod monitor;
 pub mod packages;
 pub mod procs;

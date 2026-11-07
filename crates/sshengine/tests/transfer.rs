@@ -438,6 +438,9 @@ impl SftpOps for FakeFs {
             gid: None,
         })
     }
+    async fn rename_no_replace(&self, from: &str, to: &str) -> Result<(), fs_sshengine::Error> {
+        self.rename(from, to).await
+    }
     /// 与 `stat_size` 同口径：**不存在必须报错**，不能抹平成 `Ok(size 0)`。
     /// 下载方向的源身份取值走这里（`source_identity`），若这里对不存在的远端文件回 Ok，
     /// 「远端源文件读不到就失败」那条不变量（审计 P1-6）会静默失守。
@@ -3283,4 +3286,97 @@ impl SftpOps for PipelineOps {
     async fn canonicalize(&self, path: &str) -> Result<String, fs_sshengine::Error> {
         self.inner.canonicalize(path).await
     }
+}
+
+#[tokio::test]
+async fn no_replace_upload_keeps_existing_destination_and_pinned_source() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/keep".into(), b"original".to_vec());
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("source");
+    std::fs::write(&local, b"captured").unwrap();
+    let source = Arc::new(std::fs::File::open(&local).unwrap());
+    std::fs::rename(&local, dir.path().join("saved")).unwrap();
+    std::fs::write(&local, b"replacement").unwrap();
+    let manager = TransferManager::spawn(fs.clone(), 1);
+    let mut events = manager.events().await;
+    let options = TransferOptions {
+        no_replace: true,
+        upload_source: Some(source.clone()),
+    };
+    let registered = std::sync::atomic::AtomicBool::new(false);
+    let id = manager
+        .submit_tracked(
+            up_job(local.clone(), "/new", "mcp-pinned"),
+            options.clone(),
+            |_| {
+                registered.store(true, std::sync::atomic::Ordering::Release);
+            },
+        )
+        .await
+        .unwrap();
+    assert!(registered.load(std::sync::atomic::Ordering::Acquire));
+    assert!(matches!(
+        drain_to_terminal(&mut events, id).await,
+        TransferState::Done
+    ));
+    assert_eq!(fs.get("/new").unwrap(), b"captured");
+    let id = manager
+        .submit_with_options(up_job(local, "/keep", "mcp-conflict"), options)
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut events, id).await,
+        TransferState::Failed(_)
+    ));
+    assert_eq!(fs.get("/keep").unwrap(), b"original");
+    assert!(manager.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_download_commits_new_file_but_preserves_existing_file() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/remote".into(), b"download".to_vec());
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("local");
+    let manager = TransferManager::spawn(fs, 1);
+    let mut events = manager.events().await;
+    let options = TransferOptions {
+        no_replace: true,
+        upload_source: None,
+    };
+    let id = manager
+        .submit_with_options(
+            down_job(dest.clone(), "/remote", dir.path().into()),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut events, id).await,
+        TransferState::Done
+    ));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"download");
+    std::fs::write(&dest, b"existing").unwrap();
+    let id = manager
+        .submit_with_options(
+            down_job(dest.clone(), "/remote", dir.path().into()),
+            options,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut events, id).await,
+        TransferState::Failed(_)
+    ));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
+    assert!(manager.shutdown(Duration::from_secs(2)).await);
 }

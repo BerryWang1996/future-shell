@@ -46,6 +46,7 @@ use crate::tool::{parse_tool, McpTool, ParseError};
 
 /// 一次调用要用到的全部外界接触面。
 pub struct Ports<'a> {
+    pub management: &'a dyn crate::managed::ManagementPort,
     pub sessions: &'a dyn SessionDirectory,
     pub terminal: &'a dyn TerminalPort,
     pub command: &'a dyn CommandPort,
@@ -114,6 +115,7 @@ fn no_such_session() -> CallOutput {
 /// 给人看的一行话：「工具名: 要做什么」。进确认框与审计。
 fn display_of(t: &McpTool) -> String {
     let what = match t {
+        McpTool::Managed(op) => format!("{op:?}"),
         McpTool::ProfilesList | McpTool::SessionsList => String::new(),
         McpTool::SessionsOpen { profile_id } => profile_id.clone(),
         McpTool::TerminalRead { source, .. } => format!("{source:?}"),
@@ -180,6 +182,16 @@ pub async fn call(
     // ── ③ 会话在不在（分类之前）────────────────────────────────────────
     if let Some(sid) = tool.session_id() {
         if !ports.sessions.is_alive(sid) {
+            if matches!(tool, McpTool::Managed(_)) {
+                return CallOutput::err(ToolError {
+                    is_error: true,
+                    code: "FS_MCP_TARGET_UNAVAILABLE",
+                    tier: None,
+                    confirmation_required: false,
+                    message: "会话不可用，请通过 sessions.list 查询当前会话".into(),
+                    details: None,
+                });
+            }
             return no_such_session();
         }
     }
@@ -194,6 +206,13 @@ pub async fn call(
                 other => Some(other),
             }
         }
+        _ => None,
+    };
+
+    let binding = match &tool {
+        McpTool::Managed(op) => op
+            .session_id()
+            .and_then(|sid| ports.management.generation(sid)),
         _ => None,
     };
 
@@ -217,7 +236,10 @@ pub async fn call(
         return settle(&tool, &gated, ctx, ports, McpVerdict::Denied, None, None, e).await;
     }
 
-    dispatch_after_gate(tool, gated, decision, open_authz, ctx, ledger, ports).await
+    dispatch_after_gate(
+        tool, gated, decision, open_authz, ctx, ledger, ports, binding,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -229,6 +251,7 @@ async fn dispatch_after_gate(
     ctx: &CallContext,
     ledger: &mut OpenLedger,
     ports: &Ports<'_>,
+    binding: Option<u64>,
 ) -> CallOutput {
     let raw_display = display_of(&tool);
 
@@ -295,7 +318,25 @@ async fn dispatch_after_gate(
     }
 
     // ── ⑧ 执行 ────────────────────────────────────────────────────────
-    let ran = execute(&tool, ports).await;
+    let managed = if let McpTool::Managed(op) = &tool {
+        Some(ports.management.run(op, binding).await)
+    } else {
+        None
+    };
+    let mut operation_error = None;
+    let ran = match managed {
+        Some(Ok(value)) => Ok(Executed {
+            text: value.to_string(),
+            structured: Some(value),
+            exit_code: None,
+        }),
+        Some(Err(e)) => {
+            let message = e.message.clone();
+            operation_error = Some(e);
+            Err(message)
+        }
+        None => execute(&tool, ports).await,
+    };
 
     // 会话真的开起来了才记台账——在「用户批准」那一刻记，会让一次因为
     // 网络失败而没开成的尝试也算数，下次就不问了。
@@ -339,9 +380,29 @@ async fn dispatch_after_gate(
         )));
     }
 
+    if let Some(error) = operation_error {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: error.code,
+            tier: Some(gated.tier().as_str()),
+            confirmation_required: false,
+            message: text.as_str().to_string(),
+            details: error.partial.map(|value| {
+                redact_value(
+                    &value,
+                    &ctx.known_secrets
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        });
+    }
+
     if matches!(tool, McpTool::ProfilesList) && ran.is_err() {
         return CallOutput::err(ToolError {
             is_error: true,
+            details: None,
             code: "FS_MCP_PROFILE_LIST_FAILED",
             tier: Some("read_only"),
             confirmation_required: false,
@@ -405,6 +466,7 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
         exit_code: None,
     };
     match tool {
+        McpTool::Managed(_) => unreachable!("managed operations use the management port"),
         McpTool::ProfilesList => {
             let profiles = ports.sessions.list_profiles().await?;
             Ok(Executed {
@@ -551,6 +613,40 @@ mod tests {
     use std::time::Duration;
 
     type F<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+    #[derive(Default)]
+    struct Management {
+        seen: Mutex<Vec<(crate::managed::ManagedTool, Option<u64>)>>,
+        generation: std::sync::Arc<AtomicUsize>,
+        fail: bool,
+    }
+    impl crate::managed::ManagementPort for Management {
+        fn generation(&self, _: &str) -> Option<u64> {
+            Some(self.generation.load(SeqCst) as u64 + 1)
+        }
+        fn run<'a>(
+            &'a self,
+            tool: &'a crate::managed::ManagedTool,
+            generation: Option<u64>,
+        ) -> F<'a, Result<serde_json::Value, crate::managed::ManagementError>> {
+            self.seen.lock().unwrap().push((tool.clone(), generation));
+            Box::pin(async move {
+                if tool.session_id().is_some() && generation != self.generation("s1") {
+                    return Err(crate::managed::ManagementError::new(
+                        "FS_MCP_TARGET_UNAVAILABLE",
+                        "connection changed",
+                    ));
+                }
+                if self.fail {
+                    return Err(crate::managed::ManagementError {
+                        code: "FS_MCP_COPY_FAILED",
+                        message: format!("failed {SECRET}"),
+                        partial: Some(serde_json::json!({"copied_files":1,"staging_path":SECRET})),
+                    });
+                }
+                Ok(serde_json::json!({}))
+            })
+        }
+    }
 
     /// 每个端口方法各自的调用计数。
     ///
@@ -743,6 +839,7 @@ mod tests {
         seen: Mutex<Vec<(String, bool, String)>>,
         /// 置真时被调用即 panic——用来证明「根本没走到确认这一步」。
         never: bool,
+        change_generation: Option<std::sync::Arc<AtomicUsize>>,
     }
 
     impl Conf {
@@ -756,6 +853,7 @@ mod tests {
                 },
                 seen: Mutex::new(Vec::new()),
                 never: false,
+                change_generation: None,
             }
         }
         fn with(answer: Option<bool>, alive: bool) -> Self {
@@ -778,6 +876,9 @@ mod tests {
         fn confirm(&self, t: ConfirmTicket) -> F<'_, ConfirmReply> {
             assert!(!self.never, "这条路径不该走到确认——弹一个批准了也没用的框");
             self.calls.confirm.fetch_add(1, SeqCst);
+            if let Some(generation) = &self.change_generation {
+                generation.fetch_add(1, SeqCst);
+            }
             self.seen.lock().unwrap().push((
                 t.tool_name.to_string(),
                 t.strong,
@@ -866,6 +967,7 @@ mod tests {
 
     /// 一整套假实现 + 装配。
     struct Rig {
+        management: Management,
         dir: Dir,
         term: Term,
         cmd: Cmd,
@@ -886,6 +988,7 @@ mod tests {
             let mut conf = Conf::approving();
             conf.calls = calls.clone();
             Self {
+                management: Management::default(),
                 dir: Dir {
                     calls: calls.clone(),
                     ..Default::default()
@@ -920,6 +1023,7 @@ mod tests {
 
         async fn call(&mut self, name: &str, args: &str) -> CallOutput {
             let ports = Ports {
+                management: &self.management,
                 sessions: &self.dir,
                 terminal: &self.term,
                 command: &self.cmd,
@@ -1457,11 +1561,98 @@ mod tests {
         assert!(!out.is_err(), "{out:?}");
         r.calls.only(&[("open", 1)]);
 
+        for (name, args) in crate::managed::examples() {
+            let mut r = Rig::new();
+            let out = r.call(name, &args.to_string()).await;
+            assert!(!out.is_err(), "{name}: {out:?}");
+            r.calls.only(&[]);
+            let seen = r.management.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let McpTool::Managed(expected) = parse_tool(name, &args.to_string()).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(seen[0].0, expected);
+            assert_eq!(seen[0].1, expected.session_id().map(|_| 1));
+        }
         assert_eq!(
-            cases.len() + 1,
+            cases.len() + 1 + crate::managed::examples().len(),
             crate::tool::MCP_MANIFEST.len(),
             "每个工具都覆盖"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_tools_obey_independent_authorization_and_execution_modes() {
+        for (name, args) in crate::managed::examples() {
+            let mut disabled = Rig::new();
+            disabled.ctx.mode = AiMode::Disabled;
+            assert!(disabled.call(name, &args.to_string()).await.is_err());
+            assert!(disabled.management.seen.lock().unwrap().is_empty());
+            let mut readonly = Rig::new();
+            readonly.ctx.mode = AiMode::ReadOnlyOnly;
+            let tool = parse_tool(name, &args.to_string()).unwrap();
+            let write = classify_for_mcp(&tool, "test").tier() != fs_policy::Tier::ReadOnly;
+            let output = readonly.call(name, &args.to_string()).await;
+            assert_eq!(output.is_err(), write, "{name}");
+            assert_eq!(
+                readonly.management.seen.lock().unwrap().len(),
+                usize::from(!write)
+            );
+        }
+        let args = r#"{"session_id":"s1","path":"/tmp/test"}"#;
+        let mut independent = Rig::new();
+        independent.authz = Authorization::new(["sftp.copy", "sftp.rename"]);
+        assert!(independent.call("sftp.delete", args).await.is_err());
+        assert!(independent.management.seen.lock().unwrap().is_empty());
+        let mut confirmed = Rig::new();
+        assert!(!confirmed.call("sftp.delete", args).await.is_err());
+        assert!(confirmed.conf.last_strong());
+        let mut direct = Rig::new();
+        direct.ctx.skip_confirmation = true;
+        direct.conf = Conf::forbidden();
+        assert!(!direct.call("sftp.delete", args).await.is_err());
+        assert_eq!(direct.management.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_binding_survives_confirmation_and_partial_errors_are_redacted() {
+        let args = r#"{"session_id":"s1","from":"/tmp/source","to":"/tmp/target"}"#;
+        let mut changed = Rig::new();
+        changed.conf.change_generation = Some(changed.management.generation.clone());
+        let output = changed.call("sftp.copy", args).await;
+        let CallOutput::Err(error) = output else {
+            panic!("stale binding was accepted")
+        };
+        assert_eq!(error.code, "FS_MCP_TARGET_UNAVAILABLE");
+        assert_eq!(changed.management.seen.lock().unwrap()[0].1, Some(1));
+        let mut failed = Rig::new();
+        failed.management.fail = true;
+        let output = failed.call("sftp.copy", args).await;
+        let CallOutput::Err(error) = output else {
+            panic!("partial failure was hidden")
+        };
+        assert_eq!(error.code, "FS_MCP_COPY_FAILED");
+        assert!(!error.message.contains(SECRET));
+        let details = error.details.unwrap();
+        assert_eq!(details["copied_files"], 1);
+        assert!(!details.to_string().contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn managed_unknown_sessions_return_target_error_before_dispatch() {
+        for (name, args) in crate::managed::examples() {
+            let tool = parse_tool(name, &args.to_string()).unwrap();
+            if tool.session_id().is_none() {
+                continue;
+            }
+            let mut rig = Rig::new();
+            rig.dir.alive_until = 0;
+            let CallOutput::Err(error) = rig.call(name, &args.to_string()).await else {
+                panic!("unknown session accepted")
+            };
+            assert_eq!(error.code, "FS_MCP_TARGET_UNAVAILABLE", "{name}");
+            assert!(rig.management.seen.lock().unwrap().is_empty());
+        }
     }
 
     // ══ ⑥ 出站脱敏 ════════════════════════════════════════════════════

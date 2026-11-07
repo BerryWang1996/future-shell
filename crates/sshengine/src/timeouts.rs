@@ -275,6 +275,24 @@ impl SftpOps for TimedSftp {
             inner,
         }))
     }
+    async fn create_exclusive<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        let inner = self
+            .guard(
+                "create_exclusive",
+                path,
+                self.data,
+                self.inner.create_exclusive(path),
+            )
+            .await?;
+        Ok(Box::new(TimedWriter {
+            owner: self,
+            path,
+            inner,
+        }))
+    }
     async fn truncate(&self, path: &str, size: u64) -> Result<(), Error> {
         self.guard(
             "truncate",
@@ -312,6 +330,15 @@ impl SftpOps for TimedSftp {
     async fn lstat(&self, path: &str) -> Result<FileMeta, Error> {
         self.guard("lstat", path, self.control, self.inner.lstat(path))
             .await
+    }
+    async fn rename_no_replace(&self, from: &str, to: &str) -> Result<(), Error> {
+        self.guard(
+            "rename_no_replace",
+            to,
+            self.control,
+            self.inner.rename_no_replace(from, to),
+        )
+        .await
     }
     async fn read_link(&self, path: &str) -> Result<String, Error> {
         self.guard("read_link", path, self.control, self.inner.read_link(path))

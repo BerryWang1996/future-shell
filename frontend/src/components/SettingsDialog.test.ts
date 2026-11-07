@@ -110,6 +110,23 @@ async function flush() {
 }
 
 describe("SettingsDialog MCP 免逐次确认", () => {
+  it("新增管理工具默认关闭，删除可独立授权并回读", async () => {
+    store.clear();
+    await openAt("AI");
+    await flush();
+    for (const name of ["sftp.upload", "sftp.download", "transfer.list", "transfer.status", "transfer.cancel",
+      "sftp.stat", "sftp.walk", "sftp.mkdir", "sftp.rename", "sftp.copy", "sftp.delete", "sftp.symlink",
+      "sessions.details", "sessions.close", "sessions.reconnect"]) {
+      expect(screen.getByRole("checkbox", { name: new RegExp(name.replaceAll(".", "\\.")) })).toHaveProperty("checked", false);
+    }
+    await fireEvent.click(screen.getByRole("checkbox", { name: /sftp\.delete/ }));
+    await waitFor(() => expect(store.get("mcp.tools")).toEqual(["sftp.delete"]));
+    cleanup();
+    await openAt("AI");
+    await flush();
+    expect(screen.getByRole("checkbox", { name: /sftp\.delete/ })).toHaveProperty("checked", true);
+    expect(screen.getByRole("checkbox", { name: /sftp\.copy/ })).toHaveProperty("checked", false);
+  });
   it("默认关闭，开启后重新加载仍生效", async () => {
     store.clear();
     await openAt("AI");

@@ -32,10 +32,14 @@ let vaultPutError: string | null = null;
 let settingsValues: Record<string, unknown> = {};
 let saveWait: Promise<void> | null = null;
 let failOwnPassword = false;
+let uploadRootResult: string | null = null;
+let uploadRootError: string | null = null;
 
 vi.mock("../lib/ipc", () => ({
   invoke: async (cmd: string, args?: any) => {
     calls.push({ cmd, args });
+    if (cmd === "mcp_upload_root_get") return uploadRootResult;
+    if (cmd === "mcp_upload_root_set" && uploadRootError) throw new Error(uploadRootError);
     if (cmd === "hostkey_known_keys") {
       if (knownKeysError) throw knownKeysError;
       return knownKeysResult;
@@ -127,6 +131,11 @@ async function openHostKeyTab(initial: any) {
 }
 
 describe("ProfileDialog · MCP 连接授权", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    uploadRootResult = null;
+    uploadRootError = null;
+  });
   it("默认关闭，编辑后只修改 MCP 授权并保留其他 AI 策略", async () => {
     calls.length = 0;
     render(ProfileDialog, {
@@ -139,6 +148,36 @@ describe("ProfileDialog · MCP 连接授权", () => {
     await fireEvent.click(screen.getByTestId("pf-save"));
     const saved = calls.find((call) => call.cmd === "profile_save");
     expect(saved?.args?.profile.ai_policy).toEqual({ auto_execute: "with_confirm", mcp_allowed: true });
+  });
+
+  it("上传目录从本机设置回读，留空保存可撤销", async () => {
+    uploadRootResult = "/tmp/approved";
+    render(ProfileDialog, { props: { open: true, initial: profile({ host_key_policy: "tofu" }) } });
+    await fireEvent.click(screen.getByRole("tab", { name: "AI" }));
+    const root = screen.getByRole("textbox", { name: "MCP 本地上传目录" }) as HTMLInputElement;
+    await waitFor(() => expect(root.value).toBe("/tmp/approved"));
+    await fireEvent.input(root, { target: { value: "" } });
+    await fireEvent.click(screen.getByTestId("pf-save"));
+    await waitFor(() => expect(calls).toContainEqual({ cmd: "mcp_upload_root_set", args: {
+      profileId: "11111111-1111-1111-1111-111111111111", root: "",
+    } }));
+  });
+
+  it("目录授权失败保留表单，重试更新已保存的连接", async () => {
+    const onClose = vi.fn();
+    uploadRootError = "目录不存在";
+    render(ProfileDialog, { props: { open: true, initial: profile({ host_key_policy: "tofu" }), onClose } });
+    await fireEvent.click(screen.getByRole("tab", { name: "AI" }));
+    const root = screen.getByRole("textbox", { name: "MCP 本地上传目录" }) as HTMLInputElement;
+    await waitFor(() => expect(root.disabled).toBe(false));
+    await fireEvent.input(root, { target: { value: "/tmp/missing" } });
+    await fireEvent.click(screen.getByTestId("pf-save"));
+    await screen.findByText(/连接已保存，但上传目录未授权/);
+    expect(onClose).not.toHaveBeenCalled();
+    uploadRootError = null;
+    await fireEvent.click(screen.getByTestId("pf-save"));
+    await waitFor(() => expect(calls.filter(c => c.cmd === "profile_save")).toHaveLength(2));
+    expect(calls.filter(c => c.cmd === "profile_save")[1].args.id).toBe("11111111-1111-1111-1111-111111111111");
   });
 });
 

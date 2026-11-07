@@ -52,6 +52,7 @@ pub trait McpContextSource: Send + Sync {
 /// 对外 MCP Server（stdio）。持有全部端口的 `Arc`，每次调用现拼一个借用的
 /// [`Ports`] 喂给 `server::call`——端口是长寿命的，`Ports<'_>` 是按次借用的。
 pub struct McpServer {
+    management: Arc<dyn crate::managed::ManagementPort>,
     ctx_source: Arc<dyn McpContextSource>,
     authz: Authorization,
     /// `server::call` 要 `&mut OpenLedger`；stdio 上多个请求可能并发到达，故加锁。
@@ -70,6 +71,7 @@ pub struct McpServer {
 impl McpServer {
     pub fn new(
         ctx_source: Arc<dyn McpContextSource>,
+        management: Arc<dyn crate::managed::ManagementPort>,
         authz: Authorization,
         sessions: Arc<dyn SessionDirectory>,
         terminal: Arc<dyn TerminalPort>,
@@ -79,6 +81,7 @@ impl McpServer {
         audit: Arc<dyn McpAuditPort>,
     ) -> Self {
         Self {
+            management,
             ctx_source,
             authz,
             ledger: tokio::sync::Mutex::new(OpenLedger::new()),
@@ -140,6 +143,7 @@ impl ServerHandler for McpServer {
             let mut ledger = self.ledger.lock().await;
             let ctx = self.ctx_source.current().await;
             let ports = Ports {
+                management: &*self.management,
                 sessions: &*self.sessions,
                 terminal: &*self.terminal,
                 command: &*self.command,

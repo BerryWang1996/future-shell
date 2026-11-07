@@ -291,6 +291,33 @@ pub fn resolve_within(root: &Path, dest: &Path) -> Result<PathBuf, Error> {
     Ok(resolved)
 }
 
+/// 逐级核对父目录再创建，避免 create_dir_all 穿过既有的越界软链。
+pub fn prepare_destination(root: &Path, relative: &Path) -> Result<PathBuf, Error> {
+    use std::path::Component;
+    let root = root.canonicalize()?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(Error::Transfer("invalid sandbox-relative path".into()));
+    }
+    let mut parent = root.clone();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        parent.push(part);
+        match std::fs::create_dir(&parent) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        parent = parent.canonicalize()?;
+        if !parent.starts_with(&root) || !parent.is_dir() {
+            return Err(Error::Transfer("directory escapes download sandbox".into()));
+        }
+    }
+    resolve_within(&root, &root.join(relative))
+}
+
 /// 拒绝「末段自身是符号链接」的**写入落点**。
 ///
 /// 抽成独立函数，是因为这条防护的正确性只取决于一件事：**查的那个路径，必须就是待会儿真正

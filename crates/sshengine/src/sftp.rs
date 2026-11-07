@@ -171,6 +171,12 @@ pub trait SftpOps: Send + Sync {
             offset,
         }))
     }
+    async fn create_exclusive<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        Err(Error::Unsupported("exclusive create".into()))
+    }
     /// 把远端文件已写入的内容刷到服务器磁盘（`fsync@openssh.com`）。服务端不支持该扩展时
     /// 是空操作而不是错误——那种服务端上客户端本来就没有办法要求落盘。
     ///
@@ -189,6 +195,10 @@ pub trait SftpOps: Send + Sync {
     /// SSH_FXP_RMDIR：删除**空**目录。非空目录必须先由 [`remove_tree`] 递归删空。
     async fn remove_dir(&self, path: &str) -> Result<(), Error>;
     async fn rename(&self, from: &str, to: &str) -> Result<(), Error>;
+    /// 不覆盖已存在目标。实现无法保证时须拒绝。
+    async fn rename_no_replace(&self, _from: &str, _to: &str) -> Result<(), Error> {
+        Err(Error::Unsupported("no-replace rename".into()))
+    }
     /// SSH_FXP_LSTAT：不跟随软链的元数据（软链本身）
     async fn lstat(&self, path: &str) -> Result<FileMeta, Error>;
     /// SSH_FXP_READLINK：读取软链目标路径
@@ -327,9 +337,20 @@ pub async fn walk_files(
     root: &str,
     filter: &crate::filter::ExcludeFilter,
 ) -> Result<WalkResult, Error> {
+    walk_files_with_budget(ops, root, filter, usize::MAX).await
+}
+
+/// 有界结果供 MCP 使用。预算按 JSON 转义后的路径计算，构造时即拒绝超限。
+pub async fn walk_files_with_budget(
+    ops: &dyn SftpOps,
+    root: &str,
+    filter: &crate::filter::ExcludeFilter,
+    budget: usize,
+) -> Result<WalkResult, Error> {
     let mut out = Vec::new();
     let mut dirs = Vec::new();
     let mut skipped_links = Vec::new();
+    let mut bytes = 64usize;
     // (远端绝对路径, 相对 root 的路径, 深度)
     let mut stack = vec![(root.to_string(), String::new(), 0usize)];
     while let Some((dir, rel, depth)) = stack.pop() {
@@ -345,6 +366,16 @@ pub async fn walk_files(
             )));
         }
         for e in listing.entries {
+            if e.name.is_empty()
+                || e.name == "."
+                || e.name == ".."
+                || e.name.contains('/')
+                || e.name.contains('\0')
+            {
+                return Err(Error::Sftp(
+                    "server returned an unsafe directory entry".into(),
+                ));
+            }
             if filter.excludes(&e.name, e.is_dir) {
                 continue;
             }
@@ -353,6 +384,23 @@ pub async fn walk_files(
             } else {
                 format!("{rel}/{}", e.name)
             };
+            if out.len() + dirs.len() + skipped_links.len() >= WALK_ENTRY_MAX {
+                return Err(Error::Sftp(format!(
+                    "directory tree exceeds {WALK_ENTRY_MAX} entries"
+                )));
+            }
+            bytes = bytes.saturating_add(
+                serde_json::to_string(&child_rel)
+                    .map_err(|e| Error::Sftp(e.to_string()))?
+                    .len()
+                    + 1,
+            );
+            if bytes > budget {
+                return Err(Error::Sftp(
+                    "directory result exceeds response budget; narrow the path or exclude entries"
+                        .into(),
+                ));
+            }
             let child = format!("{dir}/{}", e.name);
             if e.is_symlink {
                 // 链既不当文件传也不递归进去（见上）。计入 skipped 供 UI 明示。
@@ -597,6 +645,16 @@ impl<R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send> RemoteReader
     }
 }
 
+fn remote_error(error: russh_sftp::client::error::Error) -> Error {
+    match error {
+        russh_sftp::client::error::Error::Status(status) => Error::SftpStatus {
+            code: status.status_code as u32,
+            message: status.error_message,
+        },
+        other => Error::Sftp(other.to_string()),
+    }
+}
+
 #[async_trait]
 impl SftpOps for RemoteSftp {
     async fn list(&self, path: &str) -> Result<ListResult, Error> {
@@ -719,6 +777,27 @@ impl SftpOps for RemoteSftp {
         }))
     }
 
+    async fn create_exclusive<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Result<Box<dyn RemoteWriter + 'a>, Error> {
+        use russh_sftp::protocol::OpenFlags;
+        let file = self
+            .inner
+            .open_with_flags(
+                path,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+            )
+            .await
+            .map_err(remote_error)?;
+        Ok(Box::new(PipelinedWriter {
+            file,
+            start: 0,
+            queued: 0,
+            largest: 0,
+        }))
+    }
+
     async fn sync(&self, path: &str) -> Result<(), Error> {
         use tokio::io::AsyncWriteExt;
         // 只读打开即可：fsync(2) 对只读 fd 同样把该文件的脏页刷盘，且不引入写语义的副作用。
@@ -767,24 +846,15 @@ impl SftpOps for RemoteSftp {
     }
 
     async fn mkdir(&self, path: &str) -> Result<(), Error> {
-        self.inner
-            .create_dir(path)
-            .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+        self.inner.create_dir(path).await.map_err(remote_error)
     }
 
     async fn remove(&self, path: &str) -> Result<(), Error> {
-        self.inner
-            .remove_file(path)
-            .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+        self.inner.remove_file(path).await.map_err(remote_error)
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), Error> {
-        self.inner
-            .remove_dir(path)
-            .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+        self.inner.remove_dir(path).await.map_err(remote_error)
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
@@ -794,13 +864,19 @@ impl SftpOps for RemoteSftp {
             .map_err(|e| Error::Sftp(e.to_string()))
     }
 
+    async fn rename_no_replace(&self, from: &str, to: &str) -> Result<(), Error> {
+        crate::managed_fileops::require_absent(self, to).await?;
+        // SSH_FXP_RENAME v3 必须拒绝已存在目标；不调用 posix-rename 覆盖扩展。
+        self.inner.rename(from, to).await.map_err(remote_error)
+    }
+
     async fn lstat(&self, path: &str) -> Result<FileMeta, Error> {
         // symlink_metadata 走 SSH_FXP_LSTAT（不跟随软链）；metadata 走 SSH_FXP_STAT
         let m = self
             .inner
             .symlink_metadata(path)
             .await
-            .map_err(|e| Error::Sftp(e.to_string()))?;
+            .map_err(remote_error)?;
         Ok(FileMeta {
             file_type: file_type_of(m.file_type()),
             size: m.len(),
@@ -817,10 +893,7 @@ impl SftpOps for RemoteSftp {
 
     async fn read_link(&self, path: &str) -> Result<String, Error> {
         // russh-sftp 2.3.0 `SftpSession::read_link` → `SftpResult<String>`，直接返回
-        self.inner
-            .read_link(path)
-            .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+        self.inner.read_link(path).await.map_err(remote_error)
     }
 
     async fn symlink(&self, target: &str, link_path: &str) -> Result<(), Error> {
@@ -832,16 +905,13 @@ impl SftpOps for RemoteSftp {
         self.inner
             .symlink(target, link_path)
             .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+            .map_err(remote_error)
     }
 
     async fn canonicalize(&self, path: &str) -> Result<String, Error> {
         // russh-sftp 2.3.0 `canonicalize` = SSH_FXP_REALPATH，取 name 应答的第一条 filename；
         // 应答里一条都没有时它自己回 `UnexpectedBehavior("no file")`，照常降级。
-        self.inner
-            .canonicalize(path)
-            .await
-            .map_err(|e| Error::Sftp(e.to_string()))
+        self.inner.canonicalize(path).await.map_err(remote_error)
     }
 }
 

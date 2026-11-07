@@ -93,6 +93,8 @@ impl RejectCode {
 /// 工具错误的线上形状：`{isError: true, code, tier, confirmation_required}`（§4.5）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     /// 恒 `true`。MCP 的 `CallToolResult` 用这个字段区分「工具报错」与「传输报错」，
     /// 前者是给模型看的、可被它读懂并改变下一步的数据。
     #[serde(rename = "isError")]
@@ -112,6 +114,7 @@ impl ToolError {
     /// 授权层拒绝：没有 tier（还没分类），也不可能靠确认翻转。
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
+            details: None,
             is_error: true,
             code: RejectCode::Forbidden.wire(),
             tier: None,
@@ -123,6 +126,7 @@ impl ToolError {
     /// 闸门判拒：有 tier，但闸门从不询问，故 `confirmation_required: false`。
     pub fn denied_by_gate(tier: Tier, message: impl Into<String>) -> Self {
         Self {
+            details: None,
             is_error: true,
             code: RejectCode::Denied.wire(),
             tier: Some(tier_wire(tier)),
@@ -134,6 +138,7 @@ impl ToolError {
     /// 用户答了「否」。问过了，所以 `confirmation_required: true`。
     pub fn denied_by_user(tier: Tier) -> Self {
         Self {
+            details: None,
             is_error: true,
             code: RejectCode::Denied.wire(),
             tier: Some(tier_wire(tier)),
@@ -145,6 +150,7 @@ impl ToolError {
     /// 确认超时。
     pub fn timed_out(tier: Tier, secs: u64) -> Self {
         Self {
+            details: None,
             is_error: true,
             code: RejectCode::Timeout.wire(),
             tier: Some(tier_wire(tier)),
@@ -161,6 +167,7 @@ impl ToolError {
     /// 文案里刻意不说「请重试」：重试会再失败一次。要说的是「先把会话弄回来」。
     pub fn aborted(tier: Tier) -> Self {
         Self {
+            details: None,
             is_error: true,
             code: RejectCode::Aborted.wire(),
             tier: Some(tier_wire(tier)),

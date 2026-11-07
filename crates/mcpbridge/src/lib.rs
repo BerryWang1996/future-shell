@@ -25,6 +25,7 @@ pub mod authz;
 pub mod client;
 pub mod confirm;
 pub mod gate;
+pub mod managed;
 pub mod payload;
 pub mod ports;
 pub mod reject;

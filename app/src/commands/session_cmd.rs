@@ -163,6 +163,7 @@ pub(crate) async fn open_session_core(
                 handle,
                 24,
                 80,
+                None,
             )
             .await
             .map_err(|m| Box::new(ConnectFailure::other(m, &profile)))?;
@@ -206,6 +207,7 @@ pub async fn establish_session(
     handle: russh::client::Handle<fs_sshengine::connect::Connector>,
     rows: u32,
     cols: u32,
+    expected_generation: Option<u64>,
 ) -> Result<(), String> {
     let app = state.app.clone();
     let registry = state.registry.clone();
@@ -313,6 +315,26 @@ pub async fn establish_session(
                                // 继续跑——用户看到「终端重连好了，文件传输却永远卡在 0%」。放在这里而不是
                                // registry.remove 那一段：shutdown 含最长 5 s 的有界等待（await），而下面
                                // 「remove 旧 + spawn 泵 + insert 新」刻意保持为同步段以收窄 session_close 插队窗口。
+    let prior = registry.get(&session_id);
+    let prior_gate = prior.as_ref().map(|session| session.operation_gate.clone());
+    let _lifecycle = match &prior_gate {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
+    if expected_generation.is_some() && registry.generation_of(&session_id) != expected_generation {
+        return Err("会话已关闭或已更换连接".into());
+    }
+    if let Some(prior) = &prior {
+        if !registry
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(prior, &current))
+        {
+            return Err("会话已关闭或已更换连接".into());
+        }
+    }
+    if prior.as_ref().is_some_and(|session| *session.stop.borrow()) {
+        return Err("会话已关闭".into());
+    }
     state.shutdown_session_subsystems(&session_id).await;
     // 传输目标锁的端点别名（审计2 #13）：一次 DNS 往返，必须在下面那段刻意保持同步的
     // 「remove 旧 + spawn 泵 + insert 新」之**前**做完，否则一个 await 会重新拉开
@@ -337,11 +359,13 @@ pub async fn establish_session(
     let generation = registry.insert(
         session_id.clone(),
         Arc::new(crate::sessions::LiveSession {
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             pipe: Arc::new(pipe),
             write: tokio::sync::Mutex::new(write_half),
             // 句柄单存（方案甲 P2-15/30）：Handle 非 Clone，Task 21 SFTP 经 registry 取用，不另设句柄表
             handle: tokio::sync::Mutex::new(handle),
             profile_id: profile.id.to_string(),
+            connection_profile: profile.clone(),
             // 传输目标锁的端点键，在此定格（见 sessions::LiveSession::target_endpoint）
             target_endpoint: crate::state::transfer_endpoint_of(profile),
             // 别名解析要一次 DNS 往返，只在装配时做一次（见 state::transfer_endpoint_aliases_of）
@@ -533,19 +557,80 @@ pub async fn session_close(
     session_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    close_core(&session_id, state.inner(), None, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionControlError {
+    #[error("连接已变化或不可用，请重新查看会话")]
+    Unavailable,
+    #[error("仍有传输任务，请先取消或等待完成")]
+    Busy,
+    #[error("连接尚未断开，无需重连")]
+    Connected,
+    #[error("连接配置或 MCP 授权已变化，请重新打开连接")]
+    ConfigurationChanged,
+    #[error("{0}")]
+    Storage(String),
+}
+
+pub(crate) async fn close_core(
+    session_id: &str,
+    state: &Arc<AppState>,
+    expected: Option<u64>,
+    reject_busy: bool,
+) -> Result<(), SessionControlError> {
+    let bound = state.registry.get_with_generation(session_id);
+    let lock = bound
+        .as_ref()
+        .map(|(_, session)| session.operation_gate.clone());
+    let _guard = match &lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if bound.as_ref().is_some_and(|(generation, _)| {
+        state.registry.generation_of(session_id) != Some(*generation)
+    }) || (expected.is_some() && state.registry.generation_of(session_id) != expected)
+    {
+        return Err(SessionControlError::Unavailable);
+    }
+    if reject_busy {
+        if let Some((generation, live)) = &bound {
+            let profile = fs_connmgr::ProfileRepo::new(state.db.pool())
+                .get(live.connection_profile.id)
+                .await
+                .map_err(|e| SessionControlError::Storage(e.to_string()))?;
+            if !profile.allows_mcp_ssh() {
+                return Err(SessionControlError::ConfigurationChanged);
+            }
+            let manager = state
+                .transfers
+                .lock()
+                .await
+                .get(&(session_id.to_string(), *generation))
+                .and_then(|slot| slot.get().cloned());
+            if let Some(manager) = manager {
+                if manager.active_len().await > 0 {
+                    return Err(SessionControlError::Busy);
+                }
+            }
+        }
+    }
     // M7.4 串口：自己那条收尾路径（无 SSH 子系统、无重连循环、无 journal 记账）。
     // 事件由串口任务在 Closed 时发（session:closed），与 SSH 这一路语义相同。
-    if let Some(sp) = state.serial.get(&session_id) {
+    if let Some(sp) = state.serial.get(session_id) {
         sp.link.close().await;
         sp.pipe.shutdown();
         return Ok(());
     }
     // 主动移除 pending 的 TOFU/kbd tx：等待中的回调收到 RecvError → 按拒绝收尾，连接任务不再挂起（F20②）
-    state.pending.clear_session(&session_id);
+    state.pending.clear_session(session_id);
     // 会话都要关了，正在跑的重连轮次没有继续的意义（P1-7：这里取消的是「本轮」，
     // 会话级退出仍由下面的 stop 通知——两个信号各司其职）
-    cancel_reconnect_round(&session_id);
-    if let Some(session) = state.registry.remove(&session_id) {
+    cancel_reconnect_round(session_id);
+    if let Some(session) = state.registry.remove(session_id) {
         // 通知 watchdog 与自动重连循环退出（F20③）：watchdog 见 registry 移除 / stop=true 即静默退出
         let _ = session.stop.send(true);
         // 审计 P0-4/P0-5：顺序是「先关传输子系统 → 再关管道 → 最后随 Arc drop 关 SSH 连接」。
@@ -553,7 +638,7 @@ pub async fn session_close(
         // 传输任务都是独立 spawn 出去的、各自持有本地文件句柄，删表项一个也停不了。
         // 用户点了「关闭标签」，后台还在继续改他的文件，直到 SSH 连接自己断开为止。
         // 反过来先关管道/连接也不行：worker 会在半途撞上 IO 错误，写了一半的临时件失去有序收尾。
-        state.shutdown_session_subsystems(&session_id).await;
+        state.shutdown_session_subsystems(session_id).await;
         // 关闭管道：shutdown 协同停止读取任务，stop 臂发起合批收尾（S214），render 泵随 rx 断开退出（EOF 泵仅自退、不代发 session:closed）
         session.pipe.shutdown();
     }
@@ -565,7 +650,7 @@ pub async fn session_close(
     );
     // 审计 P1-12：会话此刻已确实关闭，journal 写失败不得反过来把 IPC 判成失败——
     // 那会让前端保留一个点什么都没反应的死标签。
-    crate::journal::mark_closed_best_effort(&state.db, &session_id).await;
+    crate::journal::mark_closed_best_effort(&state.db, session_id).await;
     Ok(())
 }
 
@@ -576,9 +661,41 @@ pub async fn session_reconnect(
     session_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let Some(session) = state.registry.get(&session_id) else {
-        return Err("no session".into());
-    };
+    reconnect_core(&session_id, state.inner(), None, false)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn reconnect_core(
+    session_id: &str,
+    state: &Arc<AppState>,
+    expected: Option<u64>,
+    mcp: bool,
+) -> Result<bool, SessionControlError> {
+    let (generation, session) = state
+        .registry
+        .get_with_generation(session_id)
+        .ok_or(SessionControlError::Unavailable)?;
+    let gate = session.operation_gate.clone();
+    let _guard = gate.lock().await;
+    if expected.is_some_and(|g| g != generation)
+        || state.registry.generation_of(session_id) != Some(generation)
+    {
+        return Err(SessionControlError::Unavailable);
+    }
+    if mcp && session.last_reason.lock().unwrap().is_none() {
+        return Err(SessionControlError::Connected);
+    }
+    if mcp {
+        let profile = fs_connmgr::ProfileRepo::new(state.db.pool())
+            .get(session.connection_profile.id)
+            .await
+            .map_err(|e| SessionControlError::Storage(e.to_string()))?;
+        if !mcp_reconnect_matches(&session.connection_profile, &profile) {
+            return Err(SessionControlError::ConfigurationChanged);
+        }
+    }
     if session
         .reconnecting
         .compare_exchange(
@@ -589,9 +706,10 @@ pub async fn session_reconnect(
         )
         .is_err()
     {
-        return Ok(());
+        return Ok(false);
     }
-    let app_state = state.inner().clone();
+    let app_state = state.clone();
+    let session_id = session_id.to_string();
     // 首断原因复用（补丁 M-4）：watchdog 置入的 last_reason；缺省（未经断线即手动触发）按 transport_eof
     let reason = session
         .last_reason
@@ -600,9 +718,9 @@ pub async fn session_reconnect(
         .unwrap_or(crate::sessions::DisconnectReason::TransportEof);
     tauri::async_runtime::spawn(async move {
         // reconnect_loop 的 Drop 守卫保证任一退出路径释放 reconnecting 锁与本轮取消令牌
-        reconnect_loop(app_state, session_id, session, reason).await;
+        reconnect_loop(app_state, session_id, session, reason, mcp).await;
     });
-    Ok(())
+    Ok(true)
 }
 
 /// 「停止重连」入口：取消**当前这一轮**重连循环，循环在下一检查点（或退避等待中）立即退出。
@@ -829,7 +947,7 @@ fn spawn_connection_watchdog(
             .lock()
             .unwrap()
             .unwrap_or(DisconnectReason::TransportEof);
-        reconnect_loop(state, session_id, session, reason).await;
+        reconnect_loop(state, session_id, session, reason, false).await;
     });
 }
 
@@ -863,6 +981,7 @@ pub async fn reconnect_loop(
     session_id: String,
     session: Arc<crate::sessions::LiveSession>,
     reason: crate::sessions::DisconnectReason,
+    require_mcp_permission: bool,
 ) {
     let app = state.app.clone();
     let registry = state.registry.clone();
@@ -900,6 +1019,12 @@ pub async fn reconnect_loop(
         session_id: session_id.clone(),
         token: cancel_tx.clone(),
     };
+    let Some((generation, current)) = registry.get_with_generation(&session_id) else {
+        return;
+    };
+    if !Arc::ptr_eq(&current, &session) {
+        return;
+    }
 
     // 取原 profile（重连恢复 PTY 尺寸，spec §2.1；网格尺寸改为每轮拨号前新读，见 S293）
     let repo = fs_connmgr::ProfileRepo::new(state.db.pool());
@@ -908,7 +1033,7 @@ pub async fn reconnect_loop(
         emit_reconnect_gave_up(&app, &session_id, reason);
         return;
     };
-    let Ok(profile) = repo.get(pid).await else {
+    let Ok(mut profile) = repo.get(pid).await else {
         // S291：profile 已删除 → 终态事件，防标签永困断线态（复审一波中危 #4A）
         emit_reconnect_gave_up(&app, &session_id, reason);
         return;
@@ -942,6 +1067,17 @@ pub async fn reconnect_loop(
         if *stop_rx.borrow_and_update() || *cancel_rx.borrow_and_update() {
             return;
         }
+        if require_mcp_permission {
+            let Ok(current) = repo.get(pid).await else {
+                emit_reconnect_gave_up(&app, &session_id, reason);
+                return;
+            };
+            if !mcp_reconnect_matches(&session.connection_profile, &current) {
+                emit_reconnect_gave_up(&app, &session_id, reason);
+                return;
+            }
+            profile = current;
+        }
         let events: Arc<dyn fs_sshengine::events::SessionEvents> = Arc::new(GuiEvents {
             app: app.clone(),
             session_id: session_id.clone(),
@@ -962,6 +1098,16 @@ pub async fn reconnect_loop(
                 if registry.get(&session_id).is_none() {
                     return;
                 }
+                if require_mcp_permission {
+                    let Ok(current) = repo.get(pid).await else {
+                        emit_reconnect_gave_up(&app, &session_id, reason);
+                        return;
+                    };
+                    if !mcp_reconnect_matches(&session.connection_profile, &current) {
+                        emit_reconnect_gave_up(&app, &session_id, reason);
+                        return;
+                    }
+                }
                 // S293：每轮拨号前新读网格尺寸——重连窗口内的 term_resize 已更新旧 pipe 网格，
                 // 循环前一次性快照会漏掉最新 resize（复审一波低 #5）。
                 let (rows, cols) = (
@@ -978,6 +1124,7 @@ pub async fn reconnect_loop(
                     handle,
                     rows,
                     cols,
+                    Some(generation),
                 )
                 .await
                 {
@@ -1038,6 +1185,18 @@ pub async fn reconnect_loop(
         "session_id": session_id, "reason": give_up_reason.as_str(),
         "attempt": MAX_RECONNECT_ATTEMPTS, "gave_up": true }),
     );
+}
+
+fn mcp_reconnect_matches(original: &Profile, current: &Profile) -> bool {
+    current.allows_mcp_ssh()
+        && current.host == original.host
+        && current.port == original.port
+        && current.username == original.username
+        && current.protocol == original.protocol
+        && current.jump == original.jump
+        && current.auth == original.auth
+        && current.host_key_policy == original.host_key_policy
+        && current.host_key_pins == original.host_key_pins
 }
 
 /// 凭据源：按需向 Vault 取单条记录，进程内不留全量明文快照（F20⑤/spec §3.2）。
@@ -1365,5 +1524,27 @@ mod tests {
             Duration::ZERO,
             "0 翻倍应仍为 0"
         );
+    }
+    #[test]
+    fn mcp_reconnect_preserves_original_endpoint_auth_and_trust() {
+        let original: fs_connmgr::model::Profile = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "name": "synthetic", "host": "original.example",
+            "username": "test", "ai_policy": {"mcp_allowed":true}
+        }))
+        .unwrap();
+        let mut current = original.clone();
+        current.name = "renamed".into();
+        assert!(super::mcp_reconnect_matches(&original, &current));
+        current.host = "other.example".into();
+        assert!(!super::mcp_reconnect_matches(&original, &current));
+        current = original.clone();
+        current.auth.allow_agent = !current.auth.allow_agent;
+        assert!(!super::mcp_reconnect_matches(&original, &current));
+        current = original.clone();
+        current.host_key_policy = fs_connmgr::HostKeyPolicy::Strict;
+        assert!(!super::mcp_reconnect_matches(&original, &current));
+        current = original.clone();
+        current.ai_policy.mcp_allowed = false;
+        assert!(!super::mcp_reconnect_matches(&original, &current));
     }
 }
