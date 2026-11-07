@@ -91,6 +91,7 @@
       if (key === "term.highlights") highlightRules = value as HighlightRule[];
       if (key === "term.customSchemes") customSchemes = value as StoredCustomScheme[];
       if (key === "mcp.skipConfirmation") mcpSkipConfirmation = value === true;
+      if (key === "mcp.tools") mcpTools = value as string[];
     }
   }
   async function copyMcp(value: string, label: string) {
@@ -274,6 +275,9 @@
   let mcpCaller = $state("mcp");
   let mcpSkipConfirmation = $state<boolean | null>(null);
   let mcpTools = $state<string[]>([]);
+  let mcpToolsLoaded = $state(false);
+  let mcpToolsLoading = $state(false);
+  let mcpToolsLoadError = $state(false);
   /** MCP 区的局部错误（开关/轮换失败时显示在本区内，不弹全局 toast）。 */
   let mcpError = $state("");
   /** 对外 MCP 的实时状态（监听中/端口/连接数）。null = 还没取到。 */
@@ -328,11 +332,45 @@
     return { text: `监听中（端口 ${mcpStatus.port}，等待客户端）`, cls: "on" };
   }
 
-  /** 勾选/取消一个 MCP 工具并落库。名单即授权面——没勾的对外不可枚举。 */
+  /** 工具授权名单读取失败不能当成空名单，否则用户操作会覆盖原有授权。 */
+  async function loadMcpTools(): Promise<void> {
+    if (mcpToolsLoading) return;
+    mcpToolsLoading = true;
+    mcpToolsLoaded = false;
+    try {
+      const raw = await invoke<string | null>("settings_get", { key: "mcp.tools" });
+      const value: unknown = raw === null ? [] : JSON.parse(raw);
+      if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) throw new Error("工具名单格式无效");
+      mcpTools = value;
+      mcpToolsLoaded = true;
+      mcpToolsLoadError = false;
+    } catch {
+      mcpToolsLoadError = true;
+    } finally {
+      mcpToolsLoading = false;
+    }
+  }
+
+  async function saveMcpTools(next: string[]): Promise<void> {
+    if (!mcpToolsLoaded || pendingSaves > 0) return;
+    if (await settingSet("mcp.tools", next)) mcpTools = next;
+  }
+
   function toggleMcpTool(tool: string): void {
     const has = mcpTools.includes(tool);
-    mcpTools = has ? mcpTools.filter((t) => t !== tool) : [...mcpTools, tool];
-    void settingSet("mcp.tools", mcpTools);
+    void saveMcpTools(has ? mcpTools.filter((t) => t !== tool) : [...mcpTools, tool]);
+  }
+
+  function selectMcpTools(): void {
+    void saveMcpTools([...mcpTools, ...MCP_TOOL_CHOICES.filter((tool) => !mcpTools.includes(tool))]);
+  }
+
+  function invertMcpTools(): void {
+    const visible = new Set<string>(MCP_TOOL_CHOICES);
+    void saveMcpTools([
+      ...mcpTools.filter((tool) => !visible.has(tool)),
+      ...MCP_TOOL_CHOICES.filter((tool) => !mcpTools.includes(tool)),
+    ]);
   }
 
   // ── 外部 MCP 挂载（M3 出口 6）── 把外部 server（stdio 子进程）挂给 Agent。
@@ -532,7 +570,7 @@
     mcpEnabled = await settingGet<boolean>("mcp.enabled", false);
     mcpCaller = await settingGet<string>("mcp.caller", "mcp");
     mcpSkipConfirmation = await settingGet<boolean>("mcp.skipConfirmation", false);
-    mcpTools = await settingGet<string[]>("mcp.tools", []);
+    await loadMcpTools();
     mcpMounts = await settingGet<McpMount[]>("mcp.mounts", []);
     restoreUnclosed = await settingGet<boolean>("ui.restoreUnclosed", true);
     fontSize = await settingGet<number>("term.fontSize", 13);
@@ -874,11 +912,21 @@
               修改工具名单后，请断开并重新连接外部 MCP 客户端。
               在连接编辑器的 AI 页可单独允许 MCP 发现并打开该 SSH 连接。
             </p>
+            {#if mcpToolsLoadError}
+              <p class="err" role="alert">无法读取 MCP 工具授权，请重试。
+                <button type="button" disabled={mcpToolsLoading || pendingSaves > 0} onclick={() => void loadMcpTools()}>重试读取</button>
+              </p>
+            {/if}
+            <div class="row">
+              <button type="button" disabled={!mcpToolsLoaded || pendingSaves > 0} onclick={selectMcpTools}>全选</button>
+              <button type="button" disabled={!mcpToolsLoaded || pendingSaves > 0} onclick={invertMcpTools}>反选</button>
+              <span data-testid="mcp-tools-count">{#if mcpToolsLoaded}已选 {MCP_TOOL_CHOICES.filter((tool) => mcpTools.includes(tool)).length} / {MCP_TOOL_CHOICES.length}{:else}工具名单未读取{/if}</span>
+            </div>
             <div class="mcp-tools" data-testid="set-mcp-tools">
               {#each MCP_TOOL_CHOICES as tool}
                 <label>
-                  <input type="checkbox" checked={mcpTools.includes(tool)}
-                         onchange={() => toggleMcpTool(tool)} />
+                  <input type="checkbox" checked={mcpTools.includes(tool)} disabled={!mcpToolsLoaded || pendingSaves > 0}
+                         onchange={(event) => { event.currentTarget.checked = mcpTools.includes(tool); toggleMcpTool(tool); }} />
                   {MCP_TOOL_LABELS[tool]}（{tool}）
                 </label>
               {/each}
