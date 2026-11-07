@@ -292,12 +292,10 @@ impl McpManagement {
                 .get(uuid::Uuid::parse_str(&live.profile_id).map_err(failed)?)
                 .await
                 .map_err(failed)?;
-            let reconnecting = live.reconnecting.load(std::sync::atomic::Ordering::Acquire);
-            let disconnected = live.last_reason.lock().unwrap().is_some();
             return Ok(json!({
                 "session_id":sid,"name":profile.name,"endpoint":live.target_endpoint,
                 "generation":generation,
-                "state":if reconnecting {"reconnecting"} else if disconnected {"disconnected"} else {"connected"}
+                "state":live.connection_state()
             }));
         }
         let ops = self.state.sftp_ops_for(sid).await.map_err(failed)?;

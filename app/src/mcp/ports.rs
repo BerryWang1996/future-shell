@@ -70,17 +70,17 @@ pub struct McpSessions {
     pub state: Arc<AppState>,
 }
 
-/// 注册表里那条会话记着的 profile_id → 连接名与主机。
+/// 注册表里那条会话记着的 profile_id → 连接名。
 ///
 /// 从**注册表反查**而不是信任调用方给的 id（同 `ai_cmd::profile_facts_of` 的
 /// 理由）：MCP 调用方给什么都可能，而「这个会话是谁」只能以本端事实为准。
-async fn profile_name_host(state: &AppState, profile_id: &str) -> (String, String) {
+async fn profile_name(state: &AppState, profile_id: &str) -> String {
     let Ok(uuid) = uuid::Uuid::parse_str(profile_id) else {
-        return (String::new(), String::new());
+        return String::new();
     };
     match ProfileRepo::new(state.db.pool()).get(uuid).await {
-        Ok(p) => (p.name, p.host),
-        Err(_) => (String::new(), String::new()),
+        Ok(p) => p.name,
+        Err(_) => String::new(),
     }
 }
 
@@ -107,23 +107,23 @@ impl SessionDirectory for McpSessions {
 
     fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
         Box::pin(async move {
-            // 持表锁内只抄一份 (id, profile_id)，查库在锁外——查库是 await，
+            // 持表锁内只抄一份会话引用，查库在锁外——查库是 await，
             // 持锁跨 await 会把所有会话操作冻住。
-            let pairs: Vec<(String, String)> = {
+            let pairs: Vec<_> = {
                 let guard = self.state.registry.sessions.lock().unwrap();
                 guard
                     .iter()
-                    .map(|(id, e)| (id.clone(), e.session.profile_id.clone()))
+                    .map(|(id, e)| (id.clone(), e.session.clone()))
                     .collect()
             };
             let mut out = Vec::with_capacity(pairs.len());
-            for (id, profile_id) in pairs {
-                let (name, host) = profile_name_host(&self.state, &profile_id).await;
+            for (id, live) in pairs {
+                let name = profile_name(&self.state, &live.profile_id).await;
                 out.push(SessionSummary {
                     id,
                     name,
-                    host,
-                    connected: true, // 在注册表里即已连接；断线的会被摘出注册表
+                    host: live.connection_profile.host.clone(),
+                    connected: live.connection_state() == "connected",
                 });
             }
             out
