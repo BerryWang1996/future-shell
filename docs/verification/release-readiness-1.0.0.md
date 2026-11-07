@@ -218,7 +218,7 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
 
 ### 1.0.5 候选（2026-11-07）
 
-- 版本一致性门禁按 v1.0.5 校验。主工作区 cargo test 汇总 1,702 passed、0 failed、4 ignored，其中容器用例按本机环境闸直接返回。helper 47 项、前端 1,689 项通过。两套 Rust Clippy 和依赖审计通过。
+- 版本一致性门禁按 v1.0.5 校验。主工作区 cargo test 汇总 1,703 passed、0 failed、4 ignored，其中容器用例按本机环境闸直接返回。helper 47 项、前端 1,689 项通过。两套 Rust Clippy 和依赖审计通过。
 - macOS arm64 候选包通过签名校验，在隔离 OpenSSH 环境完成 15 个新增 MCP 工具的调用。新 AI 客户端自行发现入口并完成文件操作链路，见 [V8](manual-checklist-1.0.0.md#v8--mcp-server真第三方客户端连上来)。
 - 本机 Docker 拉取测试镜像超时，Linux 容器测试、三平台 CI、安装 smoke、制品校验和及来源证明仍待 PR 和 tag 流水线核对。
 - 许可快照仅更新本地包版本，第三方依赖版本沿用原锁文件。正式安装包的三份许可材料由发布工作流重新生成。

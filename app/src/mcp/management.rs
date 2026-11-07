@@ -318,6 +318,9 @@ impl McpManagement {
                 let path = fs_sshengine::managed_fileops::destination(ops.as_ref(), path)
                     .await
                     .map_err(remote_failed)?;
+                fs_sshengine::managed_fileops::require_absent(ops.as_ref(), &path)
+                    .await
+                    .map_err(remote_failed)?;
                 ops.mkdir(&path).await.map_err(remote_failed)?;
                 json!({"created":path})
             }
@@ -337,6 +340,9 @@ impl McpManagement {
                 target, link_path, ..
             } => {
                 let path = fs_sshengine::managed_fileops::destination(ops.as_ref(), link_path)
+                    .await
+                    .map_err(remote_failed)?;
+                fs_sshengine::managed_fileops::require_absent(ops.as_ref(), &path)
                     .await
                     .map_err(remote_failed)?;
                 ops.symlink(target, &path).await.map_err(remote_failed)?;

@@ -182,6 +182,16 @@ pub async fn call(
     // ── ③ 会话在不在（分类之前）────────────────────────────────────────
     if let Some(sid) = tool.session_id() {
         if !ports.sessions.is_alive(sid) {
+            if matches!(tool, McpTool::Managed(_)) {
+                return CallOutput::err(ToolError {
+                    is_error: true,
+                    code: "FS_MCP_TARGET_UNAVAILABLE",
+                    tier: None,
+                    confirmation_required: false,
+                    message: "会话不可用，请通过 sessions.list 查询当前会话".into(),
+                    details: None,
+                });
+            }
             return no_such_session();
         }
     }
@@ -1626,6 +1636,23 @@ mod tests {
         let details = error.details.unwrap();
         assert_eq!(details["copied_files"], 1);
         assert!(!details.to_string().contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn managed_unknown_sessions_return_target_error_before_dispatch() {
+        for (name, args) in crate::managed::examples() {
+            let tool = parse_tool(name, &args.to_string()).unwrap();
+            if tool.session_id().is_none() {
+                continue;
+            }
+            let mut rig = Rig::new();
+            rig.dir.alive_until = 0;
+            let CallOutput::Err(error) = rig.call(name, &args.to_string()).await else {
+                panic!("unknown session accepted")
+            };
+            assert_eq!(error.code, "FS_MCP_TARGET_UNAVAILABLE", "{name}");
+            assert!(rig.management.seen.lock().unwrap().is_empty());
+        }
     }
 
     // ══ ⑥ 出站脱敏 ════════════════════════════════════════════════════
