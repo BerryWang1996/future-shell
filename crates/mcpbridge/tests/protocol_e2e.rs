@@ -743,7 +743,7 @@ impl SessionDirectory for ProbeDir {
                 }
             }
             if id == "failed-open" {
-                return Err("synthetic open failure".into());
+                return Err("synthetic open failure 中文 hunter2".into());
             }
             self.inner.open(&id).await
         })
@@ -797,7 +797,7 @@ impl McpAuditPort for ProbeAudit {
             && self.fail_settled.swap(false, Ordering::SeqCst);
         Box::pin(async move {
             if fail {
-                Err("synthetic settled failure".into())
+                Err("synthetic settled failure 中文 hunter2".into())
             } else {
                 Ok(())
             }
@@ -967,14 +967,14 @@ async fn failed_and_rejected_opens_do_not_enter_seen_ledger() {
     )
     .await;
     for _ in 0..2 {
-        let (_, structured, text) = call(
+        let (is_error, structured, text) = call(
             &peer,
             "sessions.open",
             serde_json::json!({"profile_id":"failed-open"}),
         )
         .await;
-        // 现有端口失败返回纯文本；S2 不改变其错误契约。
-        assert!(structured.is_none());
+        assert!(is_error);
+        assert_eq!(structured.unwrap()["code"], "FS_MCP_OPERATION_FAILED");
         assert!(text.contains("synthetic open failure"));
     }
     confirm.reject.store(true, Ordering::SeqCst);
@@ -1010,15 +1010,24 @@ async fn successful_open_is_remembered_when_settled_audit_fails() {
     audit.fail_settled.store(true, Ordering::SeqCst);
     let dir = probe_dir(false);
     let peer = concurrency_peer(dir.clone(), probe_command(), confirm.clone(), audit).await;
-    assert!(
-        call(
-            &peer,
-            "sessions.open",
-            serde_json::json!({"profile_id":"audit-failure"})
-        )
-        .await
-        .0
-    );
+    let first = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"audit-failure"}),
+    )
+    .await;
+    assert!(first.0);
+    let error = first.1.unwrap();
+    assert_eq!(error["code"], "FS_MCP_AUDIT_FAILED");
+    assert_eq!(error["details"]["stage"], "settled");
+    assert_eq!(error["details"]["operation_attempted"], true);
+    assert!(!error.to_string().contains("hunter2"));
+    assert!(error["message"].as_str().unwrap().contains("中文"));
+    assert!(error["message"].as_str().unwrap().contains("redacted"));
+    assert!(error["details"]["operation_result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("s-"));
     assert_eq!(
         dir.inner.sessions.lock().unwrap().len(),
         2,
@@ -1034,4 +1043,32 @@ async fn successful_open_is_remembered_when_settled_audit_fails() {
         .0
     );
     assert_eq!(*confirm.strong.lock().unwrap(), vec![true, false]);
+}
+
+#[tokio::test]
+async fn port_failure_is_a_tool_level_error_over_rmcp() {
+    let dir = probe_dir(false);
+    let peer = concurrency_peer(
+        dir,
+        probe_command(),
+        Arc::new(ProbeConfirm::default()),
+        Arc::new(ProbeAudit::default()),
+    )
+    .await;
+    let (is_error, structured, _) = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"failed-open"}),
+    )
+    .await;
+    assert!(is_error);
+    let error = structured.unwrap();
+    assert_eq!(error["code"], "FS_MCP_OPERATION_FAILED");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("synthetic open failure"));
+    assert!(error["message"].as_str().unwrap().contains("中文"));
+    assert!(error["message"].as_str().unwrap().contains("redacted"));
+    assert!(!error.to_string().contains("hunter2"));
 }

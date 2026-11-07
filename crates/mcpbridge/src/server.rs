@@ -336,9 +336,18 @@ async fn dispatch_after_gate(
         output: None,
     };
     if let Err(why) = ports.audit.append(intent).await {
-        return CallOutput::err(ToolError::forbidden(format!(
-            "审计写入失败，本次调用未执行：{why}"
-        )));
+        let message = fs_ai::agent::record::RedactedAction::new(
+            &format!("审计写入失败，本次调用未执行：{why}"),
+            &ctx.known_secrets,
+        );
+        return CallOutput::err(ToolError {
+            code: "FS_MCP_AUDIT_FAILED",
+            tier: Some(gated.tier().as_str()),
+            is_error: true,
+            confirmation_required: false,
+            message: message.as_str().to_string(),
+            details: Some(serde_json::json!({"stage":"intent","operation_attempted":false})),
+        });
     }
 
     // ── ⑧ 执行 ────────────────────────────────────────────────────────
@@ -405,11 +414,38 @@ async fn dispatch_after_gate(
         output: Some(text.clone()),
     };
     if let Err(why) = ports.audit.append(settled).await {
-        // 动作已经发生了。**如实说**——链上会留下一条有 Intent 没有 Settled
-        // 的记录，那是可见的缺口，比一条假装一切正常的成功回包好。
-        return CallOutput::err(ToolError::forbidden(format!(
-            "操作已执行，但结果未能写入审计（{why}）。请到 FutureShell 检查审计链完整性。"
-        )));
+        let refs: Vec<&str> = ctx.known_secrets.iter().map(String::as_str).collect();
+        let mut details = serde_json::json!({"stage":"settled","operation_attempted":true});
+        if let Ok(result) = &ran {
+            let value = result
+                .structured
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"text":result.text}));
+            details["operation_result"] = redact_value(&value, &refs);
+        } else if let Some(error) = &operation_error {
+            details["operation_error_code"] = serde_json::json!(error.code);
+            details["operation_partial"] = error
+                .partial
+                .as_ref()
+                .map(|value| redact_value(value, &refs))
+                .unwrap_or(serde_json::Value::Null);
+            details["operation_error"] = serde_json::json!(text.as_str());
+        } else {
+            details["operation_result_known"] = serde_json::json!(false);
+            details["operation_error"] = serde_json::json!(text.as_str());
+        }
+        let message = fs_ai::agent::record::RedactedAction::new(
+            &format!("操作已尝试，结果未能写入审计（{why}）。操作可能已生效，请先核对状态，不要直接重试。"),
+            &ctx.known_secrets,
+        );
+        return CallOutput::err(ToolError {
+            code: "FS_MCP_AUDIT_FAILED",
+            tier: Some(gated.tier().as_str()),
+            is_error: true,
+            confirmation_required: false,
+            message: message.as_str().to_string(),
+            details: Some(details),
+        });
     }
 
     if let Some(error) = operation_error {
@@ -459,6 +495,17 @@ async fn dispatch_after_gate(
             details: None,
             code: "FS_MCP_PROFILE_LIST_FAILED",
             tier: Some("read_only"),
+            confirmation_required: false,
+            message: text.as_str().to_string(),
+        });
+    }
+
+    if ran.is_err() {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            details: None,
+            code: "FS_MCP_OPERATION_FAILED",
+            tier: Some(gated.tier().as_str()),
             confirmation_required: false,
             message: text.as_str().to_string(),
         });
@@ -652,7 +699,14 @@ async fn settle(
     };
     if let Err(why) = ports.audit.append(rec).await {
         let mut e = err;
-        e.message = format!("{}（另：这次拒绝未能写入审计：{why}）", e.message);
+        e.message = fs_ai::agent::record::RedactedAction::new(
+            &format!("{}（另：这次拒绝未能写入审计：{why}）", e.message),
+            &ctx.known_secrets,
+        )
+        .as_str()
+        .to_string();
+        let refs: Vec<&str> = ctx.known_secrets.iter().map(String::as_str).collect();
+        e.details = e.details.map(|value| redact_value(&value, &refs));
         return CallOutput::err(e);
     }
     CallOutput::err(err)
@@ -1039,6 +1093,7 @@ mod tests {
         /// 第几次调用开始失败（1 = 第一次就失败）。0 = 永不失败。
         fail_from: usize,
         change_generation_on_intent: Option<std::sync::Arc<AtomicUsize>>,
+        fail_message: String,
     }
 
     impl Audit {
@@ -1047,6 +1102,7 @@ mod tests {
                 rows: Default::default(),
                 fail_from: n,
                 change_generation_on_intent: None,
+                fail_message: format!("磁盘满 {SECRET}"),
             }
         }
         fn phases(&self) -> Vec<RecordPhase> {
@@ -1095,10 +1151,11 @@ mod tests {
                 output: rec.output.as_ref().map(|o| o.as_str().to_string()),
             });
             let fail = self.fail_from != 0 && nth >= self.fail_from;
+            let message = self.fail_message.clone();
             drop(rows);
             Box::pin(async move {
                 if fail {
-                    Err("磁盘满".to_string())
+                    Err(message)
                 } else {
                     Ok(())
                 }
@@ -1624,7 +1681,16 @@ mod tests {
         assert!(out.is_err());
         assert_eq!(r.calls.executed(), 0, "审计写不进去却执行了");
         match out {
-            CallOutput::Err(e) => assert!(e.message.contains("未执行"), "{}", e.message),
+            CallOutput::Err(e) => {
+                assert_eq!(e.code, "FS_MCP_AUDIT_FAILED");
+                assert!(e.message.contains("未执行"), "{}", e.message);
+                assert!(e.message.contains("磁盘满") && e.message.contains("redacted"));
+                assert!(!e.message.contains(SECRET));
+                assert_eq!(
+                    e.details.unwrap(),
+                    serde_json::json!({"stage":"intent","operation_attempted":false})
+                );
+            }
             _ => unreachable!(),
         }
         // 反向对照：审计正常时同一次调用会执行。
@@ -1646,13 +1712,119 @@ mod tests {
         assert_eq!(r.calls.run.load(SeqCst), 1, "这一步动作确实发生了");
         match out {
             CallOutput::Err(e) => {
-                assert!(e.message.contains("已执行"), "{}", e.message);
+                assert_eq!(e.code, "FS_MCP_AUDIT_FAILED");
+                assert!(e.message.contains("可能"), "{}", e.message);
+                assert!(!e.message.contains(SECRET));
                 assert!(!e.message.contains("未执行"), "{}", e.message);
+                let details = e.details.unwrap();
+                assert_eq!(details["stage"], "settled");
+                assert_eq!(details["operation_attempted"], true);
             }
             _ => unreachable!(),
         }
         // 链上留下一条有 Intent 没有 Settled 的可见缺口。
         assert_eq!(r.audit.phases()[0], RecordPhase::Intent);
+    }
+
+    #[tokio::test]
+    async fn settled_audit_failure_preserves_redacted_open_result_and_ledger() {
+        let mut r = Rig::new();
+        r.dir.allowed.lock().unwrap().insert("p1".into(), true);
+        *r.dir.open_result.lock().unwrap() = Ok(format!("会话-{SECRET}"));
+        r.audit = Audit::failing_at(2);
+        let out = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
+        let CallOutput::Err(e) = out else {
+            panic!("审计失败必须返回错误")
+        };
+        assert_eq!(e.code, "FS_MCP_AUDIT_FAILED");
+        let details = e.details.unwrap();
+        assert_eq!(details["stage"], "settled");
+        assert_eq!(details["operation_attempted"], true);
+        let result = details["operation_result"]["session_id"].as_str().unwrap();
+        assert!(result.contains("会话-") && result.contains("redacted"));
+        assert!(!result.contains(SECRET));
+        assert!(!e.message.contains(SECRET));
+        assert_eq!(r.calls.open.load(SeqCst), 1);
+        assert_eq!(r.ledger.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settled_audit_failure_preserves_redacted_managed_partial() {
+        let mut r = Rig::new();
+        r.management.fail = true;
+        r.audit = Audit::failing_at(2);
+        let out = r
+            .call("sftp.copy", r#"{"session_id":"s1","from":"/a","to":"/b"}"#)
+            .await;
+        let CallOutput::Err(e) = out else {
+            panic!("审计失败必须返回错误")
+        };
+        assert_eq!(e.code, "FS_MCP_AUDIT_FAILED");
+        let details = e.details.unwrap();
+        assert_eq!(details["operation_attempted"], true);
+        assert_eq!(details["operation_partial"]["copied_files"], 1);
+        let text = details.to_string();
+        assert!(text.contains("redacted"));
+        assert!(!text.contains(SECRET));
+        assert!(!e.message.contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn settled_audit_failure_reports_unknown_failed_open_without_leaking_cause() {
+        let mut r = Rig::new();
+        r.dir.allowed.lock().unwrap().insert("p1".into(), true);
+        *r.dir.open_result.lock().unwrap() = Err(format!("连接错误 {SECRET}"));
+        r.audit = Audit::failing_at(2);
+        let out = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
+        let CallOutput::Err(e) = out else {
+            panic!("审计失败必须返回错误")
+        };
+        assert_eq!(e.code, "FS_MCP_AUDIT_FAILED");
+        let details = e.details.unwrap();
+        assert_eq!(details["operation_attempted"], true);
+        assert_eq!(details["operation_result_known"], false);
+        assert!(details["operation_error"]
+            .as_str()
+            .unwrap()
+            .contains("redacted"));
+        assert!(!details.to_string().contains(SECRET));
+        assert!(r.ledger.is_empty());
+        assert_eq!(r.calls.open.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_command_with_nonzero_exit_remains_a_successful_observation() {
+        let mut r = Rig::new();
+        r.cmd.obs = Observation {
+            exit_code: Some(7),
+            stderr: "failed command".into(),
+            ..Default::default()
+        };
+        let out = r.run_cmd("ls").await;
+        let CallOutput::Ok {
+            structured: Some(value),
+            ..
+        } = out
+        else {
+            panic!("命令完成应返回观察值")
+        };
+        assert_eq!(value["exit_code"], 7);
+        assert_eq!(value["stderr"], "failed command");
+    }
+
+    #[tokio::test]
+    async fn policy_rejection_audit_failure_does_not_claim_an_execution_or_leak_why() {
+        let mut r = Rig::new();
+        r.audit = Audit::failing_at(1);
+        r.ctx.mode = AiMode::ReadOnlyOnly;
+        let out = r.run_cmd("rm -rf /tmp/fixture").await;
+        let CallOutput::Err(e) = out else {
+            panic!("必须拒绝")
+        };
+        assert_eq!(e.code, "FS_POLICY_DENIED");
+        assert!(!e.message.contains(SECRET));
+        assert!(!e.message.contains("已执行"));
+        assert_eq!(r.calls.executed(), 0);
     }
 
     /// D3 审计行里的 display **每一行**都脱过敏。
@@ -1997,10 +2169,13 @@ mod tests {
 
         let a = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
         assert!(r.conf.last_strong(), "首次该是强确认");
-        // 端口失败走的是文本回包（不是策略拒绝），但里面要说清失败了。
+        // 端口失败是工具级操作失败，而不是策略拒绝。
         match &a {
-            CallOutput::Ok { text, .. } => assert!(text.contains("失败"), "{text}"),
-            CallOutput::Err(e) => panic!("端口失败不该报成策略拒绝：{e:?}"),
+            CallOutput::Err(e) => {
+                assert_eq!(e.code, "FS_MCP_OPERATION_FAILED");
+                assert!(e.message.contains("连不上"));
+            }
+            CallOutput::Ok { .. } => panic!("端口失败不能作为成功返回"),
         }
         assert!(r.ledger.is_empty(), "没开成却记了台账");
 
