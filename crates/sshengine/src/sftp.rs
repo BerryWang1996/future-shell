@@ -685,7 +685,7 @@ impl SftpOps for RemoteSftp {
             .metadata(path)
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
-        Ok(meta.len())
+        required_file_size(meta.size)
     }
 
     async fn stat_meta(&self, path: &str) -> Result<FileMeta, Error> {
@@ -695,9 +695,10 @@ impl SftpOps for RemoteSftp {
             .metadata(path)
             .await
             .map_err(|e| Error::Sftp(e.to_string()))?;
+        let kind = file_type_of(m.file_type());
         Ok(FileMeta {
-            file_type: file_type_of(m.file_type()),
-            size: m.len(),
+            file_type: kind,
+            size: required_file_size(m.size)?,
             mtime: mtime_secs(&m),
             mode: m.permissions.map(|p| p & 0o7777),
             uid: m.uid,
@@ -877,9 +878,10 @@ impl SftpOps for RemoteSftp {
             .symlink_metadata(path)
             .await
             .map_err(remote_error)?;
+        let kind = file_type_of(m.file_type());
         Ok(FileMeta {
-            file_type: file_type_of(m.file_type()),
-            size: m.len(),
+            file_type: kind,
+            size: metadata_size(kind, m.size)?,
             mtime: mtime_secs(&m),
             // `Metadata` = `protocol::FileAttributes`，其 `permissions`/`uid`/`gid` 是 pub
             // `Option<u32>` 原始协议字段。不走 `permissions() -> FilePermissions`：那 9 个
@@ -915,6 +917,18 @@ impl SftpOps for RemoteSftp {
     }
 }
 
+fn required_file_size(size: Option<u64>) -> Result<u64, Error> {
+    size.ok_or_else(|| Error::Sftp("server did not provide file size".into()))
+}
+
+fn metadata_size(kind: FileType, size: Option<u64>) -> Result<u64, Error> {
+    if kind == FileType::Regular {
+        required_file_size(size)
+    } else {
+        Ok(size.unwrap_or(0))
+    }
+}
+
 /// 入参为 SFTP **协议**类型（`Metadata::file_type()` → `protocol::FileType`），
 /// 非 `std::fs::FileType`；该类型自带 `is_dir`/`is_file`/`is_symlink`/`is_other`。
 fn file_type_of(ft: russh_sftp::protocol::FileType) -> FileType {
@@ -941,6 +955,18 @@ fn mtime_secs(m: &russh_sftp::client::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_regular_file_size_is_not_an_empty_file() {
+        assert!(required_file_size(None).is_err());
+        assert_eq!(required_file_size(Some(0)).unwrap(), 0);
+        assert_eq!(required_file_size(Some(42)).unwrap(), 42);
+        assert!(metadata_size(FileType::Regular, None).is_err());
+        assert_eq!(metadata_size(FileType::Regular, Some(0)).unwrap(), 0);
+        assert_eq!(metadata_size(FileType::Regular, Some(42)).unwrap(), 42);
+        assert_eq!(metadata_size(FileType::Dir, None).unwrap(), 0);
+        assert_eq!(metadata_size(FileType::Symlink, None).unwrap(), 0);
+    }
 
     /// `RemoteSftp::write_at` 不得调 `flush()`：russh-sftp 的 `flush` 在服务端支持
     /// `fsync@openssh.com` 时每次都发 fsync，传输引擎逐块调用本方法，等于每 255 KiB 一次

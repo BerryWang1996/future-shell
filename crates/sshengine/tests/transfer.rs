@@ -33,6 +33,7 @@ async fn next_event(ev: &mut mpsc::Receiver<TransferEvent>) -> TransferEvent {
 #[derive(Default)]
 struct FakeFs {
     files: Mutex<HashMap<String, Vec<u8>>>,
+    missing_source_size: Mutex<bool>,
     fail_next_writes: Mutex<usize>,
     /// `fail_next_writes` 的下载侧对偶：前 n 次 `read_range` 注入失败。
     /// 下载方向此前没有任何故障注入手段，于是「重试之间发生了什么」这一整条路径
@@ -451,6 +452,11 @@ impl SftpOps for FakeFs {
         &self,
         path: &str,
     ) -> Result<fs_sshengine::sftp::FileMeta, fs_sshengine::Error> {
+        if *self.missing_source_size.lock().unwrap() {
+            return Err(fs_sshengine::Error::Sftp(
+                "server did not provide file size".into(),
+            ));
+        }
         let fs = self.files.lock().unwrap();
         let size = fs
             .get(path)
@@ -1906,6 +1912,30 @@ async fn unrecoverable_commit_failure_keeps_both_copies_and_says_where() {
 /// 原实现用 `truncate(false)` 直接打开 `<dest>` 覆写，远端 100 字节盖住本地 1000 字节的
 /// 前 100 字节，后面 900 字节旧内容原样留着——文件能打开、能解析，只是尾部挂着上一版的
 /// 残骸，用户往往到运行时才发现。断言长度**和**内容：只比长度会漏掉内容错位。
+#[tokio::test]
+async fn download_with_unknown_size_does_not_create_empty_file() {
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/unknown.bin".into(), b"nonempty".to_vec());
+    *fs.missing_source_size.lock().unwrap() = true;
+    let mgr = TransferManager::spawn(fs, 1);
+    let root = temp_subdir();
+    let dest = root.join("unknown.bin");
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit(down_job(dest.clone(), "/unknown.bin", root))
+        .await
+        .unwrap();
+    match drain_to_terminal(&mut ev, id).await {
+        TransferState::Failed(message) => assert!(message.contains("file size")),
+        other => panic!("unknown size must fail: {other:?}"),
+    }
+    assert!(!dest.exists());
+    assert!(!part_of(&dest).exists());
+}
+
 #[tokio::test]
 async fn download_over_longer_local_file_is_exactly_source_length() {
     let fs = Arc::new(FakeFs::default());
