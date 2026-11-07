@@ -918,10 +918,13 @@ async fn run_transfer(
     let mut job = job;
     let mut local = local;
     if options.no_replace {
-        let suffix = format!(".{}", uuid::Uuid::new_v4());
+        let staging_name = format!(".fs-transfer-{}", uuid::Uuid::new_v4());
         match job.direction {
             Direction::Up => {
-                job.remote.push_str(&suffix);
+                job.remote = match job.remote.rsplit_once('/') {
+                    Some((parent, _)) => format!("{parent}/{staging_name}"),
+                    None => staging_name,
+                };
                 let part = remote_part(&job.remote);
                 let meta = remote_meta(&job.remote);
                 let writer = match ops.create_exclusive(&part).await {
@@ -943,9 +946,7 @@ async fn run_transfer(
                 }
             }
             Direction::Down => {
-                let mut name = local.into_os_string();
-                name.push(&suffix);
-                local = PathBuf::from(name);
+                local = local.with_file_name(&staging_name);
                 let part = local_part(&local);
                 let meta = local_meta(&local);
                 let mut part_options = tokio::fs::OpenOptions::new();

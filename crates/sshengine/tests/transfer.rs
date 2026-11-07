@@ -188,6 +188,9 @@ impl SftpOps for FakeFs {
         &'a self,
         path: &'a str,
     ) -> Result<Box<dyn fs_sshengine::sftp::RemoteWriter + 'a>, fs_sshengine::Error> {
+        if path.rsplit('/').next().unwrap_or("").len() > 255 {
+            return Err(fs_sshengine::Error::Sftp("filename too long".into()));
+        }
         let mut files = self.files.lock().unwrap();
         if files.contains_key(path) {
             return Err(fs_sshengine::Error::Sftp("exists".into()));
@@ -3656,5 +3659,46 @@ async fn no_replace_upload_cancel_preserves_existing_parts() {
     assert_eq!(fs.get("/upload"), None);
     assert_eq!(fs.get("/upload.fspart").unwrap(), b"original part");
     assert_eq!(fs.get("/upload.fspart.fsmeta").unwrap(), b"original meta");
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_supports_maximum_length_destination_names() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/remote".into(), b"download".to_vec());
+    let dir = tempfile::tempdir().unwrap();
+    let long_name = "x".repeat(255);
+    let src = dir.path().join("source");
+    let dest = dir.path().join(&long_name);
+    std::fs::write(&src, b"upload").unwrap();
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let mut ev = mgr.events().await;
+    let opts = TransferOptions {
+        no_replace: true,
+        upload_source: None,
+    };
+    let remote = format!("/dir/{long_name}");
+    let up = mgr
+        .submit_with_options(up_job(src, &remote, "long-name"), opts.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut ev, up).await,
+        TransferState::Done
+    ));
+    assert_eq!(fs.get(&remote).unwrap(), b"upload");
+    let down = mgr
+        .submit_with_options(down_job(dest.clone(), "/remote", dir.path().into()), opts)
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut ev, down).await,
+        TransferState::Done
+    ));
+    assert_eq!(std::fs::read(dest).unwrap(), b"download");
     assert!(mgr.shutdown(Duration::from_secs(2)).await);
 }
