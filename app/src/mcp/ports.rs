@@ -40,13 +40,16 @@ type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 async fn authorized_session(
     state: &AppState,
     session_id: &str,
+    expected_generation: Option<u64>,
 ) -> PortResult<(Arc<LiveSession>, tokio::sync::OwnedMutexGuard<()>)> {
     let (generation, live) = state
         .registry
         .get_with_generation(session_id)
         .ok_or_else(|| fs_mcpbridge::ports::SESSION_UNAVAILABLE.to_string())?;
     let guard = live.operation_gate.clone().lock_owned().await;
-    if state.registry.generation_of(session_id) != Some(generation) {
+    if expected_generation != Some(generation)
+        || state.registry.generation_of(session_id) != Some(generation)
+    {
         return Err(fs_mcpbridge::ports::SESSION_UNAVAILABLE.into());
     }
     if !super::management::allowed(state, &live.profile_id).await {
@@ -206,10 +209,12 @@ impl TerminalPort for McpTerminal {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         Box::pin(async move {
-            let (session, _guard) = authorized_session(&self.state, &session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             // screen = 当前可见屏；scrollback/all = 回看+可见屏的末尾 N 行
             //（网格侧没有「纯回看不含当前屏」的取法，见 fs_terminal::pipe 文档）。
             Ok(match source {
@@ -221,11 +226,17 @@ impl TerminalPort for McpTerminal {
         })
     }
 
-    fn send(&self, session_id: &str, payload: &str) -> Fut<'_, PortResult<()>> {
+    fn send(
+        &self,
+        session_id: &str,
+        payload: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         let session_id = session_id.to_string();
         let payload = payload.as_bytes().to_vec();
         Box::pin(async move {
-            let (session, _guard) = authorized_session(&self.state, &session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             // 与 term_input 同一条写半部（Mutex 串行化保字节顺序）。
             let w = session.write.lock().await;
             w.data_bytes(payload)
@@ -256,8 +267,13 @@ pub struct McpCommand {
 }
 
 impl McpCommand {
-    async fn exec(&self, session_id: &str, tool: Tool) -> PortResult<Observation> {
-        let (session, _guard) = authorized_session(&self.state, session_id).await?;
+    async fn exec(
+        &self,
+        session_id: &str,
+        tool: Tool,
+        generation: Option<u64>,
+    ) -> PortResult<Observation> {
+        let (session, _guard) = authorized_session(&self.state, session_id, generation).await?;
         // 复用 Agent 的 RusshExecPort：同一条 `run_command` 契约、同一套
         // kill-before-close 与心跳读。ChannelRegistry 在这里只起「通道计数」的
         // 诊断作用，每次调用给一个新的即可。
@@ -273,7 +289,12 @@ impl McpCommand {
 }
 
 impl CommandPort for McpCommand {
-    fn run(&self, session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>> {
+    fn run(
+        &self,
+        session_id: &str,
+        command: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>> {
         let session_id = session_id.to_string();
         let command = command.to_string();
         Box::pin(async move {
@@ -283,6 +304,7 @@ impl CommandPort for McpCommand {
                     command,
                     mode: ExecMode::Exec,
                 },
+                generation,
             )
             .await
         })
@@ -326,12 +348,18 @@ impl McpSftp {
 }
 
 impl SftpPort for McpSftp {
-    fn list(&self, session_id: &str, path: &str) -> Fut<'_, PortResult<String>> {
+    fn list(
+        &self,
+        session_id: &str,
+        path: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
-            let (session, _guard) = authorized_session(&self.state, &session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             let port = self.exec_port(session);
             obs_to_text(port.list_remote_dir(&path).await)
         })
@@ -342,12 +370,14 @@ impl SftpPort for McpSftp {
         session_id: &str,
         path: &str,
         max_bytes: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
-            let (session, _guard) = authorized_session(&self.state, &session_id).await?;
+            let (session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             let port = self.exec_port(session);
             let obs = port
                 .read_remote_file(
@@ -359,14 +389,21 @@ impl SftpPort for McpSftp {
         })
     }
 
-    fn write(&self, session_id: &str, path: &str, content: &str) -> Fut<'_, PortResult<()>> {
+    fn write(
+        &self,
+        session_id: &str,
+        path: &str,
+        content: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         let session_id = session_id.to_string();
         let path = path.to_string();
         let content = content.as_bytes().to_vec();
         Box::pin(async move {
             // 走 SFTP 子系统（与传输/文件面板同一条通道管理），不走 exec：
             // 内容经 `cat >` 管道要过一层远端 shell 转义，二进制内容会被破坏。
-            let (_session, _guard) = authorized_session(&self.state, &session_id).await?;
+            let (_session, _guard) =
+                authorized_session(&self.state, &session_id, generation).await?;
             let ops = self.state.sftp_ops_for(&session_id).await?;
             // write_at 带 CREATE 但**不截断**：先写到 0 偏移，再把文件截到内容长度，
             // 才是「替换」语义——否则新内容比旧文件短时，尾巴上会留着旧文件的残片。

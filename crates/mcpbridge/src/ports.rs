@@ -94,29 +94,52 @@ pub trait TerminalPort: Send + Sync {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>>;
 
     /// 往终端写 payload（像用户敲进去一样）。
-    fn send(&self, session_id: &str, payload: &str) -> Fut<'_, PortResult<()>>;
+    fn send(
+        &self,
+        session_id: &str,
+        payload: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>>;
 }
 
 /// 命令执行。走 §4.4 `run_command` 契约（超时/截断/观察值），
 /// **实现只有一份**（`fs_ai::exec::run_command`），由 app 层的端口转调。
 pub trait CommandPort: Send + Sync {
-    fn run(&self, session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>>;
+    fn run(
+        &self,
+        session_id: &str,
+        command: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>>;
 }
 
 /// SFTP 三件事。
 pub trait SftpPort: Send + Sync {
-    fn list(&self, session_id: &str, path: &str) -> Fut<'_, PortResult<String>>;
+    fn list(
+        &self,
+        session_id: &str,
+        path: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>>;
     fn read(
         &self,
         session_id: &str,
         path: &str,
         max_bytes: Option<usize>,
+        generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>>;
     /// 内容内联。与 Agent 的 `sftp_put`（本地源 → 远端目的）不是同一个操作。
-    fn write(&self, session_id: &str, path: &str, content: &str) -> Fut<'_, PortResult<()>>;
+    fn write(
+        &self,
+        session_id: &str,
+        path: &str,
+        content: &str,
+        generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>>;
 }
 
 /// 用户在确认框上做了什么。

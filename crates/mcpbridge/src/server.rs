@@ -179,6 +179,11 @@ pub async fn call(
     };
     debug_assert_eq!(tool.name(), name, "解析出来的工具名必须就是请求的那个");
 
+    // 在任何异步授权检查前固定目标连接代次，确认等待与执行都使用这份绑定。
+    let binding = tool
+        .session_id()
+        .and_then(|sid| ports.management.generation(sid));
+
     // ── ③ 会话在不在（分类之前）────────────────────────────────────────
     if let Some(sid) = tool.session_id() {
         if !ports.sessions.is_alive(sid) {
@@ -211,10 +216,6 @@ pub async fn call(
         }
         _ => None,
     };
-
-    let binding = tool
-        .session_id()
-        .and_then(|sid| ports.management.generation(sid));
 
     // ── ④ 分类 ────────────────────────────────────────────────────────
     let gated = classify_for_mcp(&tool, &ctx.caller);
@@ -355,7 +356,7 @@ async fn dispatch_after_gate(
             operation_error = Some(e);
             Err(message)
         }
-        None => execute(&tool, ports).await,
+        None => execute(&tool, ports, binding).await,
     };
 
     // 会话真的开起来了才记台账——在「用户批准」那一刻记，会让一次因为
@@ -509,7 +510,11 @@ struct Executed {
 /// 都没被调过），那次是靠调用计数断言逮住的。
 /// 它**不脱敏**——端口适配器不该知道什么是机密。脱敏在唯一的那一处
 /// （`dispatch_after_gate` 里执行返回之后），回包与审计行共用同一份。
-async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> {
+async fn execute(
+    tool: &McpTool,
+    ports: &Ports<'_>,
+    binding: Option<u64>,
+) -> Result<Executed, String> {
     let plain = |text: String| Executed {
         text,
         structured: None,
@@ -553,7 +558,7 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
             max_lines,
         } => ports
             .terminal
-            .read_text(session_id, *source, *max_lines)
+            .read_text(session_id, *source, *max_lines, binding)
             .await
             .map(plain),
         McpTool::TerminalSend {
@@ -565,14 +570,14 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
             payload,
         } => ports
             .terminal
-            .send(session_id, payload)
+            .send(session_id, payload, binding)
             .await
             .map(|()| plain(format!("已发送 {} 字节", payload.len()))),
         McpTool::CommandRun {
             session_id,
             command,
         } => {
-            let obs = ports.command.run(session_id, command).await?;
+            let obs = ports.command.run(session_id, command, binding).await?;
             // `Observation` 的 snake_case serde 输出直接进 structured_content
             // （rmcp spike 结论）。文本一路给模型读，结构化一路给程序读。
             let structured = serde_json::to_value(&obs).ok();
@@ -591,7 +596,7 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
             })
         }
         McpTool::SftpList { session_id, path } => {
-            ports.sftp.list(session_id, path).await.map(plain)
+            ports.sftp.list(session_id, path, binding).await.map(plain)
         }
         McpTool::SftpRead {
             session_id,
@@ -599,7 +604,7 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
             max_bytes,
         } => ports
             .sftp
-            .read(session_id, path, *max_bytes)
+            .read(session_id, path, *max_bytes, binding)
             .await
             .map(plain),
         McpTool::SftpWrite {
@@ -608,7 +613,7 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
             content,
         } => ports
             .sftp
-            .write(session_id, path, content)
+            .write(session_id, path, content, binding)
             .await
             .map(|()| plain(format!("已写入 {path}（{} 字节）", content.len()))),
     }
@@ -841,6 +846,7 @@ mod tests {
         calls: std::sync::Arc<Calls>,
         text: String,
         deny_at_execution: bool,
+        current_generation: Option<std::sync::Arc<AtomicUsize>>,
     }
 
     impl TerminalPort for Term {
@@ -849,19 +855,38 @@ mod tests {
             _s: &str,
             _src: ReadSource,
             _m: Option<usize>,
+            generation: Option<u64>,
         ) -> F<'_, PortResult<String>> {
-            self.calls.read_text.fetch_add(1, SeqCst);
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             let t = self.text.clone();
             let denied = self.deny_at_execution;
+            let changed = self
+                .current_generation
+                .as_ref()
+                .is_some_and(|current| generation != Some(current.load(SeqCst) as u64 + 1));
+            if !changed {
+                self.calls.read_text.fetch_add(1, SeqCst);
+            }
             Box::pin(async move {
-                if denied {
+                if changed {
+                    Err(crate::ports::SESSION_UNAVAILABLE.into())
+                } else if denied {
                     Err(crate::ports::SESSION_FORBIDDEN.into())
                 } else {
                     Ok(t)
                 }
             })
         }
-        fn send(&self, _s: &str, _p: &str) -> F<'_, PortResult<()>> {
+        fn send(&self, _s: &str, _p: &str, generation: Option<u64>) -> F<'_, PortResult<()>> {
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             self.calls.send.fetch_add(1, SeqCst);
             Box::pin(async move { Ok(()) })
         }
@@ -874,7 +899,17 @@ mod tests {
     }
 
     impl CommandPort for Cmd {
-        fn run(&self, _s: &str, _c: &str) -> F<'_, PortResult<Observation>> {
+        fn run(
+            &self,
+            _s: &str,
+            _c: &str,
+            generation: Option<u64>,
+        ) -> F<'_, PortResult<Observation>> {
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             self.calls.run.fetch_add(1, SeqCst);
             let o = self.obs.clone();
             Box::pin(async move { Ok(o) })
@@ -886,15 +921,42 @@ mod tests {
     }
 
     impl SftpPort for Sftp {
-        fn list(&self, _s: &str, _p: &str) -> F<'_, PortResult<String>> {
+        fn list(&self, _s: &str, _p: &str, generation: Option<u64>) -> F<'_, PortResult<String>> {
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             self.calls.sftp_list.fetch_add(1, SeqCst);
             Box::pin(async move { Ok("a\nb\n".to_string()) })
         }
-        fn read(&self, _s: &str, _p: &str, _m: Option<usize>) -> F<'_, PortResult<String>> {
+        fn read(
+            &self,
+            _s: &str,
+            _p: &str,
+            _m: Option<usize>,
+            generation: Option<u64>,
+        ) -> F<'_, PortResult<String>> {
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             self.calls.sftp_read.fetch_add(1, SeqCst);
             Box::pin(async move { Ok("file body".to_string()) })
         }
-        fn write(&self, _s: &str, _p: &str, _c: &str) -> F<'_, PortResult<()>> {
+        fn write(
+            &self,
+            _s: &str,
+            _p: &str,
+            _c: &str,
+            generation: Option<u64>,
+        ) -> F<'_, PortResult<()>> {
+            assert_eq!(
+                generation,
+                Some(1),
+                "original session generation must reach the port"
+            );
             self.calls.sftp_write.fetch_add(1, SeqCst);
             Box::pin(async move { Ok(()) })
         }
@@ -973,6 +1035,7 @@ mod tests {
         rows: Mutex<Vec<Row>>,
         /// 第几次调用开始失败（1 = 第一次就失败）。0 = 永不失败。
         fail_from: usize,
+        change_generation_on_intent: Option<std::sync::Arc<AtomicUsize>>,
     }
 
     impl Audit {
@@ -980,6 +1043,7 @@ mod tests {
             Self {
                 rows: Default::default(),
                 fail_from: n,
+                change_generation_on_intent: None,
             }
         }
         fn phases(&self) -> Vec<RecordPhase> {
@@ -1014,6 +1078,11 @@ mod tests {
 
     impl McpAuditPort for Audit {
         fn append(&self, rec: McpCallRecord) -> F<'_, PortResult<()>> {
+            if rec.phase == RecordPhase::Intent {
+                if let Some(generation) = &self.change_generation_on_intent {
+                    generation.fetch_add(1, SeqCst);
+                }
+            }
             let mut rows = self.rows.lock().unwrap();
             let nth = rows.len() + 1;
             rows.push(Row {
@@ -1066,6 +1135,7 @@ mod tests {
                     calls: calls.clone(),
                     text: "screen text".into(),
                     deny_at_execution: false,
+                    current_generation: None,
                 },
                 cmd: Cmd {
                     calls: calls.clone(),
@@ -1184,6 +1254,18 @@ mod tests {
             .await;
         assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
         assert_eq!(r.audit.verdicts().last(), Some(&McpVerdict::Denied));
+    }
+
+    #[tokio::test]
+    async fn session_replaced_during_intent_audit_does_not_execute_on_new_generation() {
+        let mut r = Rig::new();
+        r.term.current_generation = Some(r.management.generation.clone());
+        r.audit.change_generation_on_intent = Some(r.management.generation.clone());
+        let out = r
+            .call("terminal.read", r#"{"session_id":"s1","source":"screen"}"#)
+            .await;
+        assert_eq!(out.error_code(), Some("FS_MCP_TARGET_UNAVAILABLE"));
+        assert_eq!(r.calls.read_text.load(SeqCst), 0);
     }
 
     /// A1 不存在的工具名 + 畸形参数 ⇒ 不许报 `BadArgs`。

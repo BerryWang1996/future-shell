@@ -103,6 +103,7 @@ impl TerminalPort for Term {
         _session_id: &str,
         _source: ReadSource,
         _max_lines: Option<usize>,
+        _generation: Option<u64>,
     ) -> Fut<'_, PortResult<String>> {
         // 故意回吐一个已知机密：脱敏必须发生在字节**离开本进程之前**。
         // 端口自己不脱敏（ports.rs 明写脱敏统一在 server.rs 做，
@@ -110,14 +111,24 @@ impl TerminalPort for Term {
         // 由协议对面收到的东西来判断那个唯一的脱敏点在不在。
         Box::pin(async { Ok("$ echo hunter2\nhunter2\n".to_string()) })
     }
-    fn send(&self, _session_id: &str, _payload: &str) -> Fut<'_, PortResult<()>> {
+    fn send(
+        &self,
+        _session_id: &str,
+        _payload: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
 
 struct Cmd;
 impl CommandPort for Cmd {
-    fn run(&self, _session_id: &str, command: &str) -> Fut<'_, PortResult<Observation>> {
+    fn run(
+        &self,
+        _session_id: &str,
+        command: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<Observation>> {
         let c = command.to_string();
         Box::pin(async move {
             Ok(Observation {
@@ -133,13 +144,25 @@ impl CommandPort for Cmd {
 
 struct Sftp;
 impl SftpPort for Sftp {
-    fn list(&self, _s: &str, _p: &str) -> Fut<'_, PortResult<String>> {
+    fn list(&self, _s: &str, _p: &str, _generation: Option<u64>) -> Fut<'_, PortResult<String>> {
         Box::pin(async { Ok("a.txt\n".to_string()) })
     }
-    fn read(&self, _s: &str, _p: &str, _m: Option<usize>) -> Fut<'_, PortResult<String>> {
+    fn read(
+        &self,
+        _s: &str,
+        _p: &str,
+        _m: Option<usize>,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<String>> {
         Box::pin(async { Ok("body".to_string()) })
     }
-    fn write(&self, _s: &str, _p: &str, _c: &str) -> Fut<'_, PortResult<()>> {
+    fn write(
+        &self,
+        _s: &str,
+        _p: &str,
+        _c: &str,
+        _generation: Option<u64>,
+    ) -> Fut<'_, PortResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
