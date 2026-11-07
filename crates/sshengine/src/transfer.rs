@@ -911,9 +911,76 @@ async fn run_transfer(
     };
     let total = ident.size;
 
+    // MCP 不覆盖模式为每次任务使用单独的、排他创建的临时件。
+    // 固定 .fspart/.fsmeta 是 GUI 的续传约定，不能覆盖其他人的同名文件。
+    let final_remote = job.remote.clone();
+    let final_local = local.clone();
+    let mut job = job;
+    let mut local = local;
+    if options.no_replace {
+        let suffix = format!(".{}", uuid::Uuid::new_v4());
+        match job.direction {
+            Direction::Up => {
+                job.remote.push_str(&suffix);
+                let part = remote_part(&job.remote);
+                let meta = remote_meta(&job.remote);
+                let writer = match ops.create_exclusive(&part).await {
+                    Ok(w) => w,
+                    Err(e) => fail!(total, "创建私有临时件失败: {e}"),
+                };
+                if let Err(e) = writer.finish().await {
+                    fail!(total, "关闭临时件失败: {e}");
+                }
+                let mut writer = match ops.create_exclusive(&meta).await {
+                    Ok(w) => w,
+                    Err(e) => fail!(total, "创建私有身份记录失败: {e}"),
+                };
+                if let Err(e) = writer.write(&identity_bytes(&ident)).await {
+                    fail!(total, "写身份记录失败: {e}");
+                }
+                if let Err(e) = writer.finish().await {
+                    fail!(total, "关闭身份记录失败: {e}");
+                }
+            }
+            Direction::Down => {
+                let mut name = local.into_os_string();
+                name.push(&suffix);
+                local = PathBuf::from(name);
+                let part = local_part(&local);
+                let meta = local_meta(&local);
+                let mut part_options = tokio::fs::OpenOptions::new();
+                part_options.write(true).create_new(true);
+                #[cfg(unix)]
+                part_options.mode(0o600);
+                if let Err(e) = part_options.open(&part).await {
+                    fail!(total, "创建私有临时件失败: {e}");
+                }
+                let mut meta_options = tokio::fs::OpenOptions::new();
+                meta_options.write(true).create_new(true);
+                #[cfg(unix)]
+                meta_options.mode(0o600);
+                let mut file = match meta_options.open(&meta).await {
+                    Ok(f) => f,
+                    Err(e) => fail!(total, "创建私有身份记录失败: {e}"),
+                };
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = file.write_all(&identity_bytes(&ident)).await {
+                    fail!(total, "写身份记录失败: {e}");
+                }
+                if let Err(e) = file.flush().await {
+                    fail!(total, "刷新身份记录失败: {e}");
+                }
+            }
+        }
+    }
+
     // 临时件准备 + 真实起点重算（审计 P0-2 / P1-5 / 审计2 #9）。前端给的只是 `resume: bool`，
     // 起点一律以临时件实际长度为准，且只有伴生身份记录逐字段吻合时才认这个起点。
-    let mut offset = match prepare_part(&job, &local, &ops, total, &ident).await {
+    let mut offset = match if options.no_replace {
+        Ok(0)
+    } else {
+        prepare_part(&job, &local, &ops, total, &ident).await
+    } {
         Ok(o) => o,
         Err(e) => fail!(total, "准备临时件失败: {e}"),
     };
@@ -963,7 +1030,16 @@ async fn run_transfer(
                         .await;
                     return;
                 }
-                if let Err(e) = commit(&job, &local, &ops, options.no_replace).await {
+                if let Err(e) = commit(
+                    &job,
+                    &local,
+                    &ops,
+                    options.no_replace,
+                    &final_remote,
+                    &final_local,
+                )
+                .await
+                {
                     // 提交失败同样保留临时件：数据已经完整落在 `.fspart` 上，只是没能改名，
                     // 报 Failed 让用户重来一次远比丢掉一整轮传输好。
                     let _ = ev
@@ -1304,6 +1380,8 @@ async fn commit(
     local: &Path,
     ops: &Arc<dyn SftpOps>,
     no_replace: bool,
+    final_remote: &str,
+    final_local: &Path,
 ) -> Result<(), crate::Error> {
     match job.direction {
         Direction::Up => {
@@ -1319,7 +1397,7 @@ async fn commit(
                 ))
             })?;
             if no_replace {
-                return ops.rename_no_replace(&part, &job.remote).await;
+                return ops.rename_no_replace(&part, final_remote).await;
             }
             let first = match ops.rename(&part, &job.remote).await {
                 Ok(()) => return Ok(()),
@@ -1397,14 +1475,14 @@ async fn commit(
                     .sandbox_root
                     .as_ref()
                     .ok_or_else(|| crate::Error::Transfer("download sandbox missing".into()))?;
-                let checked = crate::sandbox::resolve_within(root, local)?;
-                if checked != local {
+                let checked = crate::sandbox::resolve_within(root, final_local)?;
+                if checked != final_local {
                     return Err(crate::Error::Transfer(
                         "download destination changed".into(),
                     ));
                 }
                 crate::sandbox::reject_symlink_leaf(&part)?;
-                tokio::fs::hard_link(&part, local).await?;
+                tokio::fs::hard_link(&part, final_local).await?;
                 // 交付已完成，残留临时件清理失败不能把结果改为失败。
                 let _ = tokio::fs::remove_file(&part).await;
                 return Ok(());

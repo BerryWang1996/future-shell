@@ -161,8 +161,45 @@ impl FakeFs {
     }
 }
 
+struct FakeExclusiveWriter<'a> {
+    fs: &'a FakeFs,
+    path: String,
+    offset: u64,
+}
+
+#[async_trait::async_trait]
+impl fs_sshengine::sftp::RemoteWriter for FakeExclusiveWriter<'_> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), fs_sshengine::Error> {
+        self.fs.write_at(&self.path, self.offset, data).await?;
+        self.offset += data.len() as u64;
+        Ok(())
+    }
+    fn confirmed(&self) -> u64 {
+        self.offset
+    }
+    async fn finish(self: Box<Self>) -> Result<(), fs_sshengine::Error> {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl SftpOps for FakeFs {
+    async fn create_exclusive<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Result<Box<dyn fs_sshengine::sftp::RemoteWriter + 'a>, fs_sshengine::Error> {
+        let mut files = self.files.lock().unwrap();
+        if files.contains_key(path) {
+            return Err(fs_sshengine::Error::Sftp("exists".into()));
+        }
+        files.insert(path.to_string(), Vec::new());
+        Ok(Box::new(FakeExclusiveWriter {
+            fs: self,
+            path: path.to_string(),
+            offset: 0,
+        }))
+    }
+
     async fn list(
         &self,
         path: &str,
@@ -3326,6 +3363,14 @@ async fn no_replace_upload_keeps_existing_destination_and_pinned_source() {
         .lock()
         .unwrap()
         .insert("/keep".into(), b"original".to_vec());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/new.fspart".into(), b"existing part".to_vec());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/new.fspart.fsmeta".into(), b"existing meta".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let local = dir.path().join("source");
     std::fs::write(&local, b"captured").unwrap();
@@ -3355,6 +3400,14 @@ async fn no_replace_upload_keeps_existing_destination_and_pinned_source() {
         TransferState::Done
     ));
     assert_eq!(fs.get("/new").unwrap(), b"captured");
+    assert_eq!(
+        fs.get("/new.fspart").as_deref(),
+        Some(b"existing part".as_slice())
+    );
+    assert_eq!(
+        fs.get("/new.fspart.fsmeta").as_deref(),
+        Some(b"existing meta".as_slice())
+    );
     let id = manager
         .submit_with_options(up_job(local, "/keep", "mcp-conflict"), options)
         .await
@@ -3377,6 +3430,10 @@ async fn no_replace_download_commits_new_file_but_preserves_existing_file() {
         .insert("/remote".into(), b"download".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("local");
+    let part = dir.path().join("local.fspart");
+    let meta = dir.path().join("local.fspart.fsmeta");
+    std::fs::write(&part, b"existing part").unwrap();
+    std::fs::write(&meta, b"existing meta").unwrap();
     let manager = TransferManager::spawn(fs, 1);
     let mut events = manager.events().await;
     let options = TransferOptions {
@@ -3395,6 +3452,8 @@ async fn no_replace_download_commits_new_file_but_preserves_existing_file() {
         TransferState::Done
     ));
     assert_eq!(std::fs::read(&dest).unwrap(), b"download");
+    assert_eq!(std::fs::read(&part).unwrap(), b"existing part");
+    assert_eq!(std::fs::read(&meta).unwrap(), b"existing meta");
     std::fs::write(&dest, b"existing").unwrap();
     let id = manager
         .submit_with_options(
@@ -3409,4 +3468,193 @@ async fn no_replace_download_commits_new_file_but_preserves_existing_file() {
     ));
     assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
     assert!(manager.shutdown(Duration::from_secs(2)).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_replace_download_preserves_existing_part_and_meta_symlinks() {
+    use fs_sshengine::transfer::TransferOptions;
+    use std::os::unix::fs::symlink;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/remote".into(), b"download".to_vec());
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("local");
+    let outside = dir.path().join("other");
+    std::fs::write(&outside, b"untouched").unwrap();
+    let part = dir.path().join("local.fspart");
+    let meta = dir.path().join("local.fspart.fsmeta");
+    symlink(&outside, &part).unwrap();
+    symlink(&outside, &meta).unwrap();
+    let mgr = TransferManager::spawn(fs, 1);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit_with_options(
+            down_job(dest.clone(), "/remote", dir.path().into()),
+            TransferOptions {
+                no_replace: true,
+                upload_source: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut ev, id).await,
+        TransferState::Done
+    ));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"download");
+    assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+    assert_eq!(std::fs::read_link(&part).unwrap(), outside);
+    assert_eq!(std::fs::read_link(&meta).unwrap(), outside);
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_download_retries_with_its_private_part() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/remote".into(), vec![7; 4096]);
+    *fs.fail_next_reads.lock().unwrap() = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("local");
+    let part = dir.path().join("local.fspart");
+    std::fs::write(&part, b"original").unwrap();
+    let mgr = TransferManager::spawn(fs, 1);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit_with_options(
+            down_job(dest.clone(), "/remote", dir.path().into()),
+            TransferOptions {
+                no_replace: true,
+                upload_source: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut ev, id).await,
+        TransferState::Done
+    ));
+    assert_eq!(std::fs::read(&dest).unwrap(), vec![7; 4096]);
+    assert_eq!(std::fs::read(&part).unwrap(), b"original");
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_cancel_preserves_existing_parts() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/remote".into(), vec![7; CHUNK * 4]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("local");
+    let part = dir.path().join("local.fspart");
+    let meta = dir.path().join("local.fspart.fsmeta");
+    std::fs::write(&part, b"original part").unwrap();
+    std::fs::write(&meta, b"original meta").unwrap();
+    let mgr = TransferManager::spawn(fs, 1);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit_with_options(
+            down_job(dest.clone(), "/remote", dir.path().into()),
+            TransferOptions {
+                no_replace: true,
+                upload_source: None,
+            },
+        )
+        .await
+        .unwrap();
+    mgr.cancel(id).await;
+    assert!(matches!(
+        drain_to_terminal(&mut ev, id).await,
+        TransferState::Cancelled
+    ));
+    assert!(!dest.exists());
+    assert_eq!(std::fs::read(&part).unwrap(), b"original part");
+    assert_eq!(std::fs::read(&meta).unwrap(), b"original meta");
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_upload_retries_and_preserves_existing_parts() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/upload.fspart".into(), b"original part".to_vec());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/upload.fspart.fsmeta".into(), b"original meta".to_vec());
+    *fs.fail_next_writes.lock().unwrap() = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source");
+    std::fs::write(&src, vec![7; CHUNK + 20]).unwrap();
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit_with_options(
+            up_job(src, "/upload", "retry-private"),
+            TransferOptions {
+                no_replace: true,
+                upload_source: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        drain_to_terminal(&mut ev, id).await,
+        TransferState::Done
+    ));
+    assert_eq!(fs.get("/upload").unwrap(), vec![7; CHUNK + 20]);
+    assert_eq!(fs.get("/upload.fspart").unwrap(), b"original part");
+    assert_eq!(fs.get("/upload.fspart.fsmeta").unwrap(), b"original meta");
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn no_replace_upload_cancel_preserves_existing_parts() {
+    use fs_sshengine::transfer::TransferOptions;
+    let fs = Arc::new(FakeFs::default());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/upload.fspart".into(), b"original part".to_vec());
+    fs.files
+        .lock()
+        .unwrap()
+        .insert("/upload.fspart.fsmeta".into(), b"original meta".to_vec());
+    *fs.write_delay_ms.lock().unwrap() = 30;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source");
+    std::fs::write(&src, vec![7; CHUNK * 4]).unwrap();
+    let mgr = TransferManager::spawn(fs.clone(), 1);
+    let mut ev = mgr.events().await;
+    let id = mgr
+        .submit_with_options(
+            up_job(src, "/upload", "cancel-private"),
+            TransferOptions {
+                no_replace: true,
+                upload_source: None,
+            },
+        )
+        .await
+        .unwrap();
+    mgr.cancel(id).await;
+    assert!(matches!(
+        drain_to_terminal(&mut ev, id).await,
+        TransferState::Cancelled
+    ));
+    assert_eq!(fs.get("/upload"), None);
+    assert_eq!(fs.get("/upload.fspart").unwrap(), b"original part");
+    assert_eq!(fs.get("/upload.fspart.fsmeta").unwrap(), b"original meta");
+    assert!(mgr.shutdown(Duration::from_secs(2)).await);
 }
