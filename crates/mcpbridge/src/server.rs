@@ -194,6 +194,9 @@ pub async fn call(
             }
             return no_such_session();
         }
+        if !matches!(tool, McpTool::Managed(_)) && !ports.sessions.session_allowed(sid).await {
+            return CallOutput::err(ToolError::forbidden(crate::ports::SESSION_FORBIDDEN));
+        }
     }
 
     // `sessions.open` 的第二道门：profile 必须被标记允许 MCP 打开。
@@ -209,12 +212,9 @@ pub async fn call(
         _ => None,
     };
 
-    let binding = match &tool {
-        McpTool::Managed(op) => op
-            .session_id()
-            .and_then(|sid| ports.management.generation(sid)),
-        _ => None,
-    };
+    let binding = tool
+        .session_id()
+        .and_then(|sid| ports.management.generation(sid));
 
     // ── ④ 分类 ────────────────────────────────────────────────────────
     let gated = classify_for_mcp(&tool, &ctx.caller);
@@ -298,6 +298,26 @@ async fn dispatch_after_gate(
         }
     }
 
+    if !matches!(tool, McpTool::Managed(_)) {
+        if let Some(sid) = tool.session_id() {
+            if binding.is_none() || ports.management.generation(sid) != binding {
+                let e = ToolError {
+                    is_error: true,
+                    code: "FS_MCP_TARGET_UNAVAILABLE",
+                    tier: None,
+                    confirmation_required: false,
+                    message: crate::ports::SESSION_UNAVAILABLE.into(),
+                    details: None,
+                };
+                return settle(&tool, &gated, ctx, ports, McpVerdict::Denied, None, None, e).await;
+            }
+            if !ports.sessions.session_allowed(sid).await {
+                let e = ToolError::forbidden(crate::ports::SESSION_FORBIDDEN);
+                return settle(&tool, &gated, ctx, ports, McpVerdict::Denied, None, None, e).await;
+            }
+        }
+    }
+
     // ── ⑦ 审计（Intent）：写不进去就不执行 ──────────────────────────────
     let intent = McpCallRecord {
         phase: RecordPhase::Intent,
@@ -367,7 +387,15 @@ async fn dispatch_after_gate(
         display: fs_ai::agent::record::RedactedAction::new(&raw_display, &ctx.known_secrets),
         session_id: tool.session_id().map(|s| s.to_string()),
         tier: gated.tier(),
-        verdict,
+        verdict: if ran
+            .as_ref()
+            .err()
+            .is_some_and(|e| e == crate::ports::SESSION_FORBIDDEN)
+        {
+            McpVerdict::Denied
+        } else {
+            verdict
+        },
         rules: rules_of(&gated),
         exit_code,
         output: Some(text.clone()),
@@ -396,6 +424,28 @@ async fn dispatch_after_gate(
                         .collect::<Vec<_>>(),
                 )
             }),
+        });
+    }
+
+    if ran
+        .as_ref()
+        .err()
+        .is_some_and(|e| e == crate::ports::SESSION_FORBIDDEN)
+    {
+        return CallOutput::err(ToolError::forbidden(crate::ports::SESSION_FORBIDDEN));
+    }
+    if ran
+        .as_ref()
+        .err()
+        .is_some_and(|e| e == crate::ports::SESSION_UNAVAILABLE)
+    {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: "FS_MCP_TARGET_UNAVAILABLE",
+            tier: Some(gated.tier().as_str()),
+            confirmation_required: false,
+            message: crate::ports::SESSION_UNAVAILABLE.into(),
+            details: None,
         });
     }
 
@@ -722,6 +772,7 @@ mod tests {
         alive_until: usize,
         allowed: Mutex<std::collections::BTreeMap<String, bool>>,
         revoke_after_lookup: bool,
+        session_permissions: Mutex<std::collections::VecDeque<bool>>,
         open_result: Mutex<PortResult<String>>,
         sessions: Vec<SessionSummary>,
     }
@@ -733,6 +784,7 @@ mod tests {
                 alive_until: usize::MAX,
                 allowed: Mutex::new(Default::default()),
                 revoke_after_lookup: false,
+                session_permissions: Mutex::new(Default::default()),
                 open_result: Mutex::new(Ok("new-session".to_string())),
                 sessions: vec![SessionSummary {
                     id: "s1".into(),
@@ -768,6 +820,15 @@ mod tests {
             };
             Box::pin(async move { v })
         }
+        fn session_allowed(&self, _sid: &str) -> F<'_, bool> {
+            let allowed = self
+                .session_permissions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(true);
+            Box::pin(async move { allowed })
+        }
         fn open(&self, _pid: &str) -> F<'_, PortResult<String>> {
             self.calls.open.fetch_add(1, SeqCst);
             let r = self.open_result.lock().unwrap().clone();
@@ -779,6 +840,7 @@ mod tests {
     struct Term {
         calls: std::sync::Arc<Calls>,
         text: String,
+        deny_at_execution: bool,
     }
 
     impl TerminalPort for Term {
@@ -790,7 +852,14 @@ mod tests {
         ) -> F<'_, PortResult<String>> {
             self.calls.read_text.fetch_add(1, SeqCst);
             let t = self.text.clone();
-            Box::pin(async move { Ok(t) })
+            let denied = self.deny_at_execution;
+            Box::pin(async move {
+                if denied {
+                    Err(crate::ports::SESSION_FORBIDDEN.into())
+                } else {
+                    Ok(t)
+                }
+            })
         }
         fn send(&self, _s: &str, _p: &str) -> F<'_, PortResult<()>> {
             self.calls.send.fetch_add(1, SeqCst);
@@ -996,6 +1065,7 @@ mod tests {
                 term: Term {
                     calls: calls.clone(),
                     text: "screen text".into(),
+                    deny_at_execution: false,
                 },
                 cmd: Cmd {
                     calls: calls.clone(),
@@ -1041,6 +1111,80 @@ mod tests {
     }
 
     // ══ ① 顺序：解析 → 授权 → 会话 → 分类 → 裁决 ═══════════════════════
+
+    #[tokio::test]
+    async fn legacy_session_tools_reject_disallowed_or_revoked_profiles() {
+        let tools = [
+            ("terminal.read", r#"{"session_id":"s1","source":"screen"}"#),
+            ("terminal.send", r#"{"session_id":"s1","payload":"x"}"#),
+            ("terminal.send_raw", r#"{"session_id":"s1","payload":"x"}"#),
+            ("command.run", r#"{"session_id":"s1","command":"echo hi"}"#),
+            ("sftp.list", r#"{"session_id":"s1","path":"/tmp"}"#),
+            ("sftp.read", r#"{"session_id":"s1","path":"/tmp/x"}"#),
+            (
+                "sftp.write",
+                r#"{"session_id":"s1","path":"/tmp/x","content":"x"}"#,
+            ),
+        ];
+        for (name, args) in tools {
+            let mut r = Rig::new();
+            r.dir.session_permissions.lock().unwrap().push_back(false);
+            assert_eq!(
+                r.call(name, args).await.error_code(),
+                Some("FS_POLICY_FORBIDDEN"),
+                "{name}"
+            );
+            assert_eq!(r.calls.executed(), 0, "{name}");
+
+            let mut r = Rig::new();
+            r.dir
+                .session_permissions
+                .lock()
+                .unwrap()
+                .extend([true, false]);
+            assert_eq!(
+                r.call(name, args).await.error_code(),
+                Some("FS_POLICY_FORBIDDEN"),
+                "{name}"
+            );
+            assert_eq!(r.calls.executed(), 0, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_while_awaiting_confirmation_prevents_execution() {
+        let mut r = Rig::new();
+        r.dir
+            .session_permissions
+            .lock()
+            .unwrap()
+            .extend([true, false]);
+        let out = r.run_cmd("rm -rf /tmp/fixture").await;
+        assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
+        assert_eq!(r.conf.seen.lock().unwrap().len(), 1);
+        assert_eq!(r.calls.executed(), 0);
+    }
+
+    #[tokio::test]
+    async fn replaced_session_while_awaiting_confirmation_is_not_executed() {
+        let mut r = Rig::new();
+        r.conf.change_generation = Some(r.management.generation.clone());
+        let out = r.run_cmd("rm -rf /tmp/fixture").await;
+        assert_eq!(out.error_code(), Some("FS_MCP_TARGET_UNAVAILABLE"));
+        assert_eq!(r.conf.seen.lock().unwrap().len(), 1);
+        assert_eq!(r.calls.executed(), 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_failure_at_execution_is_an_error_and_is_audited_as_denied() {
+        let mut r = Rig::new();
+        r.term.deny_at_execution = true;
+        let out = r
+            .call("terminal.read", r#"{"session_id":"s1","source":"screen"}"#)
+            .await;
+        assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
+        assert_eq!(r.audit.verdicts().last(), Some(&McpVerdict::Denied));
+    }
 
     /// A1 不存在的工具名 + 畸形参数 ⇒ 不许报 `BadArgs`。
     ///

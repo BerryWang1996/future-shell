@@ -88,6 +88,9 @@ impl SessionDirectory for Dir {
     fn mcp_allowed(&self, _profile_id: &str) -> Fut<'_, Option<bool>> {
         Box::pin(async { Some(true) })
     }
+    fn session_allowed(&self, _session_id: &str) -> Fut<'_, bool> {
+        Box::pin(async { true })
+    }
     fn open(&self, _profile_id: &str) -> Fut<'_, PortResult<String>> {
         Box::pin(async { Ok("s-2".to_string()) })
     }

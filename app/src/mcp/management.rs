@@ -53,7 +53,7 @@ pub(crate) fn upload_root_key(profile_id: &str) -> String {
     format!("mcp.uploadRoot.{profile_id}")
 }
 
-async fn allowed(state: &AppState, profile_id: &str) -> bool {
+pub(crate) async fn allowed(state: &AppState, profile_id: &str) -> bool {
     let Ok(id) = uuid::Uuid::parse_str(profile_id) else {
         return false;
     };

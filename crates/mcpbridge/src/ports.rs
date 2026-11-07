@@ -25,6 +25,8 @@ use crate::tool::ReadSource;
 /// 把两者混为一谈会让审计里「被拦下」与「试过但失败」不可区分，
 /// 而这两件事在事后追查时的意义完全相反。
 pub type PortResult<T> = Result<T, String>;
+pub const SESSION_FORBIDDEN: &str = "该会话不可通过 MCP 使用";
+pub const SESSION_UNAVAILABLE: &str = "会话不可用或已变化";
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -73,6 +75,9 @@ pub trait SessionDirectory: Send + Sync {
     /// 要么缓存一份会过期的许可表，要么在异步上下文里阻塞等库——前者是
     /// 「用户刚取消许可、MCP 仍能开」，后者是卡住事件循环，都不可接受。
     fn mcp_allowed(&self, profile_id: &str) -> Fut<'_, Option<bool>>;
+
+    /// 当前会话绑定的原始 SSH 配置是否仍允许 MCP；错误或缺失均拒绝。
+    fn session_allowed(&self, session_id: &str) -> Fut<'_, bool>;
 
     /// 打开一个新会话，成功则给出新会话 id。
     fn open(&self, profile_id: &str) -> Fut<'_, PortResult<String>>;
