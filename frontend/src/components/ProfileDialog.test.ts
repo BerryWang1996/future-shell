@@ -126,6 +126,22 @@ async function openHostKeyTab(initial: any) {
   await fireEvent.click(screen.getByText("主机密钥"));
 }
 
+describe("ProfileDialog · MCP 连接授权", () => {
+  it("默认关闭，编辑后只修改 MCP 授权并保留其他 AI 策略", async () => {
+    calls.length = 0;
+    render(ProfileDialog, {
+      props: { open: true, initial: profile({ host_key_policy: "tofu", ai_policy: { auto_execute: "with_confirm" } }) },
+    });
+    await fireEvent.click(screen.getByRole("tab", { name: "AI" }));
+    const toggle = screen.getByRole("checkbox", { name: "允许 MCP 发现并打开此 SSH 连接" }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    await fireEvent.click(toggle);
+    await fireEvent.click(screen.getByTestId("pf-save"));
+    const saved = calls.find((call) => call.cmd === "profile_save");
+    expect(saved?.args?.profile.ai_policy).toEqual({ auto_execute: "with_confirm", mcp_allowed: true });
+  });
+});
+
 describe("ProfileDialog · 钉扎指纹", () => {
   beforeEach(() => {
     calls.length = 0;

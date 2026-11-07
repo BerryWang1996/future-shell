@@ -99,7 +99,7 @@ async fn session_open_impl(
     // Arc<AppState> 整体透传（原先是 app/registry/db/vault/pending 五个句柄各传各的）：
     // 装配链上新增的 `shutdown_session_subsystems`（P0-4/P0-5）要动 sftp_ops/transfers 两张表，
     // 它们只挂在 AppState 上；继续散着传等于每加一个子系统就要给 5 个函数各加一个参数。
-    open_session_core(state.inner().clone(), profile_id).await
+    open_session_core(state.inner().clone(), profile_id, false).await
 }
 
 /// 「按 profile 开一个新会话并装配进注册表」的共用本体，返回新 session_id。
@@ -111,6 +111,7 @@ async fn session_open_impl(
 pub(crate) async fn open_session_core(
     app_state: Arc<AppState>,
     profile_id: String,
+    require_mcp_permission: bool,
 ) -> Result<String, ConnectFailure> {
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -124,6 +125,11 @@ pub(crate) async fn open_session_core(
         .await
         .map_err(|e| ConnectFailure::bare(e.to_string()))?
     };
+    if require_mcp_permission && !profile.allows_mcp_ssh() {
+        return Err(ConnectFailure::bare(
+            "该连接已不可通过 MCP 打开。请重新查看可用连接。",
+        ));
+    }
     // 闭包要吃掉 profile；JoinError 那一路在闭包外映射，留一份只读克隆给它。
     let profile_for_err = profile.clone();
 

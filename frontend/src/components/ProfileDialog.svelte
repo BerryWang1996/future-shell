@@ -45,6 +45,7 @@
   // 协议（RDP 阶段 1）：切换时端口跟随默认（22/3389）。不改后端
   // default_port——那是 SSH 的语义，改它会让存量 profile 端口漂移。
   let protocol = $state<"ssh" | "rdp" | "serial">("ssh");
+  let mcpAllowed = $state(false);
   // 串口（M7.4）。端口名可选可填：枚举列表是**便利**不是白名单——容器里的 socat 伪终端、
   // Linux 上没被 sysfs 扫到的虚拟口，用户自己打得出来就该能连。
   let serialPort = $state("");
@@ -58,9 +59,9 @@
   let serialBauds = $state<number[]>([]);
   /** 串口档案上不成立的页签：没有认证、没有跳板、没有主机密钥、没有 SFTP。
    *  留着它们不是「多几个空页」——用户会在认证页配一遍密码然后奇怪为什么没用上。 */
-  const SERIAL_HIDDEN: readonly TabId[] = ["auth", "jump", "hostkey", "sftp", "env"];
+  const SERIAL_HIDDEN: readonly TabId[] = ["auth", "jump", "hostkey", "sftp", "ai", "env"];
   const visibleTabs = $derived(
-    TABS.filter((t) => t.id !== "ai" && (protocol === "serial" ? !SERIAL_HIDDEN.includes(t.id) : protocol === "rdp" ? ["general", "auth", "jump"].includes(t.id) : true)),
+    TABS.filter((t) => protocol === "serial" ? !SERIAL_HIDDEN.includes(t.id) : protocol === "rdp" ? ["general", "auth", "jump"].includes(t.id) : true),
   );
   let username = $state("");
   // 认证
@@ -259,6 +260,7 @@
     host = p?.host ?? "";
     port = p?.port ?? 22;
     protocol = p?.protocol ?? "ssh";
+    mcpAllowed = p?.ai_policy?.mcp_allowed === true;
     serialPort = p?.serial?.port ?? "";
     serialBaud = p?.serial?.baud ?? 115200;
     serialDataBits = p?.serial?.data_bits ?? "eight";
@@ -408,8 +410,7 @@
       env,
       term: termSettings,
       sftp,
-      // AI 页在 MVP 禁用：不发明取值，原样透传既有策略，避免「打开属性页点保存」把用户的设置抹成默认
-      ai_policy: initial?.ai_policy ?? blankAiPolicy(),
+      ai_policy: { ...(initial?.ai_policy ?? blankAiPolicy()), mcp_allowed: protocol === "ssh" && mcpAllowed },
     };
     saving = true;
     try {
@@ -1150,7 +1151,11 @@
             <label>远程目录 <input bind:value={remoteDir} /></label>
             <label>下载沙箱 <input bind:value={downloadSandbox} /></label>
           {:else if tab === "ai"}
-            <p class="hint">AI 功能请在「工具 → 选项（设置）→ AI」中配置。</p>
+            <label>
+              <input type="checkbox" bind:checked={mcpAllowed} />
+              允许 MCP 发现并打开此 SSH 连接
+            </label>
+            <p class="hint">外部客户端还需在「工具 → 选项（设置）→ AI」中获得对应工具的授权。</p>
           {:else if tab === "env"}
             {#each envRows as row, i (i)}
               <div class="envrow">

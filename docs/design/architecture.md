@@ -284,10 +284,12 @@ trait Provider {
 
 **Server 方向**（对外暴露给 Claude Desktop / Claude Code / Cursor 等）：
 
-- 工具：`sessions.list`、`sessions.open`⚠、`terminal.read`、`terminal.send`⚠、`command.run`⚠、`sftp.list`、`sftp.read`、`sftp.write`⚠（⚠ = 经策略引擎，与内置 Agent 同一闸门）。
+- 工具：`profiles.list`、`sessions.list`、`sessions.open`⚠、`terminal.read`、`terminal.send`⚠、`command.run`⚠、`sftp.list`、`sftp.read`、`sftp.write`⚠（⚠ = 经策略引擎，与内置 Agent 同一闸门）。
+  - `profiles.list`：独立授权的只读工具，仅返回已允许 MCP 使用的 SSH 配置 ID 和名称。配置权限由连接编辑器管理，外部 JSON 导入须在本机重新授权。
   - `sessions.open`⚠：经流 1 消耗 Vault 凭据连接任意主机，故 MCP 方向按 client + profile 首次打开需确认；或仅限 `ai_policy.mcp_allowed` 标记的 profile 可被打开。
   - `terminal.read(session_id, source: screen|scrollback|all, max_lines)`：返回 headless 网格纯文本（不含转义序列），经 §6.2 同一脱敏过滤器。
-  - `command.run` 共享 §4.4 `run_command` 契约（超时/截断/观察值）。
+  - `terminal.send` 支持可选的 `press_enter` 布尔参数。传 `true` 时，服务端将单行 `payload` 与一个 CR 作为一次输入发给当前 PTY，沿用显式 CR 的风险等级。空字符串可单独按 Enter。交互菜单或嵌套 SSH 中，每次提交后通过 `terminal.read` 查看提示符和结果。
+  - `command.run` 共享 §4.4 `run_command` 的超时、截断与观察值契约，使用 SSH 连接端点上的独立 exec 通道。
 - **MCP 确认契约**：⚠ 工具裁决为 `write`/`dangerous` 时，调用**阻塞等待** GUI 确认队列（入队 + 窗口闪烁/系统通知引导用户到 FutureShell）；默认超时 120 s（可配）。拒绝/超时/黑名单/上下文消亡分别返回结构化工具错误 `{isError: true, code: 'FS_POLICY_DENIED' | 'FS_POLICY_TIMEOUT' | 'FS_POLICY_FORBIDDEN' | 'FS_POLICY_ABORTED', tier, confirmation_required}`；`FORBIDDEN` 不可经确认放行。**stdio 传输下此契约是唯一的人机回路，不得静默放行。**
   - **`FS_POLICY_ABORTED`（2026-08-25 增补，M3 MCP 批次）**：等待确认期间目标上下文消亡（会话掉线 / 窗口销毁）。M3 实现规格 §10 把这个决定留给了 MCP 批次（「不得映射为 `FS_POLICY_TIMEOUT`；要么增补第四码，要么在传输层以断开表达」），此处取增补。
     - 不走传输层断开：MCP 会话与 SSH 会话是两回事，一个 SSH 会话掉线就掐掉整条 stdio 传输，会连带杀掉同一客户端上**别的**、与那台主机无关的调用。

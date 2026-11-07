@@ -189,6 +189,8 @@ impl<'a> ProfileRepo<'a> {
             p.host_key_pins.clear();
             // ③ 本地写边界授权（local_dir / remote_dir 是纯偏好，见上，故意保留）
             p.sftp.download_sandbox = None;
+            // 对外 MCP 访问是本机授权，由用户在导入后单独开启。
+            p.ai_policy.mcp_allowed = false;
 
             // 跳板链每一跳同剥。跳板不是「次要的一跳」——它是整条链上**第一个**拿到你流量的
             // 节点，逐跳字段被绕过与 Profile 级被绕过等价危险，只是换了个位置。

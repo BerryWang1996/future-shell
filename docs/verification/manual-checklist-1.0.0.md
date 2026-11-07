@@ -169,6 +169,11 @@
   单独关闭 MCP 免确认开关后，全局「无需确认」档仍可直接执行已授权操作。经实际 SSH 跳板验证，
   中文终端回显正常返回；本地测试口令仍替换为占位符。上述客户端为 MCP 验证脚本。
 
+  1.0.4 候选包使用 Codex CLI 连接隔离 SSH 环境。客户端只收到合成连接名和只读任务，
+  自行调用 `profiles.list` 并打开会话，在菜单里通过 `press_enter` 进入目标并读到主机名，
+  在直连 SSH 上用 `command.run` 取得另一个主机名。列表排除了未授权 SSH 和 RDP 配置。
+  授权撤销及外部 JSON 导入见 Rust 回归测试。
+
 ### V9 — MCP Client：挂真的 filesystem server
 
 - **出口原文**：挂载一个外部 server（filesystem 类），Agent 可调用且调用受同一策略闸门约束。

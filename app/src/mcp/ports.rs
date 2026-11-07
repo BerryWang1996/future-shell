@@ -21,7 +21,7 @@ use fs_connmgr::ProfileRepo;
 use fs_mcpbridge::confirm::{ConfirmTicket, MCP_CONFIRM_TIMEOUT};
 use fs_mcpbridge::ports::{
     CommandPort, ConfirmReply, McpAuditPort, McpCallRecord, McpConfirmPort, McpVerdict, PortResult,
-    SessionDirectory, SessionSummary, SftpPort, TerminalPort,
+    ProfileSummary, SessionDirectory, SessionSummary, SftpPort, TerminalPort,
 };
 use fs_mcpbridge::server::CallContext;
 use fs_mcpbridge::tool::ReadSource;
@@ -85,6 +85,26 @@ async fn profile_name_host(state: &AppState, profile_id: &str) -> (String, Strin
 }
 
 impl SessionDirectory for McpSessions {
+    fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
+        Box::pin(async move {
+            let profiles = ProfileRepo::new(self.state.db.pool())
+                .list()
+                .await
+                .map_err(|_| "无法读取可用连接配置，请在 FutureShell 中检查连接列表".to_string())?;
+            let mut summaries: Vec<_> = profiles
+                .into_iter()
+                .filter(fs_connmgr::Profile::allows_mcp_ssh)
+                .map(|p| ProfileSummary {
+                    profile_id: p.id.to_string(),
+                    name: p.name,
+                })
+                .collect();
+            summaries
+                .sort_unstable_by(|a, b| (&a.name, &a.profile_id).cmp(&(&b.name, &b.profile_id)));
+            Ok(summaries)
+        })
+    }
+
     fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
         Box::pin(async move {
             // 持表锁内只抄一份 (id, profile_id)，查库在锁外——查库是 await，
@@ -121,7 +141,7 @@ impl SessionDirectory for McpSessions {
                 return None; // 解析不出 uuid ⇒ 等同查无此 profile
             };
             match ProfileRepo::new(self.state.db.pool()).get(uuid).await {
-                Ok(p) => Some(p.ai_policy.mcp_allowed),
+                Ok(p) => Some(p.allows_mcp_ssh()),
                 Err(_) => None,
             }
         })
@@ -133,7 +153,7 @@ impl SessionDirectory for McpSessions {
             // 与前端「连接」走**同一条**装配序列（connect + establish + journal）。
             // PortResult 是 mcpbridge crate 定的 Result<T, String>，改不动；结构化失败
             // 在这条线上只留 summary（Display 原文）——MCP 客户端拿到的与此前一字不差。
-            crate::commands::session_cmd::open_session_core(self.state.clone(), profile_id)
+            crate::commands::session_cmd::open_session_core(self.state.clone(), profile_id, true)
                 .await
                 .map_err(|f| f.summary)
         })

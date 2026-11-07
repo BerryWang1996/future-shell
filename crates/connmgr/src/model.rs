@@ -240,6 +240,10 @@ pub mod limits {
 }
 
 impl Profile {
+    pub fn allows_mcp_ssh(&self) -> bool {
+        self.protocol == Protocol::Ssh && self.ai_policy.mcp_allowed
+    }
+
     /// 审计2 #37：保存/导入前的统一校验。返回**人可读**的第一条违规描述（中文，直出 UI）。
     ///
     /// 校验刻意放在 `fs_connmgr` 而非 app 命令层：`profile_save`（IPC）与 `import_json`
