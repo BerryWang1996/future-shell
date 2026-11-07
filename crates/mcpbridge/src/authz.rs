@@ -140,6 +140,11 @@ impl OpenLedger {
             .insert((caller.to_string(), profile_id.to_string()));
     }
 
+    /// 合并并发调用中已成功打开的记录；只增不减。
+    pub fn merge(&mut self, other: Self) {
+        self.seen.extend(other.seen);
+    }
+
     pub fn len(&self) -> usize {
         self.seen.len()
     }

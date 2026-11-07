@@ -55,9 +55,8 @@ pub struct McpServer {
     management: Arc<dyn crate::managed::ManagementPort>,
     ctx_source: Arc<dyn McpContextSource>,
     authz: Authorization,
-    /// `server::call` 要 `&mut OpenLedger`；stdio 上多个请求可能并发到达，故加锁。
-    /// 用 `tokio::sync::Mutex` 而非 std 的：守卫要**跨过** `server::call` 的 await，
-    /// std 锁守卫非 Send，会让整个 `call_tool` 的 future 不满足 `MaybeSendFuture`。
+    /// 并发请求各取快照；只在复制和合并成功记录时持锁。
+    /// 并发首次打开可能各自需要强确认，但不会跳过应有的确认。
     ledger: tokio::sync::Mutex<OpenLedger>,
     sessions: Arc<dyn SessionDirectory>,
     terminal: Arc<dyn TerminalPort>,
@@ -139,9 +138,9 @@ impl ServerHandler for McpServer {
             None => "{}".to_string(),
         };
 
-        // 锁只罩住这一次调用；拿到结果立刻放，别在持有锁期间做别的。
+        // 不能在人工确认、网络操作或审计期间持有全局台账锁。
+        let mut ledger = self.ledger.lock().await.clone();
         let out = {
-            let mut ledger = self.ledger.lock().await;
             let ctx = self.ctx_source.current().await;
             let ports = Ports {
                 management: &*self.management,
@@ -162,6 +161,9 @@ impl ServerHandler for McpServer {
             )
             .await
         };
+        // 服务器在打开成功后即记账，即使后续 settled 审计失败也必须合并。
+        // 若此处拿锁前请求被取消，可能丢失记账，下次只会多一次首次确认；不重开会话。
+        self.ledger.lock().await.merge(ledger);
         Ok(to_response(out))
     }
 }
