@@ -219,7 +219,7 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "sessions.list",
-        description: "列出 FutureShell 当前打开的 SSH 会话（id / 名称 / 主机 / 是否已连接）。",
+        description: "列出 FutureShell 当前打开的 SSH 会话（id / 名称 / 主机 / 是否已连接）。空列表不代表没有可连接配置；用 profiles.list 找到配置后可用 sessions.open 新建会话。",
         schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
@@ -227,7 +227,7 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
         name: "sessions.open",
         description:
-            "使用本机保险箱凭据打开已允许 MCP 访问的 SSH 连接。从 profiles.list 获取 profile_id，打开后用返回的 session_id 调用 terminal.read 查看当前屏幕。",
+            "使用已允许 MCP 访问的 SSH 配置新建会话，无需先在 FutureShell 手动打开该服务器。从 profiles.list 获取 profile_id；同一配置可重复或并发打开，每次成功都会创建独立会话；使用返回的 session_id 操作。结果不明时先用 sessions.list 核对，不要盲目重发。认证和确认按当前配置执行。",
         schema_json: r#"{"type":"object","properties":{"profile_id":{"type":"string"}},"required":["profile_id"],"additionalProperties":false}"#,
         gated: true,
         vault_class: false,

@@ -105,10 +105,10 @@ fn parse_error_output(e: ParseError) -> CallOutput {
     CallOutput::err(ToolError::forbidden(e.to_string()))
 }
 
-/// 会话不存在或已断开。
+/// 会话不可用。
 fn no_such_session() -> CallOutput {
     CallOutput::err(ToolError::forbidden(
-        "指定的会话不存在或已断开。请先用 sessions.list 看看有哪些可用的会话。",
+        "指定的会话不可用。请通过 sessions.list 查找会话；若需新建，请先用 profiles.list 获取已允许的配置，再调用 sessions.open。",
     ))
 }
 
@@ -193,7 +193,7 @@ pub async fn call(
                     code: "FS_MCP_TARGET_UNAVAILABLE",
                     tier: None,
                     confirmation_required: false,
-                    message: "会话不可用，请通过 sessions.list 查询当前会话".into(),
+                    message: "会话不可用，请通过 sessions.list 查找会话；若需新建，请先用 profiles.list 获取已允许的配置，再调用 sessions.open".into(),
                     details: None,
                 });
             }
@@ -210,7 +210,10 @@ pub async fn call(
         McpTool::SessionsOpen { profile_id } => {
             let allowed = ports.sessions.mcp_allowed(profile_id).await;
             match authorize_open(allowed, &ctx.caller, profile_id, ledger) {
-                OpenAuthz::Forbidden(e) => return CallOutput::err(e),
+                OpenAuthz::Forbidden(mut e) => {
+                    e.message = "连接配置不可用。请通过 profiles.list 获取已允许的配置 ID；如需使用其他配置，请在 FutureShell 中检查该配置的 MCP 访问设置。".into();
+                    return CallOutput::err(e);
+                }
                 other => Some(other),
             }
         }
@@ -294,7 +297,7 @@ async fn dispatch_after_gate(
         if verdict == McpVerdict::Approved
             && ports.sessions.mcp_allowed(profile_id).await != Some(true)
         {
-            let e = ToolError::forbidden("该连接已不可通过 MCP 打开。请重新查看可用连接。");
+            let e = ToolError::forbidden("连接配置不可用。请通过 profiles.list 获取已允许的配置 ID，并检查 FutureShell 中的 MCP 访问设置。");
             return settle(&tool, &gated, ctx, ports, McpVerdict::Denied, None, None, e).await;
         }
     }

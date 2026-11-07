@@ -23,7 +23,7 @@
 //! 这个状态：现在它跑过了，且任何一处翻译写反都会在这里转红。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fs_ai::exec::Observation;
@@ -48,20 +48,41 @@ type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send +
 // 只做到「能把协议跑起来」的最小程度。裁决逻辑本身由 server.rs 的 102 个
 // 测试覆盖，这里要验的是协议那一层，故端口一律给确定的、好断言的返回。
 
-struct Management;
+struct Management(Arc<Dir>);
 impl fs_mcpbridge::managed::ManagementPort for Management {
     fn generation(&self, _: &str) -> Option<u64> {
         Some(1)
     }
     fn run<'a>(
         &'a self,
-        _: &'a fs_mcpbridge::managed::ManagedTool,
+        tool: &'a fs_mcpbridge::managed::ManagedTool,
         _: Option<u64>,
     ) -> Fut<'a, Result<serde_json::Value, fs_mcpbridge::managed::ManagementError>> {
-        Box::pin(async { Ok(serde_json::json!({})) })
+        Box::pin(async move {
+            if let fs_mcpbridge::managed::ManagedTool::Close { session_id } = tool {
+                self.0.sessions.lock().unwrap().remove(session_id);
+            }
+            Ok(serde_json::json!({}))
+        })
     }
 }
-struct Dir;
+struct Dir {
+    sessions: Mutex<std::collections::BTreeSet<String>>,
+    next: AtomicUsize,
+}
+impl Dir {
+    fn new(initial: bool) -> Self {
+        let sessions = if initial {
+            ["s-1".to_string()].into_iter().collect()
+        } else {
+            Default::default()
+        };
+        Self {
+            sessions: Mutex::new(sessions),
+            next: AtomicUsize::new(2),
+        }
+    }
+}
 impl SessionDirectory for Dir {
     fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
         Box::pin(async {
@@ -73,26 +94,40 @@ impl SessionDirectory for Dir {
     }
 
     fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
-        Box::pin(async {
-            vec![SessionSummary {
-                id: "s-1".into(),
-                name: "生产机".into(),
-                host: "example.internal".into(),
-                connected: true,
-            }]
+        Box::pin(async move {
+            self.sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|id| SessionSummary {
+                    id: id.clone(),
+                    name: "生产机".into(),
+                    host: "example.internal".into(),
+                    connected: true,
+                })
+                .collect()
         })
     }
     fn is_alive(&self, session_id: &str) -> bool {
-        session_id == "s-1"
+        self.sessions.lock().unwrap().contains(session_id)
     }
-    fn mcp_allowed(&self, _profile_id: &str) -> Fut<'_, Option<bool>> {
-        Box::pin(async { Some(true) })
+    fn mcp_allowed(&self, profile_id: &str) -> Fut<'_, Option<bool>> {
+        let allowed = match profile_id {
+            "missing" => None,
+            "unallowed" => Some(false),
+            _ => Some(true),
+        };
+        Box::pin(async move { allowed })
     }
     fn session_allowed(&self, _session_id: &str) -> Fut<'_, bool> {
         Box::pin(async { true })
     }
     fn open(&self, _profile_id: &str) -> Fut<'_, PortResult<String>> {
-        Box::pin(async { Ok("s-2".to_string()) })
+        Box::pin(async move {
+            let id = format!("s-{}", self.next.fetch_add(1, Ordering::SeqCst));
+            self.sessions.lock().unwrap().insert(id.clone());
+            Ok(id)
+        })
     }
 }
 
@@ -220,11 +255,20 @@ impl McpContextSource for Ctx {
 /// 必须持有返回的 `RunningService` 本体——传输与服务循环挂在它上面，
 /// 提前析构连接就断了（client.rs 的测试里同一条注释，同一个坑）。
 async fn paired(tools: &[&str], answer: Option<bool>) -> RunningService<RoleClient, ()> {
+    paired_with_sessions(tools, answer, true).await
+}
+
+async fn paired_with_sessions(
+    tools: &[&str],
+    answer: Option<bool>,
+    initial: bool,
+) -> RunningService<RoleClient, ()> {
+    let directory = Arc::new(Dir::new(initial));
     let server = McpServer::new(
         Arc::new(Ctx),
-        Arc::new(Management),
+        Arc::new(Management(directory.clone())),
         Authorization::new(tools.iter().copied()),
-        Arc::new(Dir),
+        directory,
         Arc::new(Term),
         Arc::new(Cmd),
         Arc::new(Sftp),
@@ -513,6 +557,10 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
     assert_eq!(ident.name, "FutureShell");
     let instructions = info.instructions.as_deref().expect("握手应说明操作边界");
     for expected in [
+        "sessions.list 为空",
+        "无需预先手动打开服务器",
+        "同一配置每次成功打开",
+        "不盲目重发",
         "原始连接端点",
         "无 PTY",
         "sessions.details",
@@ -521,4 +569,146 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
     ] {
         assert!(instructions.contains(expected), "缺少协议说明: {expected}");
     }
+}
+
+#[tokio::test]
+async fn empty_registry_allows_two_parallel_opens_and_independent_close() {
+    let peer = paired_with_sessions(
+        &[
+            "profiles.list",
+            "sessions.list",
+            "sessions.open",
+            "sessions.close",
+            "terminal.read",
+        ],
+        Some(true),
+        false,
+    )
+    .await;
+    let (err, value, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    assert!(!err);
+    assert_eq!(value.unwrap(), serde_json::json!([]));
+    let (err, value, _) = call(&peer, "profiles.list", serde_json::json!({})).await;
+    assert!(!err);
+    let profile = value.unwrap()["profiles"][0]["profile_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (a, b) = tokio::join!(
+        call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":profile})
+        ),
+        call(
+            &peer,
+            "sessions.open",
+            serde_json::json!({"profile_id":profile})
+        ),
+    );
+    assert!(!a.0 && !b.0);
+    let a = a.1.unwrap()["session_id"].as_str().unwrap().to_owned();
+    let b = b.1.unwrap()["session_id"].as_str().unwrap().to_owned();
+    assert_ne!(a, b);
+    let (_, list, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    let list = list.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(list.as_array().unwrap().iter().any(|s| s["id"] == a));
+    assert!(list.as_array().unwrap().iter().any(|s| s["id"] == b));
+    assert!(
+        !call(&peer, "sessions.close", serde_json::json!({"session_id":a}))
+            .await
+            .0
+    );
+    let (_, list, _) = call(&peer, "sessions.list", serde_json::json!({})).await;
+    let list = list.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], b);
+    assert!(
+        !call(
+            &peer,
+            "terminal.read",
+            serde_json::json!({"session_id":b,"source":"screen"})
+        )
+        .await
+        .0
+    );
+}
+
+#[tokio::test]
+async fn session_guidance_is_discoverable_and_refusals_keep_generic_codes() {
+    let peer = paired_with_sessions(
+        &[
+            "profiles.list",
+            "sessions.list",
+            "sessions.open",
+            "sessions.details",
+            "terminal.read",
+        ],
+        Some(true),
+        false,
+    )
+    .await;
+    let listed = peer.list_all_tools().await.unwrap();
+    let description = |name: &str| {
+        listed
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .to_string()
+    };
+    assert!(description("sessions.list").contains("空列表不代表没有可连接配置"));
+    let open = description("sessions.open");
+    for phrase in [
+        "profiles.list",
+        "无需先在 FutureShell 手动打开",
+        "独立会话",
+        "不要盲目重发",
+    ] {
+        assert!(open.contains(phrase), "missing guidance: {phrase}");
+    }
+    let missing_session = call(
+        &peer,
+        "terminal.read",
+        serde_json::json!({"session_id":"missing","source":"screen"}),
+    )
+    .await;
+    assert!(missing_session.0);
+    let err = missing_session.1.unwrap();
+    assert_eq!(err["code"], "FS_POLICY_FORBIDDEN");
+    assert!(err["message"].as_str().unwrap().contains("profiles.list"));
+    assert!(!err["message"].as_str().unwrap().contains("已断开"));
+    let missing_managed = call(
+        &peer,
+        "sessions.details",
+        serde_json::json!({"session_id":"missing"}),
+    )
+    .await;
+    assert!(missing_managed.0);
+    let managed_error = missing_managed.1.unwrap();
+    assert_eq!(managed_error["code"], "FS_MCP_TARGET_UNAVAILABLE");
+    assert!(managed_error["message"]
+        .as_str()
+        .unwrap()
+        .contains("profiles.list"));
+    let missing = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"missing"}),
+    )
+    .await;
+    let denied = call(
+        &peer,
+        "sessions.open",
+        serde_json::json!({"profile_id":"unallowed"}),
+    )
+    .await;
+    assert!(missing.0 && denied.0);
+    assert_eq!(missing.1, denied.1);
+    let err = missing.1.unwrap();
+    assert_eq!(err["code"], "FS_POLICY_FORBIDDEN");
+    assert!(err["message"].as_str().unwrap().contains("profiles.list"));
 }

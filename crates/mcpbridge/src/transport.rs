@@ -104,7 +104,7 @@ impl ServerHandler for McpServer {
                 "FutureShell",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions("SSH exec 和 SFTP 使用原始连接端点；交互终端中经堡垒机或嵌套 SSH 进入的主机不会改变该端点。command.run 及旧 sftp.list/read 使用独立无 PTY exec 通道。需要操作交互目标时，先用 terminal.read 查看，再用 terminal.send 的 press_enter 提交；source=screen 是可见屏，all/scrollback 可读取最新尾部。单项操作失败时先用 sessions.details 核对连接状态和端点；结果不明时先检查状态，不要自动重复执行。工具授权与远端文件系统权限分别检查。")
+            .with_instructions("sessions.list 为空不代表没有可连接配置；调用 profiles.list 查找已允许的 SSH 配置，再用 sessions.open 的 profile_id 创建会话，无需预先手动打开服务器。同一配置每次成功打开都会产生独立 session_id，后续操作使用各自返回的 ID；结果不明时先查 sessions.list，不盲目重发。SSH exec 和 SFTP 使用原始连接端点；交互终端中经堡垒机或嵌套 SSH 进入的主机不会改变该端点。command.run 及旧 sftp.list/read 使用独立无 PTY exec 通道。需要操作交互目标时，先用 terminal.read 查看，再用 terminal.send 的 press_enter 提交；source=screen 是可见屏，all/scrollback 可读取最新尾部。单项操作失败时先用 sessions.details 核对连接状态和端点；结果不明时先检查状态，不要自动重复执行。工具授权与远端文件系统权限分别检查。")
     }
 
     /// `tools/list`：**从授权层过滤后的清单**生成，不另写一份。未授权工具在这里
