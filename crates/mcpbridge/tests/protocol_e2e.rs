@@ -511,4 +511,14 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
     );
     let ident = info.server_info.as_ref().expect("握手要报出服务端身份");
     assert_eq!(ident.name, "FutureShell");
+    let instructions = info.instructions.as_deref().expect("握手应说明操作边界");
+    for expected in [
+        "原始连接端点",
+        "无 PTY",
+        "sessions.details",
+        "all/scrollback",
+        "不要自动重复执行",
+    ] {
+        assert!(instructions.contains(expected), "缺少协议说明: {expected}");
+    }
 }

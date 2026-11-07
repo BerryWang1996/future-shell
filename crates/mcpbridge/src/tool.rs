@@ -234,7 +234,7 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "terminal.read",
-        description: "读取会话终端的纯文本内容（已脱敏）。用 source=screen 查看当前提示符、菜单或回显，再决定下一次输入。",
+        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines。查看提示符或回显后再决定输入。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer"}},"required":["session_id","source"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
@@ -272,14 +272,14 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "sftp.list",
-        description: "列出远端目录内容（只读）。",
+        description: "通过原始 SSH 连接端点的独立无 PTY exec 通道列目录（只读），不跟随交互终端内的堡垒机选主；通道不支持时先查 sessions.details 和终端状态。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
     },
     ManifestEntry {
         name: "sftp.read",
-        description: "读取远端文件内容（只读，默认上限 32 KiB）。",
+        description: "通过原始 SSH 连接端点的独立无 PTY exec 通道读文件（只读，默认上限 32 KiB），不跟随交互终端内的堡垒机选主；通道不支持时先查 sessions.details 和终端状态。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["session_id","path"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
