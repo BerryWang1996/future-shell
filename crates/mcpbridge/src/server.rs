@@ -114,7 +114,7 @@ fn no_such_session() -> CallOutput {
 /// 给人看的一行话：「工具名: 要做什么」。进确认框与审计。
 fn display_of(t: &McpTool) -> String {
     let what = match t {
-        McpTool::SessionsList => String::new(),
+        McpTool::ProfilesList | McpTool::SessionsList => String::new(),
         McpTool::SessionsOpen { profile_id } => profile_id.clone(),
         McpTool::TerminalRead { source, .. } => format!("{source:?}"),
         McpTool::TerminalSend { payload, .. } | McpTool::TerminalSendRaw { payload, .. } => {
@@ -266,6 +266,15 @@ async fn dispatch_after_gate(
         }
     };
 
+    if let McpTool::SessionsOpen { profile_id } = &tool {
+        if verdict == McpVerdict::Approved
+            && ports.sessions.mcp_allowed(profile_id).await != Some(true)
+        {
+            let e = ToolError::forbidden("该连接已不可通过 MCP 打开。请重新查看可用连接。");
+            return settle(&tool, &gated, ctx, ports, McpVerdict::Denied, None, None, e).await;
+        }
+    }
+
     // ── ⑦ 审计（Intent）：写不进去就不执行 ──────────────────────────────
     let intent = McpCallRecord {
         phase: RecordPhase::Intent,
@@ -330,6 +339,16 @@ async fn dispatch_after_gate(
         )));
     }
 
+    if matches!(tool, McpTool::ProfilesList) && ran.is_err() {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: "FS_MCP_PROFILE_LIST_FAILED",
+            tier: Some("read_only"),
+            confirmation_required: false,
+            message: text.as_str().to_string(),
+        });
+    }
+
     // 回包与审计行用的是**同一个** `text`，不可能一处脱了另一处没脱。
     // `structured` 也在**这一处**脱：它是端口给的原始值（`command.run` 的
     // Observation 里就带 stdout/stderr），若不脱就进结构化输出，等于给机密留了
@@ -386,6 +405,14 @@ async fn execute(tool: &McpTool, ports: &Ports<'_>) -> Result<Executed, String> 
         exit_code: None,
     };
     match tool {
+        McpTool::ProfilesList => {
+            let profiles = ports.sessions.list_profiles().await?;
+            Ok(Executed {
+                text: format!("{} 个可用 SSH 连接配置", profiles.len()),
+                structured: Some(serde_json::json!({ "profiles": profiles })),
+                exit_code: None,
+            })
+        }
         McpTool::SessionsList => {
             let list = ports.sessions.list().await;
             let v = serde_json::json!(list
@@ -514,7 +541,7 @@ async fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{ConfirmReply, PortResult, SessionSummary};
+    use crate::ports::{ConfirmReply, PortResult, ProfileSummary, SessionSummary};
     use crate::tool::ReadSource;
     use fs_ai::exec::Observation;
     use std::future::Future;
@@ -532,6 +559,7 @@ mod tests {
     /// 只有「这个方法恰好被调了 1 次、那个恰好 0 次」逮得住。
     #[derive(Default)]
     struct Calls {
+        list_profiles: AtomicUsize,
         list: AtomicUsize,
         open: AtomicUsize,
         alive_asked: AtomicUsize,
@@ -548,6 +576,7 @@ mod tests {
         /// 除了列出来的这些，其它端口方法一次都没被调过。
         fn only(&self, expected: &[(&str, usize)]) {
             let all: Vec<(&str, usize)> = vec![
+                ("list_profiles", self.list_profiles.load(SeqCst)),
                 ("list", self.list.load(SeqCst)),
                 ("open", self.open.load(SeqCst)),
                 ("read_text", self.read_text.load(SeqCst)),
@@ -575,7 +604,8 @@ mod tests {
         }
 
         fn executed(&self) -> usize {
-            self.list.load(SeqCst)
+            self.list_profiles.load(SeqCst)
+                + self.list.load(SeqCst)
                 + self.open.load(SeqCst)
                 + self.read_text.load(SeqCst)
                 + self.send.load(SeqCst)
@@ -595,6 +625,7 @@ mod tests {
         calls: std::sync::Arc<Calls>,
         alive_until: usize,
         allowed: Mutex<std::collections::BTreeMap<String, bool>>,
+        revoke_after_lookup: bool,
         open_result: Mutex<PortResult<String>>,
         sessions: Vec<SessionSummary>,
     }
@@ -605,6 +636,7 @@ mod tests {
                 calls: Default::default(),
                 alive_until: usize::MAX,
                 allowed: Mutex::new(Default::default()),
+                revoke_after_lookup: false,
                 open_result: Mutex::new(Ok("new-session".to_string())),
                 sessions: vec![SessionSummary {
                     id: "s1".into(),
@@ -617,6 +649,11 @@ mod tests {
     }
 
     impl SessionDirectory for Dir {
+        fn list_profiles(&self) -> F<'_, PortResult<Vec<ProfileSummary>>> {
+            self.calls.list_profiles.fetch_add(1, SeqCst);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
         fn list(&self) -> F<'_, Vec<SessionSummary>> {
             self.calls.list.fetch_add(1, SeqCst);
             let v = self.sessions.clone();
@@ -627,7 +664,12 @@ mod tests {
             n < self.alive_until
         }
         fn mcp_allowed(&self, pid: &str) -> F<'_, Option<bool>> {
-            let v = self.allowed.lock().unwrap().get(pid).copied();
+            let mut allowed = self.allowed.lock().unwrap();
+            let v = if self.revoke_after_lookup {
+                allowed.remove(pid)
+            } else {
+                allowed.get(pid).copied()
+            };
             Box::pin(async move { v })
         }
         fn open(&self, _pid: &str) -> F<'_, PortResult<String>> {
@@ -1354,13 +1396,14 @@ mod tests {
 
     // ══ ⑤ 路由 ═══════════════════════════════════════════════════════
 
-    /// E1 九个工具各自转调**各自的**端口方法。
+    /// E1 所有工具各自转调**各自的**端口方法。
     ///
     /// 防的是「全都走了 command.run」——M3 批次③ 真出过这个 bug，四个特化
     /// 端口方法一次都没被调过，而所有「结果对不对」的断言照样绿。
     #[tokio::test]
     async fn every_tool_reaches_its_own_port_method_and_no_other() {
         let cases: Vec<(&str, String, &str)> = vec![
+            ("profiles.list", "{}".into(), "list_profiles"),
             ("sessions.list", "{}".into(), "list"),
             (
                 "terminal.read",
@@ -1417,7 +1460,7 @@ mod tests {
         assert_eq!(
             cases.len() + 1,
             crate::tool::MCP_MANIFEST.len(),
-            "九个工具一个不少"
+            "每个工具都覆盖"
         );
     }
 
@@ -1463,6 +1506,18 @@ mod tests {
     }
 
     // ══ ⑦ sessions.open 的两道门 ══════════════════════════════════════
+
+    #[tokio::test]
+    async fn revoking_a_profile_while_approval_is_pending_prevents_open() {
+        let mut r = Rig::new();
+        r.dir.revoke_after_lookup = true;
+        r.dir.allowed.lock().unwrap().insert("p1".into(), true);
+        let out = r.call("sessions.open", r#"{"profile_id":"p1"}"#).await;
+        assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
+        assert_eq!(r.calls.confirm.load(SeqCst), 1);
+        r.calls.only(&[]);
+        assert_eq!(r.audit.verdicts(), vec![McpVerdict::Denied]);
+    }
 
     /// G1 没打勾 ⇒ FORBIDDEN，且**没弹确认框**。
     #[tokio::test]

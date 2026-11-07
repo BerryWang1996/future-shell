@@ -221,6 +221,7 @@
   // 这份清单与 `crates/mcpbridge/src/tool.rs` 的 MCP_MANIFEST 同名；两边漂移时
   // 「勾了一个不存在的工具」最坏只是被后端 `Authorization::new` 归入 unknown，不生效。
   const MCP_TOOL_CHOICES = [
+    "profiles.list",
     "sessions.list",
     "sessions.open",
     "terminal.read",
@@ -232,8 +233,9 @@
     "sftp.write",
   ] as const;
   const MCP_TOOL_LABELS: Record<string, string> = {
+    "profiles.list": "查找已授权的 SSH 连接配置",
     "sessions.list": "查看会话列表", "sessions.open": "打开连接", "terminal.read": "读取终端内容",
-    "terminal.send": "发送终端文本", "terminal.send_raw": "发送原始按键数据", "command.run": "执行命令",
+    "terminal.send": "输入终端文本（可按 Enter）", "terminal.send_raw": "发送原始按键数据", "command.run": "执行独立 SSH 命令",
     "sftp.list": "查看远程目录", "sftp.read": "读取远程文件", "sftp.write": "写入远程文件",
   };
   let mcpEnabled = $state(false);
@@ -837,6 +839,8 @@
             <p class="hint">
               在「需确认」档位下，开启此项可让已勾选的 MCP 工具直接执行，包括危险命令。仍需访问令牌。
               <strong>未勾选的工具对外部客户端不可用。</strong>
+              修改工具名单后，请断开并重新连接外部 MCP 客户端。
+              在连接编辑器的 AI 页可单独允许 MCP 发现并打开该 SSH 连接。
             </p>
             <div class="mcp-tools" data-testid="set-mcp-tools">
               {#each MCP_TOOL_CHOICES as tool}

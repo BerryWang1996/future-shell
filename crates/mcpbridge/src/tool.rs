@@ -20,12 +20,15 @@ pub enum ReadSource {
 /// 对外暴露的全部 MCP 工具。⚠ 标记见 [`MCP_MANIFEST`] 的 `gated` 字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
+    ProfilesList,
     /// 列出当前会话（只读；不含任何凭据字段——见 `ports::SessionSummary`）。
     SessionsList,
     /// ⚠ 打开会话：经流 1 **消耗 Vault 凭据**连接主机。授权层另有两道
     /// （profile 须标 `mcp_allowed` + 每个 (client, profile) 首次打开须确认），
     /// 见 [`crate::authz`]。
-    SessionsOpen { profile_id: String },
+    SessionsOpen {
+        profile_id: String,
+    },
     /// 读 headless 网格纯文本（不含转义序列），经同一脱敏过滤器。
     TerminalRead {
         session_id: String,
@@ -34,13 +37,19 @@ pub enum McpTool {
     },
     /// ⚠ 向终端发送 payload。分类目标 = **完整 payload 字符串**，基线至少 `Write`；
     /// 含控制/不可打印字符或超阈值 → `Dangerous`（§4.5，实现见 `gate.rs`）。
-    TerminalSend { session_id: String, payload: String },
+    TerminalSend {
+        session_id: String,
+        payload: String,
+    },
     /// ⚠⚠ 原始终端控制序列：**恒 `Dangerous`**（强确认）。
     ///
     /// 单开一个工具而不是给 `terminal.send` 加个 `raw: true` 开关：布尔开关会让
     /// 「这次调用要不要强确认」取决于一个**调用方可自选**的参数，而工具名是
     /// 授权白名单的键——用户可以只授权 `terminal.send` 而不授权 `send_raw`。
-    TerminalSendRaw { session_id: String, payload: String },
+    TerminalSendRaw {
+        session_id: String,
+        payload: String,
+    },
     /// ⚠ 执行一条命令。共享 §4.4 `run_command` 契约（超时/截断/观察值），
     /// 契约实现只有一份（`fs_ai::exec`），由 app 层的端口转调。
     ///
@@ -48,9 +57,15 @@ pub enum McpTool {
     /// 用户可见的 PTY，那是 `terminal.send` 的语义面、且它按 payload 整串分类；
     /// 若 `command.run` 也能选它，外部调用方就能拿着一个「按命令文本分类」的
     /// 裁决去做终端注入，绕开 `terminal.send` 的控制字符口径。
-    CommandRun { session_id: String, command: String },
+    CommandRun {
+        session_id: String,
+        command: String,
+    },
     /// 列远端目录（只读）。
-    SftpList { session_id: String, path: String },
+    SftpList {
+        session_id: String,
+        path: String,
+    },
     /// 读远端文件（只读）。
     SftpRead {
         session_id: String,
@@ -89,6 +104,13 @@ pub struct ManifestEntry {
 /// 见 [`crate::authz::Authorization::enumerable`]），而不是另写一份。
 pub const MCP_MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
+        name: "profiles.list",
+        description: "查找用户已允许 MCP 打开的 SSH 连接配置。按名称选择，将返回的 profile_id 传给 sessions.open。名称重合时先请用户确认。",
+        schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        gated: false,
+        vault_class: false,
+    },
+    ManifestEntry {
         name: "sessions.list",
         description: "列出 FutureShell 当前打开的 SSH 会话（id / 名称 / 主机 / 是否已连接）。",
         schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
@@ -98,22 +120,31 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
         name: "sessions.open",
         description:
-            "使用本机保险箱凭据打开已允许 MCP 访问的 SSH 连接，按 MCP 设置决定是否提示确认。",
+            "使用本机保险箱凭据打开已允许 MCP 访问的 SSH 连接。从 profiles.list 获取 profile_id，打开后用返回的 session_id 调用 terminal.read 查看当前屏幕。",
         schema_json: r#"{"type":"object","properties":{"profile_id":{"type":"string"}},"required":["profile_id"],"additionalProperties":false}"#,
         gated: true,
         vault_class: false,
     },
     ManifestEntry {
         name: "terminal.read",
-        description: "读取会话终端的纯文本内容（不含转义序列，已脱敏）。",
+        description: "读取会话终端的纯文本内容（已脱敏）。用 source=screen 查看当前提示符、菜单或回显，再决定下一次输入。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer"}},"required":["session_id","source"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
     },
     ManifestEntry {
         name: "terminal.send",
-        description: "向会话终端发送一段文本（像用户敲进去一样）。含控制字符或超长时按危险处理。",
-        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"payload":{"type":"string"}},"required":["session_id","payload"],"additionalProperties":false}"#,
+        description: "向已打开的交互终端输入文字。提交菜单选项或命令时，传单行 payload 并设置 press_enter=true，例如 payload 为 p。发送后用 terminal.read 查看结果。",
+        schema_json: r#"{
+            "type":"object",
+            "properties":{
+                "session_id":{"type":"string","description":"sessions.list 或 sessions.open 返回的会话 ID"},
+                "payload":{"type":"string","description":"要输入的文字。与 press_enter=true 一起使用时传单行文字，无需添加换行或转义。空字符串可用于单独按 Enter。"},
+                "press_enter":{"type":"boolean","default":false,"description":"在输入文字后按一次 Enter（发送 CR）。用于交互菜单、堡垒机和终端命令，按现有危险操作策略判定。"}
+            },
+            "required":["session_id","payload"],
+            "additionalProperties":false
+        }"#,
         gated: true,
         vault_class: false,
     },
@@ -126,8 +157,8 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "command.run",
-        description: "在会话所在主机上执行一条命令，返回 stdout/stderr/exit_code。\
-                      走独立 exec 通道，60 秒超时、输出 32 KiB 截断。",
+        description: "在 SSH 连接端点上通过独立的无 PTY exec 通道执行命令，返回 stdout/stderr/exit_code。\
+                      已在终端内通过堡垒机菜单或嵌套 SSH 切换主机时，请用 terminal.send（press_enter=true）和 terminal.read 操作该终端。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}"#,
         gated: true,
         vault_class: false,
@@ -159,6 +190,7 @@ impl McpTool {
     /// 线上名。与 [`MCP_MANIFEST`] 同源（`manifest()` 反查那一条）。
     pub fn name(&self) -> &'static str {
         match self {
+            Self::ProfilesList => "profiles.list",
             Self::SessionsList => "sessions.list",
             Self::SessionsOpen { .. } => "sessions.open",
             Self::TerminalRead { .. } => "terminal.read",
@@ -174,7 +206,7 @@ impl McpTool {
     /// 这次调用作用于哪个会话（`sessions.list` / `sessions.open` 没有）。
     pub fn session_id(&self) -> Option<&str> {
         match self {
-            Self::SessionsList | Self::SessionsOpen { .. } => None,
+            Self::ProfilesList | Self::SessionsList | Self::SessionsOpen { .. } => None,
             Self::TerminalRead { session_id, .. }
             | Self::TerminalSend { session_id, .. }
             | Self::TerminalSendRaw { session_id, .. }
@@ -241,6 +273,15 @@ struct ReadArgs {
 struct SendArgs {
     session_id: String,
     payload: String,
+    #[serde(default)]
+    press_enter: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSendArgs {
+    session_id: String,
+    payload: String,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +335,10 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
         args_json
     };
     Ok(match name {
+        "profiles.list" => {
+            let _: Empty = serde_json::from_str(args_json).map_err(bad)?;
+            McpTool::ProfilesList
+        }
         "sessions.list" => {
             let _: Empty = serde_json::from_str(args_json).map_err(bad)?;
             McpTool::SessionsList
@@ -313,14 +358,26 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
             }
         }
         "terminal.send" => {
-            let a: SendArgs = serde_json::from_str(args_json).map_err(bad)?;
+            let mut a: SendArgs = serde_json::from_str(args_json).map_err(bad)?;
+            if a.press_enter {
+                if a.payload.contains(['\r', '\n']) {
+                    return Err(ParseError::BadArgs {
+                        tool: name.to_string(),
+                        detail:
+                            "press_enter=true 时 payload 必须是单行文字，由 FutureShell 附加回车"
+                                .into(),
+                    });
+                }
+                // 输入和 Enter 一次送入策略、审计与 PTY，沿用显式 CR 的判定。
+                a.payload.push('\r');
+            }
             McpTool::TerminalSend {
                 session_id: a.session_id,
                 payload: a.payload,
             }
         }
         "terminal.send_raw" => {
-            let a: SendArgs = serde_json::from_str(args_json).map_err(bad)?;
+            let a: RawSendArgs = serde_json::from_str(args_json).map_err(bad)?;
             McpTool::TerminalSendRaw {
                 session_id: a.session_id,
                 payload: a.payload,
@@ -373,6 +430,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "profiles.list",
                 "sessions.list",
                 "sessions.open",
                 "terminal.read",
@@ -434,6 +492,39 @@ mod tests {
         assert!(!MCP_MANIFEST.is_empty(), "做空防护：清单不能是空的");
     }
 
+    #[test]
+    fn terminal_send_only_appends_enter_when_requested() {
+        for (args, payload) in [
+            (r#"{"session_id":"s","payload":"p\n"}"#, "p\n"),
+            (
+                r#"{"session_id":"s","payload":"p","press_enter":false}"#,
+                "p",
+            ),
+            (
+                r#"{"session_id":"s","payload":"p","press_enter":true}"#,
+                "p\r",
+            ),
+            (
+                r#"{"session_id":"s","payload":"","press_enter":true}"#,
+                "\r",
+            ),
+        ] {
+            assert_eq!(
+                parse_tool("terminal.send", args).unwrap(),
+                McpTool::TerminalSend {
+                    session_id: "s".into(),
+                    payload: payload.into(),
+                }
+            );
+        }
+        let args = r#"{"session_id":"s","payload":"p\r","press_enter":true}"#;
+        assert!(parse_tool("terminal.send", args).is_err());
+        let args = r#"{"session_id":"s","payload":"p\n","press_enter":true}"#;
+        assert!(parse_tool("terminal.send", args).is_err());
+        let args = r#"{"session_id":"s","payload":"p","press_enter":true}"#;
+        assert!(parse_tool("terminal.send_raw", args).is_err());
+    }
+
     /// 枚举的每一支都能反查到清单条目，且清单每一条都能被解析出来。
     ///
     /// 双向：单向的话，「清单里加了一条却没有解析臂」或「枚举里加了一支却
@@ -441,6 +532,7 @@ mod tests {
     #[test]
     fn enum_and_manifest_cover_each_other_exactly() {
         let samples = [
+            McpTool::ProfilesList,
             McpTool::SessionsList,
             McpTool::SessionsOpen {
                 profile_id: "p".into(),

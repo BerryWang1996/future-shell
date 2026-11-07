@@ -31,7 +31,7 @@ use fs_mcpbridge::authz::Authorization;
 use fs_mcpbridge::confirm::ConfirmTicket;
 use fs_mcpbridge::ports::{
     CommandPort, ConfirmReply, McpAuditPort, McpCallRecord, McpConfirmPort, PortResult,
-    SessionDirectory, SessionSummary, SftpPort, TerminalPort,
+    ProfileSummary, SessionDirectory, SessionSummary, SftpPort, TerminalPort,
 };
 use fs_mcpbridge::server::CallContext;
 use fs_mcpbridge::tool::ReadSource;
@@ -50,6 +50,15 @@ type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send +
 
 struct Dir;
 impl SessionDirectory for Dir {
+    fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>> {
+        Box::pin(async {
+            Ok(vec![ProfileSummary {
+                profile_id: "p-1".into(),
+                name: "测试 hunter2".into(),
+            }])
+        })
+    }
+
     fn list(&self) -> Fut<'_, Vec<SessionSummary>> {
         Box::pin(async {
             vec![SessionSummary {
@@ -251,6 +260,7 @@ async fn an_unauthorized_tool_is_not_enumerable_over_the_wire() {
     let names: Vec<String> = listed.iter().map(|t| t.name.to_string()).collect();
     for forbidden in [
         "command.run",
+        "profiles.list",
         "terminal.send",
         "sftp.write",
         "sessions.open",
@@ -297,6 +307,45 @@ async fn a_vault_class_tool_cannot_be_authorized_into_existence() {
 }
 
 // ───────────────────────── tools/call ─────────────────────────
+
+#[tokio::test]
+async fn only_authorized_clients_can_discover_redacted_profile_summaries() {
+    let peer = paired(&["sessions.list"], Some(true)).await;
+    assert!(call(&peer, "profiles.list", serde_json::json!({})).await.0);
+
+    let peer = paired(&["profiles.list"], Some(false)).await;
+    let tools = peer.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "profiles.list");
+    let (is_err, structured, text) = call(&peer, "profiles.list", serde_json::json!({})).await;
+    assert!(!is_err);
+    let value = structured.unwrap();
+    let summary = value["profiles"][0].as_object().unwrap();
+    assert_eq!(summary.len(), 2);
+    assert_eq!(summary["profile_id"], "p-1");
+    assert!(summary["name"].as_str().unwrap().contains("测试"));
+    assert!(!value.to_string().contains("hunter2"));
+    assert!(!text.contains("hunter2"));
+}
+
+#[tokio::test]
+async fn terminal_enter_is_discoverable_and_uses_the_existing_risk_gate() {
+    let peer = paired(&["terminal.send"], Some(true)).await;
+    let tools = peer.list_all_tools().await.unwrap();
+    let schema = &tools[0].input_schema;
+    assert_eq!(schema["properties"]["press_enter"]["type"], "boolean");
+    assert_eq!(schema["properties"]["press_enter"]["default"], false);
+
+    let args = serde_json::json!({"session_id":"s-1","payload":"p","press_enter":true});
+    let (is_err, _, text) = call(&peer, "terminal.send", args.clone()).await;
+    assert!(!is_err);
+    assert_eq!(text, "已发送 2 字节");
+
+    let peer = paired(&["terminal.send"], Some(false)).await;
+    let (is_err, structured, _) = call(&peer, "terminal.send", args).await;
+    assert!(is_err);
+    assert_eq!(structured.unwrap()["tier"], "dangerous");
+}
 
 #[tokio::test]
 async fn calling_an_authorized_readonly_tool_round_trips() {

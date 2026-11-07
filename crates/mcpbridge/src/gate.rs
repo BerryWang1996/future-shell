@@ -153,7 +153,7 @@ pub fn classify_for_mcp(tool: &McpTool, caller: &str) -> McpGated {
         }
 
         // ── Agent 面没有对应物：规则写在这里 ──────────────────────────
-        McpTool::SessionsList | McpTool::TerminalRead { .. } => read_only(),
+        McpTool::ProfilesList | McpTool::SessionsList | McpTool::TerminalRead { .. } => read_only(),
 
         // 打开会话不改远端任何东西，但它**花掉一份凭据**并建立一条新的活连接。
         // 定 Write 而不是 Dangerous 有一个具体后果值得说清：`ReadOnlyOnly` 档下
@@ -371,6 +371,7 @@ mod tests {
     #[test]
     fn read_only_tools_are_read_only_yet_still_pass_through_the_gate() {
         for t in [
+            McpTool::ProfilesList,
             McpTool::SessionsList,
             McpTool::TerminalRead {
                 session_id: "s".into(),
@@ -458,10 +459,11 @@ mod tests {
         assert_eq!(a.caller, "claude-desktop");
     }
 
-    /// 九个工具全覆盖：每一支都能分类，且 tool_name 与清单对得上。
+    /// 每一支都能分类，且 tool_name 与清单对得上。
     #[test]
     fn every_tool_variant_can_be_classified() {
         let all = [
+            McpTool::ProfilesList,
             McpTool::SessionsList,
             McpTool::SessionsOpen {
                 profile_id: "p".into(),
@@ -521,6 +523,7 @@ mod tests {
     fn the_warning_marks_match_what_the_gate_actually_does() {
         // ① 没标 ⚠ 的：换什么参数都是 ReadOnly。
         let free: Vec<(&str, Vec<McpTool>)> = vec![
+            ("profiles.list", vec![McpTool::ProfilesList]),
             ("sessions.list", vec![McpTool::SessionsList]),
             (
                 "terminal.read",
@@ -619,7 +622,7 @@ mod tests {
         }
 
         // ③ 做空防护 + 与清单对账：两组加起来正好是整张清单。
-        assert_eq!(free.len(), 4);
+        assert_eq!(free.len(), 5);
         assert_eq!(gated.len(), 5);
         let covered: std::collections::BTreeSet<&str> = free
             .iter()

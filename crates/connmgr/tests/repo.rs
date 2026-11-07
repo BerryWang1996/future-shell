@@ -161,7 +161,9 @@ async fn export_import_roundtrip() {
         got.sftp.download_sandbox, None,
         "下载沙箱根是本机写边界授权，导入面必须剥离"
     );
-    assert_eq!(got.ai_policy, p.ai_policy);
+    assert_eq!(got.ai_policy.auto_execute, p.ai_policy.auto_execute);
+    assert!(p.ai_policy.mcp_allowed);
+    assert!(!got.ai_policy.mcp_allowed, "导入不能授予本机 MCP 访问");
     assert_ne!(got.id, p.id, "导入须换新 id，避免与本机既有条目撞号");
 }
 

@@ -44,8 +44,17 @@ pub struct SessionSummary {
     pub connected: bool,
 }
 
+/// 已允许 MCP 使用的 SSH 配置。对外只提供选择所需的字段。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProfileSummary {
+    pub profile_id: String,
+    pub name: String,
+}
+
 /// 会话与连接配置的目录。
 pub trait SessionDirectory: Send + Sync {
+    fn list_profiles(&self) -> Fut<'_, PortResult<Vec<ProfileSummary>>>;
+
     fn list(&self) -> Fut<'_, Vec<SessionSummary>>;
 
     /// 这个会话此刻还在不在。
