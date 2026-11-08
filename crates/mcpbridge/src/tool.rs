@@ -235,7 +235,7 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "terminal.read",
-        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines（正数）；空屏可设置 wait_ms（0-10000，推荐 1000），仅等待可见内容。查看提示符或回显后再决定输入。",
+        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines（正数）；空屏可设置 wait_ms（0-10000，推荐 1000），仅在当前快照文本为空时等待输出，计时不包含授权、门锁和审计耗时；非空文本（包括空格和换行）无需等待。查看提示符或回显后再决定输入。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer","minimum":1},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0}},"required":["session_id","source"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,

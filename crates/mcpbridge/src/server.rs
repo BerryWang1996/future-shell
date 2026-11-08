@@ -2116,6 +2116,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn terminal_read_preserves_whitespace_as_nonempty_text() {
+        for value in [" ", "\n", " \n "] {
+            let mut r = Rig::new();
+            r.term.text = value.into();
+            match r
+                .call(
+                    "terminal.read",
+                    r#"{"session_id":"s1","source":"screen","wait_ms":1000}"#,
+                )
+                .await
+            {
+                CallOutput::Ok {
+                    text,
+                    structured: Some(status),
+                } => {
+                    assert_eq!(text, value);
+                    assert_eq!(status["text"], value);
+                    assert_eq!(status["empty"], false);
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+    }
+
     // ══ ⑦ sessions.open 的两道门 ══════════════════════════════════════
 
     #[tokio::test]
