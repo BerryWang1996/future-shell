@@ -1,6 +1,8 @@
 # FutureShell 1.0.5 开发计划
 
-更新于 2026-11-07。代码基线为 `v1.0.4`（`e0a69bf`）。本文供范围确认、开发、复审和验收使用。当前 `release/1.0.5` 已进入实现与验证阶段，本地结果见第八节，三平台 CI 与正式制品待核对。1.0.5 增加外部 MCP 的文件上传下载、传输管理、远端文件管理和 SSH 会话管理。所有新入口都会出现在「设置 → AI → 对外 MCP 服务」的工具授权清单中。
+本文沿用 1.0.5 计划作为开发与审计记录，后续版本按时间续记；下文“当前”“未实施”等历史表述只适用于其所在阶段。原始基线为 `v1.0.4`（`e0a69bf`），1.0.5 已发布。
+
+**最新状态（2026-11-08）：1.1.1 本地开发中，未发布或安装。** 集成分支为 `codex/1.1.1-mcp-endpoints`。终端读取、rz/sz 取消与保存、MCP 双向终端文件传输均已实现并经过分卡独立复审；最终真实验收仍有停止线，不能据单元测试通过判定完成。`a4a2cd7` 已关闭真实 zsh 上传目录误落反例，空文件与 96 KiB 双向哈希通过；4 MiB 下载触发效果队列数量上限，正在补接收背压。后续须固定新源码与二进制再验大文件、取消后同终端恢复及剩余矩阵。仅使用隔离 loopback SSH、便携测试应用和合成文件；本机安装版与真实服务器未改动。
 
 ## 一、现状与交付目标
 
@@ -442,3 +444,15 @@ owner范围偏离由经理按证据批准：默认400行，预计闭环520；实
 8dc4f33为c219代码加操作guide/索引/CHANGELOG，root亲验core426、app bridge50/mcp36/io8、前端全量1713通过+条件跳过的跨语言1项定向补齐，fmt/版本/文档与嵌入资源native构建通过。该候选exe SHA256为50416134ae09818e702af196cd2c8dd220f02d4f6659a4da12e236f94a60a22b。最终QA首个headless空文件上传即阻断：zsh-f执行command cd不会切当前目录，protocol_confirmed但文件误落B cwd而非所给qa-files。只读同TTY对照确证，不以“非POSIX”排除常见现场，不把协议确认冒充路径验证；其余矩阵未验，私有fixture已精确回收，证据`/tmp/fs111-final-public-8dc4f3364d36.json`。
 
 79363f7针对该实际落点root回修三生产文件14行，新增/调整测试另计；固定/bin/sh -c脚本与目录位置参数，argv0占位/$1精确、内层cd失败不rz、外层cwd保持，上传依赖/bin/sh+rz而下载sz，不要求人工exec sh。独立D2核真实sh/bash/zsh-f先红后绿36项及两rmcp断言各1，准重建后重新QA；stub oracle不是修后真实SSH，旧8dc反例仍保留。当前功能源码已冻结，正式发布/安装未执行。
+
+
+### 最终验收新反例：接收效果背压（a4a2cd7）
+
+a4a2cd7 代码同 79363f7，原生嵌入资源候选 exe SHA-256 为 `78613d1174ce18b8da5035ad18e2798c42a338bedf51492c87fb63f7ceadcd71`。独立真实 headless MCP 通过同机两个不同 hostkey/端口/CWD 的 loopback SSH，嵌套进入 B：空文件与 96 KiB 双向哈希及 4 MiB 上传落点正确，旧 zsh cd 误落反例关闭。4 MiB 下载在 bytes_done=1,956,864 时失败，spool=904,192，差值约 1028 个 1 KiB Write，符合 1024 项效果上限而非 8 MiB 字节上限。证据 `/tmp/fs111-final-public-a4a2cd7cc972.json`；此候选停止后未重放，全部自建进程、秘密/DB、socket 与合成文件已回收。两端同一物理机，不称跨机验证；原有 SFTP 仍针对原连接端点。
+
+军师独立 D1 裁定：同步 filter 继续不等待，原 pipe 单读取任务在效果队列高低水位处暂停 source.read，把背压传回容量 16 的 ChannelReader。限定 bridge.rs/pipe.rs，512 项或 4 MiB 暂停，项数 ≤256 且字节 ≤2 MiB 恢复；保留 1024/8 MiB 硬拒绝，独立 CAN/Done、FIFO、原代次/owner/gate、headless 无 render ACK 均不改变。stop、尾部、取消、reset、驱动退出必须可达且无丢失唤醒；不得把 driver 与 pipe 的 Notify 混为两个竞争消费者。默认 ≤400 生产变更行，独立固定差异 D2 后才重建 QA。仅提高预算、合并 Write 或添加 sz 参数不足以修复持续积压。
+
+拒绝只广告 ZRINIT Rxbuflen 的备选：GNU 0.12.21rc lsz.c 的 Rxbuflen→ZCRCW 停等分支在 `#if 0` 内，非字符输入还可能覆写 Rxbuflen；不能据旗标存在声称通用兼容。验收须涵盖 high→pause→low→resume、两预算及 FIFO，暂停期间 stop/tail/取消/换代、异常单批超限控制出口；真 GNU 0.12/0.13 PTY 的 4 MiB、至少一路 128 MiB 正常下载及活动取消，覆盖 GUI 手动 sz 与 MCP、最终 hash/落点和同 PTY 哨兵。新候选仍须补 optional OO 的实际静默 timer 预期和最新保存文案；旧严格 OO 失败证据不冒充新策略成功。
+
+
+91548ba 已实现上述背压卡，仅两源码文件、90 生产变更行，4 项新测试。独立 D2 固定 a4a2cd7..91548ba，无新增高中发现，放行仅本地候选/真实 QA；软水位允许一个读块超调，不保证任意异常输入不触发硬限。原始 terminal267/bridge53 日志及旧 pipe 暂停仍读的红例已复核；受控真实 SessionPipe+EffectQueue 的 4/128 MiB 连续流不是 GNU/AppState 验收。经理另亲跑 core427 通过、0 ignored，fmt/diffcheck/文档链接通过，custom-protocol 原生构建成功，exe SHA-256 `7808ba6f864b4a8c91010bca8d642fa148480dd7acef19e5bb6eb3a6dfed808b`，dist index `0ed746aac0e014014ddae86b80f6b0b7ef7597034c5af24c07ab15c7bce812fc`。日志 `/tmp/fs111-b1flow-root-core.log`、`/tmp/fs111-b1flow-native-build.log`；开始绑定新候选实际 QA，尚未解除最终停止线。
