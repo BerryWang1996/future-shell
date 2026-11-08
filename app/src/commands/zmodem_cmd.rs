@@ -18,6 +18,8 @@ pub struct ZmodemStatus {
     pub sandbox: Option<String>,
     /// 自动检测是否开启
     pub auto: bool,
+    /// 最近一次驱动失败；结果可能未知。
+    pub error: Option<String>,
 }
 
 #[tauri::command]
@@ -38,11 +40,13 @@ pub async fn zmodem_status(
             active: false,
             sandbox: None,
             auto: false,
+            error: None,
         },
         Some(t) => ZmodemStatus {
             active: t.active(),
             sandbox: Some(t.sandbox_display()),
             auto: t.auto_enabled(),
+            error: t.failure_message(),
         },
     })
 }

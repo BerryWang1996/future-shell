@@ -33,7 +33,7 @@ use fs_terminal::zsession::{Action, Direction, ZmodemSession};
 use std::borrow::Cow;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
@@ -90,6 +90,11 @@ enum Effect {
     Done { ok: bool, message: String },
 }
 
+struct QueuedEffect {
+    transfer_id: u64,
+    effect: Effect,
+}
+
 /// 多文件上传的队列项。句柄在入队时打开（begin_send 全量校验的产物），
 /// 排队期间一直持有——排队时再开，文件可能已经被人挪走，而那要等到
 /// 轮到它才发现，报错时用户已经忘了当初选了什么。
@@ -104,6 +109,7 @@ struct PendingFile {
 
 /// 传输态：状态机 + 两端的文件句柄。
 struct Transfer {
+    id: u64,
     session: ZmodemSession,
     /// 接收落盘句柄与最终路径
     sink: Option<std::io::BufWriter<std::fs::File>>,
@@ -141,6 +147,14 @@ pub struct ZmodemTap {
     /// `rz` 每隔约十秒重发一次 ZRINIT，逐次弹框会把用户埋在对话框里。置位后
     /// 只在传输结束（或取消）时复位。
     need_file_announced: AtomicBool,
+    /// 当前传输的代次；队列效果与它绑定，不得作用到下一轮。
+    transfer_id: AtomicU64,
+    /// 取消已受理，等待驱动处理终态；重复取消幂等。
+    cancelling: AtomicBool,
+    /// 首次有效登记的 SSH 连接代次；0 表示尚未登记。
+    connection_generation: AtomicU64,
+    /// 通道/驱动失败，不得被后续成功状态覆盖。
+    failure: Mutex<Option<String>>,
     /// 本会话已确定的下载目录（2026-08-26 两段式）。
     ///
     /// 一次 `sz` 批量传多个文件时，第一个文件做的「去哪」决定对**本次会话**
@@ -154,17 +168,26 @@ pub struct ZmodemTap {
     pending_finalize: Mutex<Option<PendingFinalize>>,
     /// 本会话真正落地的最终路径集合（reveal 的白名单，见 [`Self::resolve_received`]）。
     finalized: Mutex<std::collections::HashSet<PathBuf>>,
-    tx: mpsc::UnboundedSender<Effect>,
+    tx: mpsc::UnboundedSender<QueuedEffect>,
 }
 
 fn cancellation_actions(
     cur: &mut Option<Transfer>,
     waiting: &AtomicBool,
+    cancelling: &AtomicBool,
 ) -> Result<Vec<Action>, String> {
+    if cancelling.load(Ordering::SeqCst) {
+        return Ok(Vec::new());
+    }
     if let Some(transfer) = cur.as_mut() {
+        if transfer.session.is_finished() {
+            return Err("传输正在收尾".into());
+        }
+        cancelling.store(true, Ordering::SeqCst);
         return Ok(transfer.session.cancel());
     }
-    if waiting.swap(false, Ordering::SeqCst) {
+    if waiting.load(Ordering::SeqCst) {
+        cancelling.store(true, Ordering::SeqCst);
         return Ok(vec![
             Action::Send(fs_terminal::zmodem::cancel_sequence()),
             Action::Done {
@@ -207,6 +230,10 @@ impl ZmodemTap {
             sniff: Mutex::new(Vec::new()),
             busy: AtomicBool::new(false),
             need_file_announced: AtomicBool::new(false),
+            transfer_id: AtomicU64::new(0),
+            cancelling: AtomicBool::new(false),
+            connection_generation: AtomicU64::new(0),
+            failure: Mutex::new(None),
             session_download_dir: Mutex::new(None),
             pending_finalize: Mutex::new(None),
             finalized: Mutex::new(Default::default()),
@@ -245,9 +272,11 @@ impl ZmodemTap {
         }
         let total = opened.len() as u32;
         let mut cur = self.cur.lock().unwrap();
-        if cur.is_some() {
-            return Err("该会话已有传输在进行".into());
+        if cur.is_some() || self.cancelling.load(Ordering::SeqCst) {
+            return Err("该会话已有传输在进行或正在取消".into());
         }
+        let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.failure.lock().unwrap() = None;
         let (first_path, first_size, first_file) = opened.remove(0);
         let name = first_path
             .file_name()
@@ -257,6 +286,7 @@ impl ZmodemTap {
         let session = ZmodemSession::new_send(&name, first_size);
         let hello = session.start();
         *cur = Some(Transfer {
+            id: transfer_id,
             session,
             sink: None,
             sink_path: None,
@@ -274,9 +304,14 @@ impl ZmodemTap {
             file_index: 1,
             file_count: total,
         });
-        drop(cur);
         self.busy.store(true, Ordering::SeqCst);
-        let _ = self.tx.send(Effect::Send(hello));
+        if let Err(error) = self.queue(transfer_id, Effect::Send(hello)) {
+            *self.failure.lock().unwrap() = Some(error.clone());
+            *cur = None;
+            self.busy.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        drop(cur);
         self.emit_progress_files("sending", &name, 0, Some(first_size), 1, total);
         Ok(())
     }
@@ -311,16 +346,34 @@ impl ZmodemTap {
     /// 用户取消当前传输。
     pub fn cancel(&self) -> Result<(), String> {
         let mut cur = self.cur.lock().unwrap();
-        let acts = cancellation_actions(&mut cur, &self.need_file_announced)?;
-        drop(cur);
+        let transfer_id = cur
+            .as_ref()
+            .map(|t| t.id)
+            .unwrap_or_else(|| self.transfer_id.load(Ordering::SeqCst));
+        let acts = cancellation_actions(&mut cur, &self.need_file_announced, &self.cancelling)?;
+        if acts.is_empty() {
+            return Ok(());
+        }
+        self.busy.store(true, Ordering::SeqCst);
         self.sniff.lock().unwrap().clear();
-        self.dispatch(acts);
+        if let Err(error) = self.dispatch(transfer_id, acts) {
+            *self.failure.lock().unwrap() = Some(error.clone());
+            *cur = None;
+            self.busy.store(false, Ordering::SeqCst);
+            self.cancelling.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        drop(cur);
         Ok(())
     }
 
     /// 是否有传输在进行（前端进度条的存在依据）。
     pub fn active(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    pub fn failure_message(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
     }
 
     /// 落盘根目录（给前端显示「下载到哪」与「打开所在目录」用）。
@@ -371,7 +424,16 @@ impl ZmodemTap {
     }
 
     /// 把状态机动作翻译成副作用并投递。
-    fn dispatch(&self, acts: Vec<Action>) {
+    fn queue(&self, transfer_id: u64, effect: Effect) -> Result<(), String> {
+        self.tx
+            .send(QueuedEffect {
+                transfer_id,
+                effect,
+            })
+            .map_err(|_| "终端传输驱动不可用，结果未知".to_string())
+    }
+
+    fn dispatch(&self, transfer_id: u64, acts: Vec<Action>) -> Result<(), String> {
         for a in acts {
             let eff = match a {
                 Action::Send(b) => Effect::Send(b),
@@ -385,10 +447,9 @@ impl ZmodemTap {
                 Action::FileSent => Effect::FileSent,
                 Action::Done { ok, message } => Effect::Done { ok, message },
             };
-            // 发送失败 = 驱动任务已退出（会话关闭）。此时无处执行副作用，
-            // 丢弃是唯一选择；不要在这里 unwrap，那会 panic 在读取任务里。
-            let _ = self.tx.send(eff);
+            self.queue(transfer_id, eff)?;
         }
+        Ok(())
     }
 
     fn emit_state(&self, phase: &str, name: &str, done: u64, total: Option<u64>) {
@@ -481,7 +542,15 @@ impl ByteTap for ZmodemTap {
             return Cow::Borrowed(chunk);
         }
         let mut cur = self.cur.lock().unwrap();
+        if cur.is_none() && self.cancelling.load(Ordering::SeqCst) {
+            return Cow::Borrowed(chunk);
+        }
         if let Some(t) = cur.as_mut() {
+            // 终态效果仍在队列中时保留资源供驱动消费；后续 shell 字节直接透传。
+            if t.session.is_finished() {
+                return Cow::Borrowed(chunk);
+            }
+            let transfer_id = t.id;
             // 传输中：全部字节喂状态机，屏幕上什么都不出
             let acts = t.session.feed(chunk);
             let finished = t.session.is_finished();
@@ -502,12 +571,13 @@ impl ByteTap for ZmodemTap {
                 t.reported = done;
             }
             if finished {
-                *cur = None;
-                self.busy.store(false, Ordering::SeqCst);
                 self.sniff.lock().unwrap().clear();
             }
+            // 排队与读状态在同一临界区内排序，取消不能插到这些效果之前。
+            if let Err(error) = self.dispatch(transfer_id, acts) {
+                *self.failure.lock().unwrap() = Some(error);
+            }
             drop(cur);
-            self.dispatch(acts);
             if milestone && dir == Direction::Send {
                 self.emit_progress_files("sending", "", done, total, fi, fc);
             } else if milestone {
@@ -545,9 +615,14 @@ impl ByteTap for ZmodemTap {
                     // （屏幕上闪一串 `**B0100...`，Xshell 同样如此），同时通知前端
                     // 弹选择框；用户选完由 `begin_send` 正式起会话。
                     sniff.clear();
+                    let first = !self.need_file_announced.swap(true, Ordering::SeqCst);
+                    if first {
+                        self.transfer_id.fetch_add(1, Ordering::SeqCst);
+                        *self.failure.lock().unwrap() = None;
+                    }
                     drop(sniff);
                     drop(cur);
-                    if !self.need_file_announced.swap(true, Ordering::SeqCst) {
+                    if first {
                         tracing::info!(
                             session_id = %self.session_id,
                             "检出 ZRINIT：远端在等文件（rz），请求前端选择本地文件"
@@ -563,28 +638,32 @@ impl ByteTap for ZmodemTap {
                     let hello = session.start();
                     let acts = session.feed(&probe[at..]);
                     let (done, total) = (session.transferred(), session.declared_size());
-                    let finished = session.is_finished();
-                    if !finished {
-                        *cur = Some(Transfer {
-                            session,
-                            sink: None,
-                            sink_path: None,
-                            source: None,
-                            recv_name: None,
-                            reported: 0,
-                            pending: Default::default(),
-                            file_index: 1,
-                            file_count: 1,
-                        });
-                        self.busy.store(true, Ordering::SeqCst);
+                    let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+                    *self.failure.lock().unwrap() = None;
+                    *cur = Some(Transfer {
+                        id: transfer_id,
+                        session,
+                        sink: None,
+                        sink_path: None,
+                        source: None,
+                        recv_name: None,
+                        reported: 0,
+                        pending: Default::default(),
+                        file_index: 1,
+                        file_count: 1,
+                    });
+                    self.busy.store(true, Ordering::SeqCst);
+                    if let Err(error) = self
+                        .queue(transfer_id, Effect::Send(hello))
+                        .and_then(|_| self.dispatch(transfer_id, acts))
+                    {
+                        *self.failure.lock().unwrap() = Some(error);
                     }
                     drop(cur);
                     tracing::info!(
                         session_id = %self.session_id, ?kind, at,
                         "检出 ZRQINIT：远端 sz 发文件，转入接收模式"
                     );
-                    let _ = self.tx.send(Effect::Send(hello));
-                    self.dispatch(acts);
                     self.emit_state("receiving", "", done, total);
                     // 帧起始之前的字节仍属终端。`at` 是在 `probe` 里的下标：落在滑窗
                     // 段内（at < s）说明帧头始于上一块，本块无一字节属于终端。
@@ -599,28 +678,124 @@ impl ByteTap for ZmodemTap {
     }
 }
 
+/// 等待本 tap 首次登记，并固定其 SSH 连接代次。
+/// 仅首次登记可等待；已经绑定的 tap 一旦失效决不能绑定新连接。
+async fn bound_session(
+    state: &Arc<crate::state::AppState>,
+    session_id: &str,
+    tap: &Arc<ZmodemTap>,
+) -> Result<
+    (
+        Arc<crate::sessions::LiveSession>,
+        tokio::sync::OwnedMutexGuard<()>,
+    ),
+    String,
+> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let bound = tap.connection_generation.load(Ordering::SeqCst);
+        if let Some((generation, session)) = state.registry.get_with_generation(session_id) {
+            if bound != 0 && bound != generation {
+                return Err("终端连接已变化，传输结果未知".into());
+            }
+            let gate = session.operation_gate.clone();
+            let guard = if bound == 0 {
+                match tokio::time::timeout_at(deadline, gate.lock_owned()).await {
+                    Ok(guard) => guard,
+                    Err(_) => return Err("终端传输首次登记超时，结果未知".into()),
+                }
+            } else {
+                gate.lock_owned().await
+            };
+            let same_generation = state.registry.generation_of(session_id) == Some(generation);
+            let same_tap = state
+                .zmodem
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, tap));
+            if same_generation && same_tap {
+                tap.connection_generation
+                    .store(generation, Ordering::SeqCst);
+                return Ok((session, guard));
+            }
+            drop(guard);
+            if bound != 0 {
+                return Err("终端传输会话已失效，结果未知".into());
+            }
+        } else if bound != 0 {
+            return Err("终端会话已关闭，传输结果未知".into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("终端传输首次登记超时，结果未知".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// 驱动任务：串行执行副作用。
 async fn drive(
     app: AppHandle,
     state: Arc<crate::state::AppState>,
     session_id: String,
     tap: std::sync::Weak<ZmodemTap>,
-    mut rx: mpsc::UnboundedReceiver<Effect>,
+    mut rx: mpsc::UnboundedReceiver<QueuedEffect>,
 ) {
-    while let Some(eff) = rx.recv().await {
-        match eff {
+    while let Some(queued) = rx.recv().await {
+        let Some(tap) = tap.upgrade() else { return };
+        let transfer_id = queued.transfer_id;
+        if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
+            continue;
+        }
+        let (session, _lifecycle) = match bound_session(&state, &session_id, &tap).await {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "ZMODEM 驱动停止");
+                *tap.failure.lock().unwrap() = Some(error.clone());
+                if state
+                    .zmodem
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &tap))
+                {
+                    emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                }
+                *tap.cur.lock().unwrap() = None;
+                tap.busy.store(false, Ordering::SeqCst);
+                tap.cancelling.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        // Waiting for the lifecycle gate may span completion and a new round.
+        if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
+            continue;
+        }
+        if tap.failure_message().is_some() && !matches!(queued.effect, Effect::Done { .. }) {
+            continue;
+        }
+        match queued.effect {
             Effect::Send(bytes) => {
-                let Some(session) = state.registry.get(&session_id) else {
-                    tracing::debug!(%session_id, "会话已关闭，ZMODEM 回写丢弃");
-                    continue;
-                };
                 let guard = session.write.lock().await;
                 if let Err(e) = guard.data_bytes(bytes).await {
-                    tracing::warn!(%session_id, error = %e, "ZMODEM 回写失败");
+                    let error = format!("ZMODEM 写入失败，传输结果未知：{e}");
+                    tracing::warn!(%session_id, %error);
+                    *tap.failure.lock().unwrap() = Some(error.clone());
+                    emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                    let mut cur = tap.cur.lock().unwrap();
+                    if let Some(t) = cur.as_mut() {
+                        let actions = t
+                            .session
+                            .cancel()
+                            .into_iter()
+                            .filter(|a| matches!(a, Action::Done { .. }))
+                            .collect();
+                        tap.cancelling.store(true, Ordering::SeqCst);
+                        let _ = tap.dispatch(transfer_id, actions);
+                    }
                 }
             }
             Effect::Begin { name, size } => {
-                let Some(tap) = tap.upgrade() else { return };
                 match open_spool(&tap.sandbox) {
                     Ok((file, path)) => {
                         tracing::info!(%session_id, ?path, size, "ZMODEM 开始接收（spool）");
@@ -637,48 +812,63 @@ async fn drive(
                     }
                     Err(e) => {
                         tracing::warn!(%session_id, name, error = %e, "ZMODEM 建暂存文件失败，取消传输");
-                        // 建不出文件就别让对端白发几百兆：立刻取消
-                        if let Ok(()) = tap.cancel() {}
+                        let error = format!("ZMODEM 建暂存文件失败，传输结果未知：{e}");
+                        *tap.failure.lock().unwrap() = Some(error.clone());
+                        emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                        let _ = tap.cancel();
                     }
                 }
             }
             Effect::Write(data) => {
-                let Some(tap) = tap.upgrade() else { return };
-                let mut cur = tap.cur.lock().unwrap();
-                if let Some(t) = cur.as_mut() {
-                    if let Some(sink) = t.sink.as_mut() {
-                        if let Err(e) = sink.write_all(&data) {
-                            tracing::warn!(%session_id, error = %e, "ZMODEM 落盘写失败");
-                        }
-                    }
+                let result = {
+                    let mut cur = tap.cur.lock().unwrap();
+                    cur.as_mut()
+                        .and_then(|t| t.sink.as_mut())
+                        .ok_or_else(|| "接收文件尚未打开".to_string())
+                        .and_then(|sink| sink.write_all(&data).map_err(|e| e.to_string()))
+                };
+                if let Err(e) = result {
+                    let error = format!("ZMODEM 落盘写失败，传输结果未知：{e}");
+                    *tap.failure.lock().unwrap() = Some(error.clone());
+                    emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                    let _ = tap.cancel();
                 }
             }
             Effect::Finish { bytes } => {
-                let Some(tap) = tap.upgrade() else { return };
-                let (spool, orig_name) = {
+                let result = {
                     let mut cur = tap.cur.lock().unwrap();
-                    cur.as_mut()
-                        .map(|t| {
-                            if let Some(mut sink) = t.sink.take() {
-                                // flush 的错误必须看：BufWriter 的 Drop 会吞掉它，
-                                // 那样「传输成功」的提示配上一个短了几 KiB 的文件。
-                                if let Err(e) = sink.flush() {
-                                    tracing::warn!(%session_id, error = %e, "ZMODEM 收尾 flush 失败");
-                                }
+                    match cur.as_mut() {
+                        Some(t) => match t.sink.take() {
+                            Some(mut sink) => {
+                                sink.flush().map_err(|e| e.to_string()).and_then(|()| {
+                                    match (t.sink_path.clone(), t.recv_name.clone()) {
+                                        (Some(path), Some(name)) => Ok((path, name)),
+                                        _ => Err("暂存文件信息缺失".into()),
+                                    }
+                                })
                             }
-                            (t.sink_path.clone(), t.recv_name.clone())
-                        })
-                        .unwrap_or((None, None))
-                };
-                let (Some(spool), Some(orig_name)) = (spool, orig_name) else {
-                    continue; // 没有 Begin 的 Finish：协议异常，无物可归置
-                };
-                let on_disk = std::fs::metadata(&spool).ok().map(|m| m.len());
-                if let (Some(disk), got) = (on_disk, bytes) {
-                    if disk != got {
-                        tracing::warn!(%session_id, disk, got, "落盘字节数与协议计数不符");
+                            None => Err("接收文件尚未打开".into()),
+                        },
+                        None => Err("传输已失效".into()),
                     }
                 }
+                .and_then(|(path, name)| {
+                    let disk = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                    if disk != bytes {
+                        return Err(format!("落盘字节数 {disk} 与协议计数 {bytes} 不符"));
+                    }
+                    Ok((path, name))
+                });
+                let (spool, orig_name) = match result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        let error = format!("ZMODEM 收尾失败，传输结果未知：{e}");
+                        *tap.failure.lock().unwrap() = Some(error.clone());
+                        emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                        let _ = tap.cancel();
+                        continue;
+                    }
+                };
                 // 上一个文件的决策还没被消费（用户没答、下一个文件已收完）：
                 // 按兜底策略先归置它——建议目录 + keep-both。**不能直接覆盖**，
                 // 覆盖会让它的 spool 成为 .incoming 里再没人引用的孤儿，
@@ -724,7 +914,6 @@ async fn drive(
                 decide_and_maybe_finalize(&app, &state, &tap, &session_id).await;
             }
             Effect::FileSent => {
-                let Some(tap) = tap.upgrade() else { return };
                 // 出队下一个或收尾。整段持锁：next_file 与换 source 必须原子，
                 // 中途放开的话 filter() 会在「新 ZFILE 已发、旧句柄还在」的窗口里
                 // 喂数据——喂的还是上一个文件的内容。
@@ -764,35 +953,53 @@ async fn drive(
                         None => t.session.finish(),
                     }
                 };
-                tap.dispatch(acts);
+                let _ = tap.dispatch(transfer_id, acts);
             }
             Effect::NeedChunk { offset } => {
-                let Some(tap) = tap.upgrade() else { return };
                 let mut buf = vec![0u8; fs_terminal::zsession::SUBPACKET_BYTES];
-                let acts = {
+                let result = {
                     let mut cur = tap.cur.lock().unwrap();
                     let Some(t) = cur.as_mut() else { continue };
-                    let n = match t.source.as_mut() {
-                        None => 0,
+                    match t.source.as_mut() {
+                        None => Err("待发文件不可用".to_string()),
                         Some(src) => {
-                            // 按状态机给的偏移定位再读。顺序读在重传（ZRPOS 回退）
-                            // 时会错位，且错位不报错——落地文件长度对、内容全错。
                             use std::io::Seek as _;
-                            if let Err(e) = src.seek(std::io::SeekFrom::Start(offset)) {
-                                tracing::warn!(%session_id, offset, error = %e, "ZMODEM 定位待发文件失败");
-                                0
-                            } else {
-                                read_full(src, &mut buf)
-                            }
+                            src.seek(std::io::SeekFrom::Start(offset))
+                                .and_then(|_| read_full(src, &mut buf))
+                                .and_then(|n| {
+                                    if n == 0
+                                        && t.session
+                                            .declared_size()
+                                            .is_some_and(|size| offset < size)
+                                    {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "待发文件提前结束",
+                                        ));
+                                    }
+                                    Ok(t.session.feed_file_chunk(&buf[..n]))
+                                })
+                                .map_err(|e| e.to_string())
                         }
-                    };
-                    t.session.feed_file_chunk(&buf[..n])
+                    }
                 };
-                tap.dispatch(acts);
+                let acts = match result {
+                    Ok(acts) => acts,
+                    Err(e) => {
+                        let error = format!("ZMODEM 读取待发文件失败，传输结果未知：{e}");
+                        *tap.failure.lock().unwrap() = Some(error.clone());
+                        emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                        let _ = tap.cancel();
+                        continue;
+                    }
+                };
+                let _ = tap.dispatch(transfer_id, acts);
             }
             Effect::Done { ok, message } => {
-                let Some(tap) = tap.upgrade() else { return };
                 let mut cur = tap.cur.lock().unwrap();
+                if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let path = cur.as_mut().and_then(|t| {
                     if let Some(mut sink) = t.sink.take() {
                         let _ = sink.flush();
@@ -800,10 +1007,14 @@ async fn drive(
                     t.sink_path.clone()
                 });
                 *cur = None;
-                drop(cur);
                 tap.busy.store(false, Ordering::SeqCst);
+                tap.cancelling.store(false, Ordering::SeqCst);
+                tap.sniff.lock().unwrap().clear();
                 // 复位「已通知」闩：下一次 rz 要能再弹一次选择框
                 tap.need_file_announced.store(false, Ordering::SeqCst);
+                let failure = tap.failure_message();
+                let ok = ok && failure.is_none();
+                let message = failure.unwrap_or(message);
                 tracing::info!(%session_id, ok, message, "ZMODEM 传输结束");
                 emit_progress(
                     &app,
@@ -815,6 +1026,7 @@ async fn drive(
                     None,
                     &message,
                 );
+                drop(cur);
             }
         }
     }
@@ -840,18 +1052,17 @@ fn display_path(p: &Path) -> String {
 }
 
 /// 读满一块（`Read::read` 允许短读，直接用会把文件切成大量小子包）。
-fn read_full(src: &mut std::io::BufReader<std::fs::File>, buf: &mut [u8]) -> usize {
-    use std::io::Read as _;
+fn read_full(src: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match src.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(k) => n += k,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    n
+    Ok(n)
 }
 
 /// 在沙箱的 `.incoming/` 下建一个 spool 文件（两段式下载的第一段）。
@@ -886,16 +1097,32 @@ mod tests {
     fn waiting_for_local_file_cancel_sends_can_and_reports_terminal() {
         let mut cur = None;
         let waiting = AtomicBool::new(true);
-        let acts =
-            cancellation_actions(&mut cur, &waiting).expect("waiting rz must be cancellable");
+        let cancelling = AtomicBool::new(false);
+        let acts = cancellation_actions(&mut cur, &waiting, &cancelling)
+            .expect("waiting rz must be cancellable");
         assert!(acts.iter().any(
             |a| matches!(a, Action::Send(bytes) if bytes == &fs_terminal::zmodem::cancel_sequence())
         ));
         assert!(acts
             .iter()
             .any(|a| matches!(a, Action::Done { ok: false, .. })));
-        assert!(!waiting.load(Ordering::SeqCst));
-        assert!(cancellation_actions(&mut cur, &waiting).is_err());
+        assert!(waiting.load(Ordering::SeqCst));
+        assert!(cancelling.load(Ordering::SeqCst));
+        assert!(cancellation_actions(&mut cur, &waiting, &cancelling)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn duplicate_waiting_cancel_is_idempotent() {
+        let mut cur = None;
+        let waiting = AtomicBool::new(true);
+        let cancelling = AtomicBool::new(false);
+        assert!(cancellation_actions(&mut cur, &waiting, &cancelling).is_ok());
+        assert!(
+            cancellation_actions(&mut cur, &waiting, &cancelling).is_ok(),
+            "accepted cancellation should remain idempotent until terminal event"
+        );
     }
 
     #[test]
@@ -1182,6 +1409,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_full_propagates_source_error() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read error"))
+            }
+        }
+        assert!(read_full(&mut Broken, &mut [0; 8]).is_err());
+    }
+
     /// S338：`read_full` 补齐短读——否则一次短读就把文件切成大量小子包，
     /// 传输速率会掉一个数量级。
     #[test]
@@ -1193,14 +1431,14 @@ mod tests {
         // BufReader 容量刻意小于目标块，制造短读
         let mut src = std::io::BufReader::with_capacity(7, std::fs::File::open(&path).unwrap());
         let mut buf = vec![0u8; 1024];
-        let n = read_full(&mut src, &mut buf);
+        let n = read_full(&mut src, &mut buf).unwrap();
         assert_eq!(n, 1024, "须读满整块（容量 7 的 BufReader 会逐次短读）");
         assert_eq!(&buf[..n], &payload[..1024]);
         // 末块短于目标：返回实际字节数，不得死循环
         let mut src2 = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
         let mut big = vec![0u8; 5000];
         assert_eq!(
-            read_full(&mut src2, &mut big),
+            read_full(&mut src2, &mut big).unwrap(),
             4096,
             "文件末尾返回实读字节数"
         );

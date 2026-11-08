@@ -106,7 +106,7 @@
     }
     void (async () => {
       try {
-        const s = await invoke<{ active: boolean; sandbox: string | null; auto: boolean }>(
+        const s = await invoke<{ active: boolean; sandbox: string | null; auto: boolean; error?: string | null }>(
           "zmodem_status",
           { sessionId: id },
         );
@@ -114,6 +114,7 @@
         if (sessionId !== id) return;
         backendActive = s.active;
         sandbox = s.sandbox;
+        if (s.error) toast.error(s.error);
       } catch {
         // 查不到就按未启用处理：这条只影响「要不要显示恢复条」，不该弹错提示
         if (sessionId === id) {
