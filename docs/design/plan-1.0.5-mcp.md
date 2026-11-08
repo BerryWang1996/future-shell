@@ -436,3 +436,9 @@ owner范围偏离由经理按证据批准：默认400行，预计闭环520；实
 1500daff独审未放行，发现两个新增P2并列为当前停止线：完整首ZRQINIT既start又feed产生双ZRINIT；尚未输出的潜在头前缀（普通末尾单*等）在取消/超时Done清sniff、无cur EOF及driver退出时可能丢失。当前只回修此二者：生产共用Start以完整首帧产生唯一响应，pending前缀归owner并经原tail/notify精确一次交回；旧尾先于fresh、发布/closed与owner槽同边界，Drop不拿cur/无await/无强环/poison恢复。bridge单文件自然≤200生产行目标，不为初150预估省顺序保护。须真实共用Start双向及所有split、一Begin/Finish、零握手前Send，以及literal*/partial在cancel/timeout/EOF/driverdrop下红绿；不拿probe全split绿代替Start副作用验证，不把既有41/15当新分支证据。
 
 后续两卡只读方案已核，未实施：busy约7文件220–300生产行，补GUI输入共享gate、各长操作/新提交/MCP关闭重连前后检查及单一BUSY→CONFLICT，read/status/cancel及GUI拆除保留；最后双tool约9文件280–380行，一次接线schema/managed/tier/引导/适配器/27项授权UI，五秒写预算内最后核owner/cancel/授权/root、mark_attempted紧接实际CR写，未知保原handle供查。全部待本轮owner回修独审后推进，未提前暴露半成品入口。
+
+后续实绩：fc60633单文件161生产行关闭owner两P2并独立D2放行；bridge45全跑及tail-poison追加1项，受控实际pipe证据不冒充native。busy76881fd七文件146生产行已D2放行，保留保守Busy可能先于旧gen Unavailable的非阻断优先级，仍无旧写。双tool b9ac065九文件284生产行两路独审，schema/权限/发现/UI放行；adapter发现预约拒绝遗留未登记空partial，c219817单文件20行已D2关闭：明确accepted/command_attempted=false并返回真实安全恢复相对路径，无假taskid，不删除已受理恢复文件。
+
+8dc4f33为c219代码加操作guide/索引/CHANGELOG，root亲验core426、app bridge50/mcp36/io8、前端全量1713通过+条件跳过的跨语言1项定向补齐，fmt/版本/文档与嵌入资源native构建通过。该候选exe SHA256为50416134ae09818e702af196cd2c8dd220f02d4f6659a4da12e236f94a60a22b。最终QA首个headless空文件上传即阻断：zsh-f执行command cd不会切当前目录，protocol_confirmed但文件误落B cwd而非所给qa-files。只读同TTY对照确证，不以“非POSIX”排除常见现场，不把协议确认冒充路径验证；其余矩阵未验，私有fixture已精确回收，证据`/tmp/fs111-final-public-8dc4f3364d36.json`。
+
+79363f7针对该实际落点root回修三生产文件14行，新增/调整测试另计；固定/bin/sh -c脚本与目录位置参数，argv0占位/$1精确、内层cd失败不rz、外层cwd保持，上传依赖/bin/sh+rz而下载sz，不要求人工exec sh。独立D2核真实sh/bash/zsh-f先红后绿36项及两rmcp断言各1，准重建后重新QA；stub oracle不是修后真实SSH，旧8dc反例仍保留。当前功能源码已冻结，正式发布/安装未执行。
