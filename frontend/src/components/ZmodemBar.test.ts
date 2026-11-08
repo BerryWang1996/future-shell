@@ -9,7 +9,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import ZmodemBar from "./ZmodemBar.svelte";
 import { toast } from "../lib/toast";
-import { IDLE, type TransferView } from "../lib/zmodem";
+import { readFileSync } from "node:fs";
+import { IDLE, reduce, type ZmodemProgress, type TransferView } from "../lib/zmodem";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -338,4 +339,41 @@ describe("download decision asynchronous ownership", () => {
     expect(error).not.toHaveBeenCalled();
     info.mockRestore(); error.mockRestore();
   });
+});
+
+// 此文件来自 Rust 的生产 pending_presentation 路径，显式环境变量使跨语言测试可复跑。
+const presentationFixture = process.env.FS111_PRESENTATION_FIXTURE;
+it.skipIf(!presentationFixture)("backend stale refresh preserves B conflict actions and the active directory choice", async () => {
+  const payload = JSON.parse(readFileSync(presentationFixture!, "utf8")) as Record<string, ZmodemProgress>;
+  const before = reduce(IDLE, payload.original);
+  const replayed = reduce(before, payload.replay);
+  expect(replayed).toBe(before); // 相同载荷不触发组件 effect，保留本地选择状态。
+  expect(replayed.decision).toEqual({ decisionId: "B-id", sessionId: "s1", name: "B",
+    suggestedDir: payload.original.suggestedDir, conflict: true, reason: "conflict" });
+  const { rerender } = render(ZmodemBar, { props: { sessionId: "s1", view: before } });
+  await rerender({ sessionId: "s1", view: replayed });
+  for (const action of ["zm-ow", "zm-keep", "zm-skip"]) expect(screen.getByTestId(action)).toBeTruthy();
+  const first = reduce(IDLE, payload.firstRun);
+  expect(first.decision?.reason).toBe("first-run");
+  await rerender({ sessionId: "s1", view: first });
+  await fireEvent.click(screen.getByText("记住这个目录，以后都存这里"));
+  await fireEvent.click(screen.getByTestId("zm-dec-change"));
+  await fireEvent.click(await screen.findByTestId("fp-dir"));
+  await waitFor(() => expect(screen.getByTestId("fp-crumbs").textContent).toContain("docs"));
+  const repeated = reduce(first, payload.firstRun);
+  expect(repeated).toBe(first);
+  await rerender({ sessionId: "s1", view: repeated });
+  expect((screen.getByText("记住这个目录，以后都存这里").querySelector("input") as HTMLInputElement)?.checked).toBe(true);
+  expect(screen.getByTestId("file-picker")).toBeTruthy();
+  expect(screen.getByTestId("fp-crumbs").textContent).toContain("docs");
+  await fireEvent.click(screen.getByTestId("fp-confirm"));
+  expect(screen.getByTestId("zm-dec-dir").textContent).toBe("docs");
+  await rerender({ sessionId: "s1", view: reduce(repeated, payload.firstRun) });
+  expect(screen.getByTestId("zm-dec-dir").textContent).toBe("docs");
+  await rerender({ sessionId: "s1", view: reduce(repeated, { ...payload.firstRun, decisionId: "new-id" }) });
+  expect((screen.getByText("记住这个目录，以后都存这里").querySelector("input") as HTMLInputElement)?.checked).toBe(false);
+  const initial = reduce(IDLE, payload.initial);
+  expect(initial.decision?.reason).toBe("choose-dir");
+  expect(initial.decision?.decisionId).toBe("B-id");
+  expect(initial.decision?.conflict).toBe(false);
 });

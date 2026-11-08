@@ -238,6 +238,8 @@ struct PendingFinalize {
     orig_name: String,
     /// 对端声明的字节数（saved 事件的 total 用）。
     bytes: u64,
+    /// 同一决策最近一次呈现的完整载荷，恢复时原样重放。
+    presentation: Option<serde_json::Value>,
 }
 
 impl ZmodemTap {
@@ -462,8 +464,8 @@ impl ZmodemTap {
 
     /// 仅展示恢复队首；调用方须先发前一项 saved，再发下一项提示。
     pub fn present_pending_download(&self) {
-        let pending_guard = self.pending_finalize.lock().unwrap();
-        let Some(pending) = pending_guard.front() else {
+        let mut pending_guard = self.pending_finalize.lock().unwrap();
+        let Some(pending) = pending_guard.front_mut() else {
             return;
         };
         let dir = self
@@ -472,23 +474,8 @@ impl ZmodemTap {
             .unwrap()
             .clone()
             .unwrap_or_else(|| default_download_dir(&self.sandbox));
-        let name = fs_sshengine::sandbox::escape_local_component(&pending.orig_name);
-        emit_progress_full(
-            &self.app,
-            &self.session_id,
-            "needs-decision",
-            &name,
-            None,
-            pending.bytes,
-            Some(pending.bytes),
-            "choose-dir",
-            None,
-            None,
-            Some(&display_path(&dir)),
-            Some(&display_path(&pending.spool)),
-            None,
-            Some(&pending.decision_id),
-        );
+        let payload = pending_presentation(pending, &self.session_id, &dir);
+        emit_decision_presentation(&self.app, &payload);
     }
 
     /// 把状态机动作翻译成副作用并投递。
@@ -983,6 +970,7 @@ async fn drive(
                         spool,
                         orig_name,
                         bytes,
+                        presentation: None,
                     },
                     &dir,
                 );
@@ -1370,6 +1358,7 @@ mod tests {
                 spool,
                 orig_name: "payload.bin".into(),
                 bytes: 12,
+                presentation: None,
             };
             let id = pending.decision_id.clone();
             let mut slot = std::collections::VecDeque::from([pending]);
@@ -1399,6 +1388,74 @@ mod tests {
     }
 
     #[test]
+    fn stale_refresh_replays_the_presented_decision_without_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("out");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("B"), b"existing B").unwrap();
+        let spool = root.path().join("B.part");
+        std::fs::write(&spool, b"received B").unwrap();
+        let selected = Mutex::new(Some(dir.clone()));
+        let finalized = Mutex::new(Default::default());
+        let mut slot = std::collections::VecDeque::from([PendingFinalize {
+            decision_id: "B-id".into(),
+            spool: spool.clone(),
+            orig_name: "B".into(),
+            bytes: 10,
+            presentation: None,
+        }]);
+        let original = decision_presentation(
+            slot.front_mut().unwrap(),
+            "s1",
+            &dir,
+            "conflict",
+            Some(true),
+        );
+        let forbidden = root.path().join("must-not-create");
+        assert!(finalize_pending(
+            &mut slot,
+            &selected,
+            &finalized,
+            "s1",
+            "stale-A-id",
+            &forbidden,
+            None,
+            "skip"
+        )
+        .unwrap()
+        .is_none());
+        // 与命令 stale 分支的 present_pending_download 使用完全相同的取值函数。
+        let replay = pending_presentation(slot.front_mut().unwrap(), "s1", &forbidden);
+        assert_eq!(
+            replay, original,
+            "stale A must replay B's complete conflict presentation"
+        );
+        assert_eq!(std::fs::read(&spool).unwrap(), b"received B");
+        assert_eq!(std::fs::read(dir.join("B")).unwrap(), b"existing B");
+        assert_eq!(*selected.lock().unwrap(), Some(dir.clone()));
+        assert!(finalized.lock().unwrap().is_empty());
+        assert_eq!(slot.len(), 1);
+        assert_eq!(slot.front().unwrap().decision_id, "B-id");
+        assert!(!forbidden.exists());
+        let pending = slot.front_mut().unwrap();
+        let first_run = decision_presentation(pending, "s1", &dir, "first-run", None);
+        assert_eq!(pending_presentation(pending, "s1", &forbidden), first_run);
+        pending.presentation = None;
+        let initial = pending_presentation(pending, "s1", &forbidden);
+        assert_eq!(initial["message"], "choose-dir");
+        assert_eq!(initial["conflict"], serde_json::Value::Null);
+        assert_eq!(initial["decisionId"], "B-id");
+        assert!(!forbidden.exists());
+        assert_eq!(std::fs::read(&spool).unwrap(), b"received B");
+        // 显式输出生产 refresh 载荷供前端契约测试读取，不在仓库保存临时数据。
+        if let Some(path) = std::env::var_os("FS111_PRESENTATION_FIXTURE") {
+            std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+                "original": original, "replay": replay, "firstRun": first_run, "initial": initial,
+            })).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn decision_identity_survives_both_finalize_lock_orders() {
         for ipc_first in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1412,6 +1469,7 @@ mod tests {
                     spool,
                     orig_name: name.into(),
                     bytes: 1,
+                    presentation: None,
                 }
             };
             let a = make("A");
@@ -1489,6 +1547,7 @@ mod tests {
             spool: spool.clone(),
             orig_name: "payload".into(),
             bytes: 8,
+            presentation: None,
         }]);
         let selected = Mutex::new(None);
         let finalized = Mutex::new(Default::default());
@@ -1548,6 +1607,7 @@ mod tests {
                     spool,
                     orig_name: name.into(),
                     bytes: data.len() as u64,
+                    presentation: None,
                 },
                 &blocked,
             );
@@ -1848,6 +1908,7 @@ mod tests {
                 spool: spool.clone(),
                 orig_name: "a.txt".into(),
                 bytes: 7,
+                presentation: None,
             },
             &dir,
             None,
@@ -1901,6 +1962,7 @@ mod tests {
                 spool,
                 orig_name: "rec.bin".into(),
                 bytes: 1,
+                presentation: None,
             },
             &dir,
             None,
@@ -1968,6 +2030,63 @@ fn default_download_dir(sandbox: &Path) -> PathBuf {
         .unwrap_or_else(|| sandbox.to_path_buf())
 }
 
+/// 生成并记住用户已经看到的语义；所有决策展示共用此入口。
+fn decision_presentation(
+    pending: &mut PendingFinalize,
+    session_id: &str,
+    dir: &Path,
+    reason: &str,
+    conflict: Option<bool>,
+) -> serde_json::Value {
+    let name = fs_sshengine::sandbox::escape_local_component(&pending.orig_name);
+    let name = if name.trim().is_empty() {
+        "received"
+    } else {
+        &name
+    };
+    let payload = serde_json::json!({
+        "sessionId": session_id, "phase": "needs-decision", "name": name,
+        "path": null, "done": pending.bytes, "total": pending.bytes,
+        "message": reason, "file_index": null, "file_count": null,
+        "suggestedDir": display_path(dir), "spoolPath": display_path(&pending.spool),
+        "conflict": conflict, "decisionId": pending.decision_id,
+    });
+    pending.presentation = Some(payload.clone());
+    payload
+}
+
+/// 沿用唯一事件发送点，保持事件契约扫描与其他进度事件一致。
+fn emit_decision_presentation(app: &AppHandle, payload: &serde_json::Value) {
+    emit_progress_full(
+        app,
+        payload["sessionId"].as_str().unwrap(),
+        "needs-decision",
+        payload["name"].as_str().unwrap(),
+        None,
+        payload["done"].as_u64().unwrap(),
+        payload["total"].as_u64(),
+        payload["message"].as_str().unwrap(),
+        None,
+        None,
+        payload["suggestedDir"].as_str(),
+        payload["spoolPath"].as_str(),
+        payload["conflict"].as_bool(),
+        payload["decisionId"].as_str(),
+    );
+}
+
+/// 恢复不重新决定去向、检测冲突或落盘；未呈现过的项只提示选择目录。
+fn pending_presentation(
+    pending: &mut PendingFinalize,
+    session_id: &str,
+    initial_dir: &Path,
+) -> serde_json::Value {
+    if let Some(payload) = &pending.presentation {
+        return payload.clone();
+    }
+    decision_presentation(pending, session_id, initial_dir, "choose-dir", None)
+}
+
 fn choose_download_dir(
     session_dir: &Mutex<Option<PathBuf>>,
     from_setting: Option<PathBuf>,
@@ -2010,8 +2129,8 @@ async fn decide_and_maybe_finalize(
     };
     let dir = choose_download_dir(&tap.session_download_dir, from_setting);
 
-    let pending_guard = tap.pending_finalize.lock().unwrap();
-    let Some(pending) = pending_guard.front().cloned() else {
+    let mut pending_guard = tap.pending_finalize.lock().unwrap();
+    let Some(pending) = pending_guard.front_mut() else {
         return;
     };
     // 展示名沿用旧避让逻辑的清洗（不改变盘上事实，只让文案里不出现裸控制字符）
@@ -2030,22 +2149,8 @@ async fn decide_and_maybe_finalize(
             "choose-dir"
         };
         let suggested = default_download_dir(&tap.sandbox);
-        emit_progress_full(
-            app,
-            session_id,
-            "needs-decision",
-            &display_name,
-            None,
-            pending.bytes,
-            Some(pending.bytes),
-            reason,
-            None,
-            None,
-            Some(&display_path(&suggested)),
-            Some(&display_path(&pending.spool)),
-            None,
-            Some(&pending.decision_id),
-        );
+        let payload = decision_presentation(pending, session_id, &suggested, reason, None);
+        emit_decision_presentation(app, &payload);
         return;
     };
 
@@ -2054,6 +2159,7 @@ async fn decide_and_maybe_finalize(
     let target = dir.join(&display_name);
     if !target.exists() {
         // 无冲突：身份随调用传递，释放展示锁后也不消费别项。
+        let pending = pending.clone();
         drop(pending_guard);
         let (name, path, bytes) = match finalize_download(
             tap,
@@ -2092,22 +2198,8 @@ async fn decide_and_maybe_finalize(
     }
 
     // 冲突：问。带上建议目录与冲突标记；spool 路径让前端在「关闭=兜底归置」时回传场景使用。
-    emit_progress_full(
-        app,
-        session_id,
-        "needs-decision",
-        &display_name,
-        None,
-        pending.bytes,
-        Some(pending.bytes),
-        "conflict",
-        None,
-        None,
-        Some(&display_path(&dir)),
-        Some(&display_path(&pending.spool)),
-        Some(true),
-        Some(&pending.decision_id),
-    );
+    let payload = decision_presentation(pending, session_id, &dir, "conflict", Some(true));
+    emit_decision_presentation(app, &payload);
 }
 
 /// 归置的冲突策略。

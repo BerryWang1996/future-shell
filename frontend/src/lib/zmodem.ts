@@ -148,7 +148,21 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         fileIndex: ev.file_index ?? prev.fileIndex,
         fileCount: ev.file_count ?? prev.fileCount,
       };
-    case "needs-decision":
+    case "needs-decision": {
+      const decision: DownloadDecision = {
+        decisionId: ev.decisionId ?? "",
+        sessionId: ev.sessionId,
+        name: ev.name || prev.name,
+        suggestedDir: ev.suggestedDir ?? "",
+        conflict: ev.conflict ?? false,
+        reason: ev.message || (ev.conflict ? "conflict" : "first-run"),
+      };
+      // 后端原样重放同一决策时保留对象，避免重跑组件 effect 清空用户选择。
+      const old = prev.decision;
+      if (old && old.decisionId === decision.decisionId && old.sessionId === decision.sessionId
+        && old.name === decision.name && old.suggestedDir === decision.suggestedDir
+        && old.conflict === decision.conflict && old.reason === decision.reason
+        && prev.done === ev.done && prev.total === (ev.total ?? prev.total)) return prev;
       return {
         ...prev,
         visible: true,
@@ -156,15 +170,9 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         name: ev.name || prev.name,
         done: ev.done,
         total: ev.total ?? prev.total,
-        decision: {
-          decisionId: ev.decisionId ?? "",
-          sessionId: ev.sessionId,
-          name: ev.name || prev.name,
-          suggestedDir: ev.suggestedDir ?? "",
-          conflict: ev.conflict ?? false,
-          reason: ev.message || (ev.conflict ? "conflict" : "first-run"),
-        },
+        decision,
       };
+    }
     case "done":
     case "failed":
       return {

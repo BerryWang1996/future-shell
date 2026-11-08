@@ -101,7 +101,6 @@
       void finalize(effDir(), applyPolicy, null);
       return;
     }
-    rememberChoice = null;
   });
 
   // 会话终态复位「其余同此处理」：下次传输重新问（与后端 session 目录的
