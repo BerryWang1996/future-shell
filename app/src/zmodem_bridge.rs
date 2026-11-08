@@ -120,6 +120,25 @@ fn effect_admitted(effect: &Effect, cancelling: bool, failed: bool) -> bool {
     }
 }
 
+fn effect_from_action(a: Action, cancelling: &AtomicBool) -> Effect {
+    match a {
+        Action::Send(b) if b == fs_terminal::zmodem::cancel_sequence() => Effect::Cancel,
+        Action::Send(b) => Effect::Send(b),
+        Action::BeginRecv(info) => Effect::Begin {
+            name: info.name,
+            size: info.size,
+        },
+        Action::Write(d) => Effect::Write(d),
+        Action::FinishRecv { bytes } => Effect::Finish { bytes },
+        Action::NeedChunk { offset } => Effect::NeedChunk { offset },
+        Action::FileSent => Effect::FileSent,
+        Action::Done { ok: false, message } if cancelling.load(Ordering::SeqCst) => {
+            Effect::CancelDone { message }
+        }
+        Action::Done { ok, message } => Effect::Done { ok, message },
+    }
+}
+
 struct QueuedEffect {
     transfer_id: u64,
     effect: Effect,
@@ -166,7 +185,12 @@ impl EffectQueue {
         };
     }
 
-    fn push(&mut self, transfer_id: u64, effect: Effect) -> Result<(), String> {
+    fn push(
+        &mut self,
+        transfer_id: u64,
+        effect: Effect,
+        cancelling: &AtomicBool,
+    ) -> Result<(), String> {
         if transfer_id != self.round {
             return Ok(());
         }
@@ -182,6 +206,8 @@ impl EffectQueue {
         }
         match effect {
             Effect::Cancel => {
+                // CAN 会抢先于普通队列；必须同时封住所有旧数据效果。
+                cancelling.store(true, Ordering::SeqCst);
                 self.cancel = true;
                 return Ok(());
             }
@@ -452,8 +478,7 @@ impl ZmodemTap {
         if !self.pending_finalize.lock().unwrap().is_empty() {
             return Err("请先保存已接收的文件，再开始新传输".into());
         }
-        let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
-        self.reset_effects(transfer_id);
+        let transfer_id = self.next_round();
         *self.failure.lock().unwrap() = None;
         let (first_path, first_size, first_file) = opened.remove(0);
         let name = first_path
@@ -626,7 +651,7 @@ impl ZmodemTap {
     fn queue(&self, transfer_id: u64, effect: Effect) -> Result<(), String> {
         let mut queue = self.effects.queue.lock().unwrap();
         let was_failed = queue.failed;
-        let result = queue.push(transfer_id, effect);
+        let result = queue.push(transfer_id, effect, &self.cancelling);
         let overflow = !was_failed && queue.failed;
         if overflow {
             // queue 入口也用于持 cur 的同步 filter；这里决不递归 cancel/获取 cur。
@@ -643,28 +668,16 @@ impl ZmodemTap {
         result
     }
 
-    fn reset_effects(&self, round: u64) {
-        self.effects.queue.lock().unwrap().reset(round);
+    fn next_round(&self) -> u64 {
+        let mut queue = self.effects.queue.lock().unwrap();
+        let round = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+        queue.reset(round);
+        round
     }
 
     fn dispatch(&self, transfer_id: u64, acts: Vec<Action>) -> Result<(), String> {
         for a in acts {
-            let eff = match a {
-                Action::Send(b) if b == fs_terminal::zmodem::cancel_sequence() => Effect::Cancel,
-                Action::Send(b) => Effect::Send(b),
-                Action::BeginRecv(info) => Effect::Begin {
-                    name: info.name,
-                    size: info.size,
-                },
-                Action::Write(d) => Effect::Write(d),
-                Action::FinishRecv { bytes } => Effect::Finish { bytes },
-                Action::NeedChunk { offset } => Effect::NeedChunk { offset },
-                Action::FileSent => Effect::FileSent,
-                Action::Done { ok: false, message } if self.cancelling.load(Ordering::SeqCst) => {
-                    Effect::CancelDone { message }
-                }
-                Action::Done { ok, message } => Effect::Done { ok, message },
-            };
+            let eff = effect_from_action(a, &self.cancelling);
             self.queue(transfer_id, eff)?;
         }
         Ok(())
@@ -847,8 +860,7 @@ impl ByteTap for ZmodemTap {
                     sniff.clear();
                     let first = !self.need_file_announced.swap(true, Ordering::SeqCst);
                     if first {
-                        let round = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
-                        self.reset_effects(round);
+                        self.next_round();
                         *self.failure.lock().unwrap() = None;
                     }
                     drop(sniff);
@@ -869,8 +881,7 @@ impl ByteTap for ZmodemTap {
                     let hello = session.start();
                     let acts = session.feed(&probe[at..]);
                     let (done, total) = (session.transferred(), session.declared_size());
-                    let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
-                    self.reset_effects(transfer_id);
+                    let transfer_id = self.next_round();
                     *self.failure.lock().unwrap() = None;
                     *cur = Some(Transfer {
                         id: transfer_id,
@@ -1296,8 +1307,7 @@ async fn drive(
                 });
                 *cur = None;
                 // 关闭本轮：已排队的迟到 Done/数据不得复活它。
-                let round = tap.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
-                tap.reset_effects(round);
+                tap.next_round();
                 tap.busy.store(false, Ordering::SeqCst);
                 tap.cancelling.store(false, Ordering::SeqCst);
                 tap.sniff.lock().unwrap().clear();
@@ -1393,6 +1403,12 @@ fn open_spool(sandbox: &Path) -> Result<(std::fs::File, PathBuf), String> {
 mod tests {
     use super::*;
 
+    impl EffectQueue {
+        fn test_push(&mut self, round: u64, effect: Effect) -> Result<(), String> {
+            self.push(round, effect, &AtomicBool::new(false))
+        }
+    }
+
     fn transfer(session: ZmodemSession) -> Transfer {
         Transfer {
             id: 1,
@@ -1409,29 +1425,110 @@ mod tests {
     }
 
     #[test]
+    fn protocol_cancel_blocks_queued_data_and_routes_failure_to_control_slot() {
+        use fs_terminal::zmodem::{FrameHeader, FrameKind};
+        let mut skip = ZmodemSession::new_receive();
+        let skip_actions = skip.feed(
+            &FrameHeader {
+                kind: FrameKind::ZSKIP,
+                flags: [0; 4],
+            }
+            .to_hex(),
+        );
+        let mut cache = ZmodemSession::new_receive();
+        cache.feed(
+            &FrameHeader {
+                kind: FrameKind::ZDATA,
+                flags: [0; 4],
+            }
+            .to_bin32(),
+        );
+        let cache_actions = cache.feed(&vec![b'x'; 1024 * 1024 + 1]);
+        let mut close = ZmodemSession::new_send("empty", 0);
+        close.finish();
+        let close_actions =
+            close.expire_close(std::time::Instant::now() + std::time::Duration::from_secs(20));
+        for acts in [skip_actions, cache_actions, close_actions] {
+            let cancelling = AtomicBool::new(false);
+            let mut queue = EffectQueue::default();
+            queue.reset(7);
+            queue
+                .test_push(7, Effect::Write(b"pending".to_vec()))
+                .unwrap();
+            queue.test_push(7, Effect::Send(b"ZACK".to_vec())).unwrap();
+            for action in acts {
+                queue
+                    .push(7, effect_from_action(action, &cancelling), &cancelling)
+                    .unwrap();
+            }
+            let mut admitted = Vec::new();
+            while let Some(queued) = queue.pop() {
+                if effect_admitted(&queued.effect, cancelling.load(Ordering::SeqCst), false) {
+                    admitted.push(queued.effect);
+                }
+            }
+            assert!(matches!(
+                &admitted[..],
+                [Effect::Cancel, Effect::CancelDone { .. }]
+            ));
+            assert!(cancelling.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn stale_protocol_cancel_does_not_set_new_round_cancellation_gate() {
+        let cancelling = AtomicBool::new(false);
+        let mut queue = EffectQueue::default();
+        queue.reset(9);
+        for action in [
+            Action::Send(fs_terminal::zmodem::cancel_sequence()),
+            Action::Done {
+                ok: false,
+                message: "old".into(),
+            },
+        ] {
+            queue
+                .push(7, effect_from_action(action, &cancelling), &cancelling)
+                .unwrap();
+        }
+        assert!(!cancelling.load(Ordering::SeqCst));
+        queue
+            .push(9, Effect::Send(b"new".to_vec()), &cancelling)
+            .unwrap();
+        let queued = queue.pop().unwrap();
+        assert_eq!(queued.transfer_id, 9);
+        assert!(effect_admitted(
+            &queued.effect,
+            cancelling.load(Ordering::SeqCst),
+            false
+        ));
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
     fn paused_consumer_count_and_payload_overflow_keep_control_reachable() {
         for payload_limit in [false, true] {
             let mut queue = EffectQueue::default();
             queue.reset(7);
             if payload_limit {
                 queue
-                    .push(7, Effect::Write(vec![1; MAX_QUEUED_BYTES]))
+                    .test_push(7, Effect::Write(vec![1; MAX_QUEUED_BYTES]))
                     .unwrap();
             } else {
                 for _ in 0..MAX_QUEUED_EFFECTS {
-                    queue.push(7, Effect::Write(vec![1; 1024])).unwrap();
+                    queue.test_push(7, Effect::Write(vec![1; 1024])).unwrap();
                 }
             }
             assert!(queue
-                .push(7, Effect::Write(vec![2]))
+                .test_push(7, Effect::Write(vec![2]))
                 .unwrap_err()
                 .contains("上限"));
             assert!(queue.failed);
             assert_eq!(queue.bytes, 0);
             assert!(queue.data.is_empty());
-            queue.push(7, Effect::Cancel).unwrap();
+            queue.test_push(7, Effect::Cancel).unwrap();
             queue
-                .push(
+                .test_push(
                     7,
                     Effect::CancelDone {
                         message: "user cancel".into(),
@@ -1439,7 +1536,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(queue
-                .push(
+                .test_push(
                     7,
                     Effect::Done {
                         ok: true,
@@ -1452,12 +1549,12 @@ mod tests {
                 Effect::CancelDone { message } if message == QUEUE_OVERFLOW));
             assert!(queue.pop().is_none());
             // 消费完控制通知后仍粘滞，不能被新数据重新填充。
-            assert!(queue.push(7, Effect::FileSent).is_err());
+            assert!(queue.test_push(7, Effect::FileSent).is_err());
             assert!(queue.pop().is_none());
             queue.reset(9);
-            queue.push(7, Effect::Cancel).unwrap();
+            queue.test_push(7, Effect::Cancel).unwrap();
             queue
-                .push(
+                .test_push(
                     7,
                     Effect::CancelDone {
                         message: "old".into(),
@@ -1465,7 +1562,7 @@ mod tests {
                 )
                 .unwrap();
             queue
-                .push(
+                .test_push(
                     7,
                     Effect::Done {
                         ok: true,
@@ -1474,7 +1571,7 @@ mod tests {
                 )
                 .unwrap();
             queue
-                .push(
+                .test_push(
                     9,
                     Effect::Begin {
                         name: "empty".into(),
@@ -1482,9 +1579,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-            queue.push(9, Effect::Finish { bytes: 0 }).unwrap();
+            queue.test_push(9, Effect::Finish { bytes: 0 }).unwrap();
             queue
-                .push(
+                .test_push(
                     9,
                     Effect::Done {
                         ok: true,
@@ -1507,7 +1604,7 @@ mod tests {
         let mut written = 0;
         for size in [0, 4 * 1024 * 1024] {
             queue
-                .push(
+                .test_push(
                     1,
                     Effect::Begin {
                         name: "batch".into(),
@@ -1519,7 +1616,7 @@ mod tests {
             // 模拟每次 64 KiB 读块，消费者在下一读块之前可排空。
             for _ in 0..size / 65536 {
                 for _ in 0..64 {
-                    queue.push(1, Effect::Write(vec![1; 1024])).unwrap();
+                    queue.test_push(1, Effect::Write(vec![1; 1024])).unwrap();
                 }
                 while let Some(queued) = queue.pop() {
                     if let Effect::Write(data) = queued.effect {
@@ -1530,13 +1627,13 @@ mod tests {
                 }
                 assert_eq!(queue.bytes, 0);
             }
-            queue.push(1, Effect::Finish { bytes: size }).unwrap();
+            queue.test_push(1, Effect::Finish { bytes: size }).unwrap();
             assert!(
                 matches!(queue.pop().unwrap().effect, Effect::Finish { bytes } if bytes == size)
             );
         }
         queue
-            .push(
+            .test_push(
                 1,
                 Effect::Done {
                     ok: true,
@@ -1557,7 +1654,7 @@ mod tests {
     fn control_payload_is_bounded_at_utf8_boundary() {
         let mut queue = EffectQueue::default();
         queue
-            .push(
+            .test_push(
                 0,
                 Effect::CancelDone {
                     message: "中".repeat(4096),
@@ -1578,9 +1675,9 @@ mod tests {
         {
             let mut queue = channel.queue.lock().unwrap();
             queue
-                .push(3, Effect::Write(vec![0; MAX_QUEUED_BYTES]))
+                .test_push(3, Effect::Write(vec![0; MAX_QUEUED_BYTES]))
                 .unwrap();
-            assert!(queue.push(3, Effect::Write(vec![1])).is_err());
+            assert!(queue.test_push(3, Effect::Write(vec![1])).is_err());
         }
         channel.ready.notify_one();
         assert!(matches!(receiver.0.recv().await.effect, Effect::Cancel));
@@ -1599,13 +1696,13 @@ mod tests {
             .queue
             .lock()
             .unwrap()
-            .push(4, Effect::Write(vec![1; 100]))
+            .test_push(4, Effect::Write(vec![1; 100]))
             .unwrap();
         drop(receiver);
         let mut queue = channel.queue.lock().unwrap();
         assert!(queue.data.is_empty());
         assert!(queue
-            .push(4, Effect::FileSent)
+            .test_push(4, Effect::FileSent)
             .unwrap_err()
             .contains("驱动不可用"));
     }
