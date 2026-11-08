@@ -432,3 +432,7 @@ owner卡现已固定1500daff，独审在途，尚无新tool可调用。IO cc1390
 owner范围偏离由经理按证据批准：默认400行，预计闭环520；实际driver异常退出/只存Rx在tap会永久running，须Weak槽DropGuard+closed；被动头at实际为结束偏移，修整包还不足以处理split半头泄露，须共用bounded pending-prefix；新增partial路径也必须同步接撤权hide_paths，故最终四文件655生产行、458测试行。没有新执行器/工具/权限规则或通用框架；用有限文件/固定diff完整独审守住范围，未删注释或省保护凑数字，不要求用户为内部默认预算批准。初版不安全代码不作阶段放行。
 
 1500daff定向bridge41/41、tasks15/15，较早MCP31/31原日志在`/tmp/fs111-owner-{bridge,tasks,mcp}-green.log`；offset oracle先红单列passive-red，不冒称所有split先红。覆盖生产共用probe所有头分块/ordinary echo/wrongdir、真实spool+post-watch commit竞争、guard drop/poison/旧slot/initialpartial，GUI begin_send在cur锁拒pending，GUI取消复用owner且未attempt不CAN。closed driver最前透传stale cur为固定代码+局部guard限定等价，未原生强制abort/全GUI/真PTY；后busy卡及两tool原子接线仍未做，最终QA contract维持false。
+
+1500daff独审未放行，发现两个新增P2并列为当前停止线：完整首ZRQINIT既start又feed产生双ZRINIT；尚未输出的潜在头前缀（普通末尾单*等）在取消/超时Done清sniff、无cur EOF及driver退出时可能丢失。当前只回修此二者：生产共用Start以完整首帧产生唯一响应，pending前缀归owner并经原tail/notify精确一次交回；旧尾先于fresh、发布/closed与owner槽同边界，Drop不拿cur/无await/无强环/poison恢复。bridge单文件自然≤200生产行目标，不为初150预估省顺序保护。须真实共用Start双向及所有split、一Begin/Finish、零握手前Send，以及literal*/partial在cancel/timeout/EOF/driverdrop下红绿；不拿probe全split绿代替Start副作用验证，不把既有41/15当新分支证据。
+
+后续两卡只读方案已核，未实施：busy约7文件220–300生产行，补GUI输入共享gate、各长操作/新提交/MCP关闭重连前后检查及单一BUSY→CONFLICT，read/status/cancel及GUI拆除保留；最后双tool约9文件280–380行，一次接线schema/managed/tier/引导/适配器/27项授权UI，五秒写预算内最后核owner/cancel/授权/root、mark_attempted紧接实际CR写，未知保原handle供查。全部待本轮owner回修独审后推进，未提前暴露半成品入口。
