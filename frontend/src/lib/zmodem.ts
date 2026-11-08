@@ -145,6 +145,7 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         total: ev.total ?? prev.total,
         ratio: 1,
         path: ev.path ?? prev.path,
+        message: prev.ok === true ? "文件已保存" : prev.message,
         fileIndex: ev.file_index ?? prev.fileIndex,
         fileCount: ev.file_count ?? prev.fileCount,
       };

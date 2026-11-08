@@ -127,3 +127,48 @@ it("matching skip closes its decision without a reveal path", () => {
   expect(skipped.message).toContain("跳过");
   expect(reduce(a, ev({phase: "saved", decisionId: "A", sessionId: "old-connection"}))).toEqual(a);
 });
+
+
+it.each(["协议传输完成，文件等待保存", "protocol finished; awaiting save"])(
+  "saved replaces completed protocol status (%s) with current file saved", (message) => {
+    let pending = reduce(IDLE, ev({ phase: "needs-decision", decisionId: "B", name: "b.bin" }));
+    pending = reduce(pending, ev({ phase: "done", message }));
+    const saved = reduce(pending, ev({ phase: "saved", decisionId: "B", name: "b.bin", path: "/out/b.bin" }));
+    expect(saved.message).toBe("文件已保存");
+    expect(saved.ok).toBe(true);
+    expect(saved.decision).toBeNull();
+    expect(saved.path).toBe("/out/b.bin");
+  },
+);
+
+it("saved during receiving does not finish the protocol", () => {
+  const receiving = reduce(IDLE, ev({ phase: "receiving", name: "b.bin", done: 10, total: 20 }));
+  const saved = reduce(receiving, ev({ phase: "saved", name: "b.bin", path: "/out/b.bin" }));
+  expect(saved.ok).toBeNull();
+  expect(saved.message).toBe("");
+  expect(saved.path).toBe("/out/b.bin");
+});
+
+it("saved after failure keeps the protocol failure reason", () => {
+  let pending = reduce(IDLE, ev({ phase: "needs-decision", decisionId: "B" }));
+  pending = reduce(pending, ev({ phase: "failed", message: "connection closed before protocol acknowledgement" }));
+  const saved = reduce(pending, ev({ phase: "saved", decisionId: "B", path: "/out/b.bin" }));
+  expect(saved.ok).toBe(false);
+  expect(saved.message).toBe(pending.message);
+  expect(saved.decision).toBeNull();
+  expect(saved.path).toBe("/out/b.bin");
+});
+
+it("stale saved cannot replace B's completed protocol status", () => {
+  let b = reduce(IDLE, ev({ phase: "needs-decision", decisionId: "B", name: "b.bin" }));
+  b = reduce(b, ev({ phase: "done", message: "protocol complete; awaiting B" }));
+  for (const stale of [{ decisionId: "A", sessionId: "s1" }, { decisionId: "B", sessionId: "old-session" }]) {
+    expect(reduce(b, ev({ phase: "saved", path: "/out/a.bin", ...stale }))).toBe(b);
+  }
+});
+
+it("same decision replay keeps its presentation object", () => {
+  const presentation = ev({ phase: "needs-decision", decisionId: "B", name: "b.bin", suggestedDir: "/out", conflict: true, message: "conflict" });
+  const before = reduce(IDLE, presentation);
+  expect(reduce(before, presentation)).toBe(before);
+});
