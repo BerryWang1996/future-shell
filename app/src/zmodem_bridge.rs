@@ -342,9 +342,24 @@ pub(crate) struct McpReservation {
     pub io: McpTransferIo,
 }
 // 一个 guard 只绑定原 driver 的通道和 owner 槽，不会清理新 tap 的任务。
-struct McpDriverGuard(Weak<Mutex<Option<McpOwner>>>, Weak<EffectChannel>);
+struct McpDriverGuard(
+    Weak<Mutex<Option<McpOwner>>>,
+    Weak<EffectChannel>,
+    Weak<TailOutput>,
+);
 impl Drop for McpDriverGuard {
     fn drop(&mut self) {
+        let slot = self.0.upgrade();
+        let mut owner = slot
+            .as_ref()
+            .map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
+        // Owner → Tail → Queue；发布旧前缀后 closed 才可见，且不触碰 cur。
+        if let (Some(owner), Some(tail)) = (
+            owner.as_mut().and_then(|slot| slot.as_mut()),
+            self.2.upgrade(),
+        ) {
+            tail.reclaim(owner);
+        }
         if let Some(effects) = self.1.upgrade() {
             effects
                 .queue
@@ -352,9 +367,33 @@ impl Drop for McpDriverGuard {
                 .unwrap_or_else(|p| p.into_inner())
                 .closed = true;
         }
-        if let Some(owner) = self.0.upgrade() {
-            owner.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(mut slot) = owner {
+            slot.take();
         }
+    }
+}
+
+#[derive(Default)]
+struct TailOutput {
+    bytes: Mutex<Vec<u8>>,
+    ready: Notify,
+}
+impl TailOutput {
+    fn publish(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.bytes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(bytes);
+        self.ready.notify_one();
+    }
+    fn reclaim(&self, owner: &mut McpOwner) {
+        self.publish(owner.take_passive_prefix());
+    }
+    fn drain(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.bytes.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 enum McpProbe {
@@ -372,6 +411,7 @@ struct McpOwner {
     stop: Option<(bool, String)>,
     done: u64,
     total: Option<u64>,
+    pending: Vec<u8>,
 }
 impl McpOwner {
     fn new(request: McpReservation, cancel: tokio::sync::watch::Receiver<bool>) -> Self {
@@ -389,6 +429,7 @@ impl McpOwner {
             stop: None,
             done: 0,
             total,
+            pending: Vec::new(),
         }
     }
     fn direction(&self) -> Direction {
@@ -440,6 +481,13 @@ impl McpOwner {
         }
         McpProbe::Echo(bytes)
     }
+    fn take_passive_prefix(&mut self) -> Vec<u8> {
+        if self.active {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
     fn paths(&self) -> (Option<String>, Option<String>) {
         match &self.request.io {
             McpTransferIo::Download { sink, .. } => (
@@ -463,6 +511,19 @@ impl McpOwner {
                 ZmodemSession::new_receive_single(basename).map_err(str::to_string)
             }
         }
+    }
+    fn activate_session(
+        &mut self,
+        protocol: &[u8],
+    ) -> Result<(ZmodemSession, Vec<Action>), String> {
+        let mut session = self.session()?;
+        // 已收到完整首握手；feed 负责唯一应答，不再额外发主动 hello。
+        let actions = session.feed(protocol);
+        self.active = true;
+        self.activity = Instant::now();
+        self.done = session.transferred();
+        self.total = session.declared_size();
+        Ok((session, actions))
     }
     fn poll_stop(&mut self, now: Instant) -> bool {
         if self.stop.is_some() {
@@ -554,8 +615,7 @@ pub struct ZmodemTap {
     connection_generation: AtomicU64,
     /// 通道/驱动失败，不得被后续成功状态覆盖。
     failure: Mutex<Option<String>>,
-    tail: Mutex<Vec<u8>>,
-    tail_ready: tokio::sync::Notify,
+    tail: Arc<TailOutput>,
     /// 本会话已确定的下载目录（2026-08-26 两段式）。
     ///
     /// 一次 `sz` 批量传多个文件时，第一个文件做的「去哪」决定对**本次会话**
@@ -641,8 +701,7 @@ impl ZmodemTap {
             cancelling: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
             failure: Mutex::new(None),
-            tail: Mutex::new(Vec::new()),
-            tail_ready: tokio::sync::Notify::new(),
+            tail: Arc::new(TailOutput::default()),
             session_download_dir: Mutex::new(None),
             pending_finalize: Mutex::new(Default::default()),
             finalized: Mutex::new(Default::default()),
@@ -765,6 +824,7 @@ impl ZmodemTap {
     fn settle_mcp(&self, state: &crate::state::AppState, ok: bool, message: &str) {
         let mut slot = self.mcp.lock().unwrap();
         if let Some(owner) = slot.as_mut() {
+            self.tail.reclaim(owner);
             if let Some(error) = self.failure_message() {
                 owner.stop = Some((false, error));
             }
@@ -793,6 +853,7 @@ impl ZmodemTap {
     }
 
     fn stop_mcp(&self, cur: &mut Option<Transfer>, owner: &mut McpOwner) -> Result<(), String> {
+        self.tail.reclaim(owner); // 先于 cancelling；fresh 不能越过旧前缀。
         if self.cancelling.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -1144,14 +1205,26 @@ fn emit_progress_full(
 
 impl ByteTap for ZmodemTap {
     fn output_ready(&self) -> Option<&tokio::sync::Notify> {
-        Some(&self.tail_ready)
+        Some(&self.tail.ready)
     }
     fn drain_output(&self, eof: bool) -> Vec<u8> {
-        let mut cur = self.cur.lock().unwrap();
-        let mut tail = self.tail.lock().unwrap();
+        let mut cur = self.cur.lock().unwrap_or_else(|p| p.into_inner());
+        let mut owner = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
         if eof {
+            if let Some(owner) = owner.as_mut() {
+                self.tail.reclaim(owner);
+                if cur.is_none() {
+                    let _ = self.dispatch(
+                        self.transfer_id.load(Ordering::SeqCst),
+                        vec![Action::Done {
+                            ok: false,
+                            message: "终端连接关闭，传输结果未知".into(),
+                        }],
+                    );
+                }
+            }
             if let Some(t) = cur.as_mut() {
-                tail.extend(t.session.receive_tail_at_eof());
+                self.tail.publish(t.session.receive_tail_at_eof());
                 let _ = self.dispatch(
                     t.id,
                     vec![Action::Done {
@@ -1161,7 +1234,7 @@ impl ByteTap for ZmodemTap {
                 );
             }
         }
-        std::mem::take(&mut *tail)
+        self.tail.drain()
     }
     fn filter<'a>(&self, chunk: &'a [u8]) -> Cow<'a, [u8]> {
         // driver 已结束时旧 cur 不再拥有输入；普通 SSH 输出必须恢复透传。
@@ -1178,7 +1251,17 @@ impl ByteTap for ZmodemTap {
         if !self.auto && !self.busy.load(Ordering::SeqCst) {
             return Cow::Borrowed(chunk);
         }
-        let mut cur = self.cur.lock().unwrap();
+        let mut cur = self.cur.lock().unwrap_or_else(|p| p.into_inner());
+        let mut mcp = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .effects
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed
+        {
+            return Cow::Borrowed(chunk);
+        }
         if cur.is_none() && self.cancelling.load(Ordering::SeqCst) {
             return Cow::Borrowed(chunk);
         }
@@ -1201,7 +1284,7 @@ impl ByteTap for ZmodemTap {
             };
             let (done, total) = (t.session.transferred(), t.session.declared_size());
             let dir = t.session.direction();
-            if let Some(owner) = self.mcp.lock().unwrap().as_mut() {
+            if let Some(owner) = mcp.as_mut() {
                 owner.done = done;
                 owner.total = total;
                 if !acts.is_empty() {
@@ -1224,6 +1307,7 @@ impl ByteTap for ZmodemTap {
             if let Err(error) = self.dispatch(transfer_id, acts) {
                 *self.failure.lock().unwrap() = Some(error);
             }
+            drop(mcp);
             drop(cur);
             if milestone && dir == Direction::Send {
                 self.emit_progress_files("sending", "", done, total, fi, fc);
@@ -1243,13 +1327,13 @@ impl ByteTap for ZmodemTap {
             return Cow::Borrowed(chunk);
         }
 
-        // 空闲：嗅探帧起始。滑窗与本块拼一起再找，否则被读块切开的帧头认不出来。
-        let mut sniff = self.sniff.lock().unwrap();
-        let s = sniff.len();
-        let mut probe = std::mem::take(&mut *sniff);
-        probe.extend_from_slice(chunk);
-        if let Some(owner) = self.mcp.lock().unwrap().as_mut() {
-            return match owner.probe(probe, &mut sniff) {
+        if let Some(owner) = mcp.as_mut() {
+            let mut pending = std::mem::take(&mut owner.pending);
+            pending.extend_from_slice(chunk);
+            let mut retained = Vec::new();
+            let probe = owner.probe(pending, &mut retained);
+            owner.pending = retained;
+            return match probe {
                 McpProbe::Echo(echo) => Cow::Owned(echo),
                 McpProbe::Reject { echo, reason } => {
                     owner.stop = Some((false, reason.into()));
@@ -1257,21 +1341,14 @@ impl ByteTap for ZmodemTap {
                     Cow::Owned(echo)
                 }
                 McpProbe::Start { echo, protocol } => {
-                    sniff.clear();
-                    let mut session = match owner.session() {
-                        Ok(s) => s,
+                    let (session, acts) = match owner.activate_session(&protocol) {
+                        Ok(started) => started,
                         Err(error) => {
                             *self.failure.lock().unwrap() = Some(error);
                             return Cow::Owned(echo);
                         }
                     };
-                    let hello = session.start();
-                    let acts = session.feed(&protocol);
                     let round = self.transfer_id.load(Ordering::SeqCst);
-                    owner.active = true;
-                    owner.activity = Instant::now();
-                    owner.done = session.transferred();
-                    owner.total = session.declared_size();
                     *cur = Some(Transfer {
                         id: round,
                         session,
@@ -1284,16 +1361,19 @@ impl ByteTap for ZmodemTap {
                         file_index: 1,
                         file_count: 1,
                     });
-                    if let Err(error) = self
-                        .queue(round, Effect::Send(hello))
-                        .and_then(|_| self.dispatch(round, acts))
-                    {
+                    if let Err(error) = self.dispatch(round, acts) {
                         *self.failure.lock().unwrap() = Some(error);
                     }
                     Cow::Owned(echo)
                 }
             };
         }
+        drop(mcp);
+        // 空闲：嗅探帧起始。滑窗与本块拼一起再找，否则被读块切开的帧头认不出来。
+        let mut sniff = self.sniff.lock().unwrap();
+        let s = sniff.len();
+        let mut probe = std::mem::take(&mut *sniff);
+        probe.extend_from_slice(chunk);
         match detect_start(&probe) {
             None => {
                 // 只留尾巴，别让滑窗随输出无界增长
@@ -1435,8 +1515,7 @@ async fn bound_session(
 }
 
 fn publish_tail(tap: &ZmodemTap, tail: Vec<u8>) {
-    tap.tail.lock().unwrap().extend(tail);
-    tap.tail_ready.notify_one();
+    tap.tail.publish(tail);
 }
 
 /// 驱动任务：串行执行副作用。
@@ -1447,9 +1526,13 @@ async fn drive(
     tap: std::sync::Weak<ZmodemTap>,
     rx: EffectReceiver,
 ) {
-    let _mcp_lifetime = tap
-        .upgrade()
-        .map(|t| McpDriverGuard(Arc::downgrade(&t.mcp), Arc::downgrade(&t.effects)));
+    let _mcp_lifetime = tap.upgrade().map(|t| {
+        McpDriverGuard(
+            Arc::downgrade(&t.mcp),
+            Arc::downgrade(&t.effects),
+            Arc::downgrade(&t.tail),
+        )
+    });
     let mut close_timer = tokio::time::interval(std::time::Duration::from_millis(100));
     close_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -3295,7 +3378,11 @@ mod tests {
         });
         let old_slot = Arc::new(Mutex::new(Some(owner)));
         let old_effects = Arc::new(EffectChannel::default());
-        let guard = McpDriverGuard(Arc::downgrade(&old_slot), Arc::downgrade(&old_effects));
+        let guard = McpDriverGuard(
+            Arc::downgrade(&old_slot),
+            Arc::downgrade(&old_effects),
+            Weak::new(),
+        );
         let (new, new_sender, _dir2) = upload_owner();
         let new_slot = Arc::new(Mutex::new(Some(new)));
         let new_effects = Arc::new(EffectChannel::default());
@@ -3319,10 +3406,16 @@ mod tests {
 
     #[test]
     fn mcp_driver_guard_recovers_poison_without_double_panic() {
-        let (owner, sender, _dir) = upload_owner();
+        let (mut owner, sender, _dir) = upload_owner();
+        owner.pending = b"*".to_vec();
         let slot = Arc::new(Mutex::new(Some(owner)));
         let effects = Arc::new(EffectChannel::default());
-        let guard = McpDriverGuard(Arc::downgrade(&slot), Arc::downgrade(&effects));
+        let tail = Arc::new(TailOutput::default());
+        let guard = McpDriverGuard(
+            Arc::downgrade(&slot),
+            Arc::downgrade(&effects),
+            Arc::downgrade(&tail),
+        );
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _locked = slot.lock().unwrap();
             panic!("controlled owner poison");
@@ -3331,7 +3424,12 @@ mod tests {
             let _locked = effects.queue.lock().unwrap();
             panic!("controlled channel poison");
         }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _locked = tail.bytes.lock().unwrap();
+            panic!("controlled tail poison");
+        }));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard))).is_ok());
+        assert_eq!(tail.drain(), b"*");
         assert!(sender.is_closed());
         assert!(
             effects
@@ -3389,6 +3487,7 @@ mod tests {
         drop(McpDriverGuard(
             Arc::downgrade(&slot),
             Arc::downgrade(&channel),
+            Weak::new(),
         ));
         let wire = registry
             .inspect("download", |task| {
@@ -3413,6 +3512,284 @@ mod tests {
         assert!(
             matches!(result, TerminalOutcome::Failed(message) if message.contains("cleanup failed"))
         );
+    }
+    #[test]
+    fn mcp_first_matching_handshake_has_one_response_at_every_split() {
+        use fs_terminal::zmodem::{parse_header, FrameHeader, FrameKind, Parsed};
+        for receive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let request_kind = if receive {
+                FrameKind::ZRQINIT
+            } else {
+                FrameKind::ZRINIT
+            };
+            let response_kind = if receive {
+                FrameKind::ZRINIT
+            } else {
+                FrameKind::ZFILE
+            };
+            let header = FrameHeader {
+                kind: request_kind,
+                flags: [0; 4],
+            }
+            .to_hex();
+            for split in 0..=header.len() {
+                let (mut owner, _sender, _source) = upload_owner();
+                if receive {
+                    owner.request.io = McpTransferIo::Download {
+                        basename: "target".into(),
+                        sink: DownloadSink::new(&root, "target", "target").unwrap(),
+                        expected: None,
+                    };
+                }
+                let mut pending = Vec::new();
+                let mut sends = Vec::new();
+                let mut active: Option<ZmodemSession> = None;
+                for chunk in [&header[..split], &header[split..]] {
+                    if let Some(session) = active.as_mut() {
+                        sends.extend(session.feed(chunk).into_iter().filter_map(|a| {
+                            if let Action::Send(bytes) = a {
+                                Some(bytes)
+                            } else {
+                                None
+                            }
+                        }));
+                        continue;
+                    }
+                    let mut bytes = std::mem::take(&mut pending);
+                    bytes.extend_from_slice(chunk);
+                    match owner.probe(bytes, &mut pending) {
+                        McpProbe::Echo(echo) => {
+                            assert!(echo.is_empty());
+                            assert!(sends.is_empty());
+                        }
+                        McpProbe::Start { echo, protocol } => {
+                            assert!(echo.is_empty());
+                            let (session, actions) = owner.activate_session(&protocol).unwrap();
+                            active = Some(session);
+                            sends.extend(actions.into_iter().filter_map(|a| {
+                                if let Action::Send(bytes) = a {
+                                    Some(bytes)
+                                } else {
+                                    None
+                                }
+                            }));
+                        }
+                        McpProbe::Reject { reason, .. } => panic!("{reason}"),
+                    }
+                }
+                assert_eq!(sends.len(), 1, "receive={receive} split={split}");
+                assert!(
+                    matches!(parse_header(&sends[0]), Parsed::Header(h, _) if h.kind==response_kind)
+                );
+            }
+        }
+    }
+    #[test]
+    fn mcp_driver_drop_returns_unrecognized_prefix_before_closed_fresh_output() {
+        for prefix in [b"*".as_slice(), b"**\x18B0".as_slice()] {
+            let (mut owner, _sender, _dir) = upload_owner();
+            owner.pending = prefix.to_vec();
+            let slot = Arc::new(Mutex::new(Some(owner)));
+            let effects = Arc::new(EffectChannel::default());
+            let tail = Arc::new(TailOutput::default());
+            drop(McpDriverGuard(
+                Arc::downgrade(&slot),
+                Arc::downgrade(&effects),
+                Arc::downgrade(&tail),
+            ));
+            assert!(effects.queue.lock().unwrap().closed);
+            assert_eq!(
+                [tail.drain(), b"FRESH".to_vec()].concat(),
+                [prefix, b"FRESH"].concat()
+            );
+            assert!(tail.drain().is_empty());
+        }
+    }
+    struct OwnerTailTap {
+        slot: Arc<Mutex<Option<McpOwner>>>,
+        tail: Arc<TailOutput>,
+    }
+    impl ByteTap for OwnerTailTap {
+        fn filter<'a>(&self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+            Cow::Borrowed(bytes)
+        }
+        fn output_ready(&self) -> Option<&Notify> {
+            Some(&self.tail.ready)
+        }
+        fn drain_output(&self, eof: bool) -> Vec<u8> {
+            if eof {
+                if let Some(owner) = self.slot.lock().unwrap().as_mut() {
+                    self.tail.reclaim(owner);
+                }
+            }
+            self.tail.drain()
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_unrecognized_prefix_cancel_timeout_eof_and_drop_use_original_pipe_once() {
+        use tokio::io::AsyncWriteExt;
+        for prefix in [b"*".as_slice(), b"**\x18B0".as_slice()] {
+            for mode in 0..4 {
+                let (mut owner, sender, _dir) = upload_owner();
+                owner.pending = prefix.to_vec();
+                let slot = Arc::new(Mutex::new(Some(owner)));
+                let tail = Arc::new(TailOutput::default());
+                let effects = Arc::new(EffectChannel::default());
+                if mode == 3 {
+                    drop(McpDriverGuard(
+                        Arc::downgrade(&slot),
+                        Arc::downgrade(&effects),
+                        Arc::downgrade(&tail),
+                    ));
+                    assert!(effects.queue.lock().unwrap().closed);
+                } else if mode != 2 {
+                    let mut guard = slot.lock().unwrap();
+                    let owner = guard.as_mut().unwrap();
+                    if mode == 0 {
+                        sender.send(true).unwrap();
+                    }
+                    let now = if mode == 1 {
+                        owner.started + Duration::from_secs(15)
+                    } else {
+                        Instant::now()
+                    };
+                    assert!(owner.poll_stop(now));
+                    tail.reclaim(owner); // stop_mcp 的实际共用发布点，先于 cancelling。
+                }
+                let tap = Arc::new(OwnerTailTap {
+                    slot: slot.clone(),
+                    tail: tail.clone(),
+                });
+                let (mut writer, reader) = tokio::io::duplex(128);
+                if mode != 2 {
+                    writer.write_all(b"FRESH").await.unwrap();
+                }
+                writer.shutdown().await.unwrap();
+                let mut pipe = fs_terminal::pipe::SessionPipe::spawn(
+                    reader,
+                    fs_terminal::pipe::PipeOpts {
+                        grid_rows: 24,
+                        grid_cols: 80,
+                        scrollback_lines: 10,
+                        flow: Default::default(),
+                        ring_bytes: 1024,
+                        session_log: None,
+                        record: None,
+                        tap: Some(tap),
+                        decoder: fs_terminal::decode::StreamDecoder::new(None).unwrap(),
+                    },
+                );
+                let mut rendered = pipe.render_rx();
+                let mut output = Vec::new();
+                while let Some((_, bytes)) =
+                    tokio::time::timeout(Duration::from_secs(1), rendered.recv())
+                        .await
+                        .unwrap()
+                {
+                    output.extend(bytes);
+                }
+                let expected = if mode == 2 {
+                    prefix.to_vec()
+                } else {
+                    [prefix, b"FRESH"].concat()
+                };
+                assert_eq!(output, expected, "mode={mode} prefix={prefix:?}");
+                assert_eq!(pipe.ring_snapshot_text().as_bytes(), expected);
+                assert!(tail.drain().is_empty());
+                if let Some(owner) = slot.lock().unwrap().as_mut() {
+                    tail.reclaim(owner);
+                }
+                assert!(tail.drain().is_empty(), "same round cannot replay prefix");
+                let (mut next, _sender2, _dir2) = upload_owner();
+                next.pending = b"NEXT".to_vec();
+                tail.reclaim(&mut next);
+                assert_eq!(tail.drain(), b"NEXT");
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_active_protocol_is_not_dumped_and_strict_activation_finishes_one_file() {
+        use fs_terminal::zmodem::{encode_subpacket, FrameHeader, FrameKind, SubpacketEnd};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut owner, _sender, _source) = upload_owner();
+        owner.request.io = McpTransferIo::Download {
+            basename: "target".into(),
+            sink: DownloadSink::new(&root, "target", "target").unwrap(),
+            expected: None,
+        };
+        let init = FrameHeader {
+            kind: FrameKind::ZRQINIT,
+            flags: [0; 4],
+        }
+        .to_hex();
+        let (mut session, first) = owner.activate_session(&init).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|a| matches!(a, Action::Send(_)))
+                .count(),
+            1
+        );
+        owner.pending = b"recognized binary must stay hidden".to_vec();
+        let tail = TailOutput::default();
+        tail.reclaim(&mut owner);
+        assert!(tail.drain().is_empty());
+        let mut protocol = FrameHeader {
+            kind: FrameKind::ZFILE,
+            flags: [0, 0, 0, 1],
+        }
+        .to_bin32();
+        protocol.extend(encode_subpacket(
+            b"target\x003 0 100644",
+            SubpacketEnd::AckEnd,
+            true,
+        ));
+        protocol.extend(
+            FrameHeader {
+                kind: FrameKind::ZDATA,
+                flags: [0; 4],
+            }
+            .to_bin32(),
+        );
+        protocol.extend(encode_subpacket(b"abc", SubpacketEnd::EndFrame, true));
+        protocol.extend(
+            FrameHeader {
+                kind: FrameKind::ZEOF,
+                flags: 3u32.to_le_bytes(),
+            }
+            .to_hex(),
+        );
+        protocol.extend(
+            FrameHeader {
+                kind: FrameKind::ZFIN,
+                flags: [0; 4],
+            }
+            .to_hex(),
+        );
+        protocol.extend(b"OO");
+        let actions = session.feed(&protocol);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::BeginRecv(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::FinishRecv { bytes: 3 }))
+                .count(),
+            1
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: true, .. })));
     }
 }
 
