@@ -106,6 +106,18 @@ pub struct ManifestEntry {
 /// 见 [`crate::authz::Authorization::enumerable`]），而不是另写一份。
 pub const MCP_MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
+        name: "terminal.upload",
+        description: "通过当前交互终端的 ZMODEM 上传单个文件到 remote_dir 目录。先 terminal.read 核对目标与干净 POSIX shell，目标须已安装 rz/sz；不要猜主机、安装软件或用 SFTP/Base64 回退。相对本地源须在授权上传根内。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"local_path":{"type":"string","description":"授权上传根内的相对文件路径"},"remote_dir":{"type":"string","description":"远端目标目录"}},"required":["session_id","local_path","remote_dir"],"additionalProperties":false}"#,
+        gated: true, vault_class: false,
+    },
+    ManifestEntry {
+        name: "terminal.download",
+        description: "通过当前交互终端的 ZMODEM 下载 remote_path 单个文件到固定下载沙箱。先 terminal.read 核对目标与干净 POSIX shell，目标须已安装 rz/sz；不要猜主机、安装软件或用 SFTP/Base64 回退。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"remote_path":{"type":"string","description":"远端单个源文件路径"}},"required":["session_id","remote_path"],"additionalProperties":false}"#,
+        gated: true, vault_class: false,
+    },
+    ManifestEntry {
         name: "sftp.upload",
         description: "上传已授权本地目录中的普通文件到 SSH 原始连接端点，支持二进制，拒绝覆盖。PTY 菜单切换主机不会改变 SFTP 目标。返回任务 ID 后用 transfer.status 查询结果。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string","description":"会话 ID"},"local_path":{"type":"string","description":"已授权上传目录内的相对路径或绝对路径"},"remote_path":{"type":"string","description":"远端目标文件路径，相对路径基于 SSH 登录目录"}},"required":["session_id","local_path","remote_path"],"additionalProperties":false}"#,
@@ -448,7 +460,9 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
     };
     if matches!(
         name,
-        "sftp.upload"
+        "terminal.upload"
+            | "terminal.download"
+            | "sftp.upload"
             | "sftp.download"
             | "transfer.list"
             | "transfer.status"
@@ -583,6 +597,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "terminal.upload",
+                "terminal.download",
                 "sftp.upload",
                 "sftp.download",
                 "transfer.list",
@@ -624,6 +640,8 @@ mod tests {
         assert_eq!(
             gated,
             vec![
+                "terminal.upload",
+                "terminal.download",
                 "sftp.upload",
                 "sftp.download",
                 "transfer.cancel",

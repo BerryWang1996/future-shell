@@ -222,6 +222,8 @@
   // 这份清单与 `crates/mcpbridge/src/tool.rs` 的 MCP_MANIFEST 同名；两边漂移时
   // 「勾了一个不存在的工具」最坏只是被后端 `Authorization::new` 归入 unknown，不生效。
   const MCP_TOOL_CHOICES = [
+    "terminal.upload",
+    "terminal.download",
     "sftp.upload",
     "sftp.download",
     "transfer.list",
@@ -250,6 +252,8 @@
     "sftp.write",
   ] as const;
   const MCP_TOOL_LABELS: Record<string, string> = {
+    "terminal.upload": "通过当前终端上传文件（危险）",
+    "terminal.download": "通过当前终端下载文件（危险）",
     "sftp.upload": "上传本地文件",
     "sftp.download": "下载远端文件",
     "transfer.list": "查看 MCP 传输列表",

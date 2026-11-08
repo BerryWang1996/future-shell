@@ -1301,6 +1301,98 @@ mod tests {
     }
 
     /// 一整套假实现 + 装配。
+    #[tokio::test]
+    async fn terminal_transfers_are_dangerous_default_off_and_skip_does_not_bypass_deny() {
+        for (name, args) in crate::managed::examples()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("terminal."))
+        {
+            let args = args.to_string();
+            let mut default = Rig::new();
+            default.authz = Authorization::new(std::iter::empty::<&str>());
+            assert!(default.call(name, &args).await.is_err());
+            assert!(default.management.seen.lock().unwrap().is_empty());
+            let tool = parse_tool(name, &args).unwrap();
+            assert_eq!(
+                classify_for_mcp(&tool, "test").tier(),
+                fs_policy::Tier::Dangerous
+            );
+            let mut confirmed = Rig::new();
+            assert!(!confirmed.call(name, &args).await.is_err());
+            assert!(confirmed.conf.last_strong());
+            let mut direct = Rig::new();
+            direct.ctx.skip_confirmation = true;
+            direct.conf = Conf::forbidden();
+            assert!(!direct.call(name, &args).await.is_err());
+            assert_eq!(direct.management.seen.lock().unwrap().len(), 1);
+            for mode in [AiMode::Disabled, AiMode::ReadOnlyOnly] {
+                let mut denied = Rig::new();
+                denied.ctx.mode = mode;
+                denied.ctx.skip_confirmation = true;
+                denied.conf = Conf::forbidden();
+                assert!(denied.call(name, &args).await.is_err());
+                assert!(denied.management.seen.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    struct DiscoveryContext;
+    impl crate::transport::McpContextSource for DiscoveryContext {
+        fn current<'a>(&'a self) -> F<'a, CallContext> {
+            Box::pin(async { Rig::new().ctx })
+        }
+    }
+
+    #[tokio::test]
+    async fn real_rmcp_discovery_hides_default_tools_and_emits_explicit_write_annotations() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        for enabled in [false, true] {
+            let rig = Rig::new();
+            let names = if enabled {
+                vec!["terminal.upload", "terminal.download"]
+            } else {
+                vec![]
+            };
+            let server = crate::transport::McpServer::new(
+                Arc::new(DiscoveryContext),
+                Arc::new(rig.management),
+                Authorization::new(names),
+                Arc::new(rig.dir),
+                Arc::new(rig.term),
+                Arc::new(rig.cmd),
+                Arc::new(rig.sftp),
+                Arc::new(rig.conf),
+                Arc::new(rig.audit),
+            );
+            let (server_stream, client) = tokio::io::duplex(65536);
+            let task = tokio::spawn(crate::transport::serve_stream(server, server_stream));
+            let (rd, mut wr) = tokio::io::split(client);
+            let mut rd = tokio::io::BufReader::new(rd);
+            wr.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"discovery-test\",\"version\":\"1\"}}}\n").await.unwrap();
+            let mut line = String::new();
+            rd.read_line(&mut line).await.unwrap();
+            wr.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n").await.unwrap();
+            line.clear();
+            tokio::time::timeout(Duration::from_secs(2), rd.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), if enabled { 2 } else { 0 });
+            for tool in tools {
+                assert_eq!(tool["annotations"]["readOnlyHint"], false);
+                let manifest = crate::tool::manifest_of(tool["name"].as_str().unwrap()).unwrap();
+                let schema: serde_json::Value = serde_json::from_str(manifest.schema_json).unwrap();
+                assert_eq!(tool["inputSchema"], schema);
+                assert_eq!(schema["additionalProperties"], false);
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     struct Rig {
         management: Management,
         dir: Dir,

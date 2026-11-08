@@ -225,9 +225,10 @@ pub(crate) fn classify_managed(tool: &crate::managed::ManagedTool) -> Verdict {
         | M::Stat { .. }
         | M::Walk { .. }
         | M::Details { .. } => return read_only(),
-        M::Delete { .. } | M::Symlink { .. } => {
-            return one("mcp_managed_dangerous", Tier::Dangerous, tool.name())
-        }
+        M::TerminalUpload { .. }
+        | M::TerminalDownload { .. }
+        | M::Delete { .. }
+        | M::Symlink { .. } => return one("mcp_managed_dangerous", Tier::Dangerous, tool.name()),
         M::Upload { remote_path, .. } => classify_transfer_path(remote_path),
         M::Mkdir { path, .. } => classify_transfer_path(path),
         M::Rename { from, to, .. } | M::Copy { from, to, .. } => {
@@ -674,7 +675,7 @@ mod tests {
             }
         }
         assert_eq!(free.len(), 10);
-        assert_eq!(gated.len(), 15);
+        assert_eq!(gated.len(), 17);
         let covered: std::collections::BTreeSet<&str> = free
             .iter()
             .map(|(n, _)| *n)

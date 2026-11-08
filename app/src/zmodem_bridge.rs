@@ -465,6 +465,33 @@ impl McpOwner {
             pending: Vec::new(),
         }
     }
+    fn mark_command_attempted(&mut self, handle: &str, generation: u64) -> Result<(), String> {
+        if self.request.handle != handle
+            || self.request.generation != generation
+            || self.stop.is_some()
+            || *self.cancel.borrow()
+        {
+            return Err("终端传输预约已变化或取消".into());
+        }
+        self.attempted = true;
+        Ok(())
+    }
+    fn fail_submission(&mut self, handle: &str, generation: u64, message: &str) -> bool {
+        if self.request.handle != handle || self.request.generation != generation {
+            return false;
+        }
+        let cancelled = *self.cancel.borrow();
+        self.stop.get_or_insert((
+            cancelled,
+            if cancelled {
+                "本地取消已受理"
+            } else {
+                message
+            }
+            .into(),
+        ));
+        true
+    }
     fn direction(&self) -> Direction {
         match self.request.io {
             McpTransferIo::Upload(_) => Direction::Send,
@@ -839,15 +866,20 @@ impl ZmodemTap {
     ) -> Result<(), String> {
         let mut slot = self.mcp.lock().unwrap();
         let owner = slot.as_mut().ok_or("终端传输预约已结束")?;
-        if owner.request.handle != handle
-            || owner.request.generation != generation
-            || owner.stop.is_some()
-            || *owner.cancel.borrow()
-        {
-            return Err("终端传输预约已变化或取消".into());
+        owner.mark_command_attempted(handle, generation)
+    }
+
+    /// Only the original reservation may fail; late submitters cannot stop a new owner.
+    pub(crate) fn fail_mcp_submission(&self, handle: &str, generation: u64, message: &str) {
+        let mut cur = self.cur.lock().unwrap();
+        let mut slot = self.mcp.lock().unwrap();
+        if let Some(owner) = slot.as_mut() {
+            if owner.fail_submission(handle, generation, message) {
+                if let Err(error) = self.stop_mcp(&mut cur, owner) {
+                    *self.failure.lock().unwrap() = Some(error);
+                }
+            }
         }
-        owner.attempted = true;
-        Ok(())
     }
 
     pub(crate) fn mcp_busy(&self) -> bool {
@@ -3233,6 +3265,32 @@ mod tests {
             sender,
             dir,
         )
+    }
+
+    #[test]
+    fn submission_identity_cancel_and_late_failures_cannot_touch_new_owner() {
+        let (mut owner, cancel, _dir) = upload_owner();
+        assert!(owner.mark_command_attempted("old", 7).is_err());
+        assert!(owner.mark_command_attempted("opaque", 6).is_err());
+        assert!(!owner.fail_submission("old", 7, "late failure"));
+        assert!(!owner.fail_submission("opaque", 6, "late generation"));
+        assert!(owner.stop.is_none() && !owner.attempted);
+        cancel.send(true).unwrap();
+        assert!(owner.mark_command_attempted("opaque", 7).is_err());
+        assert!(!owner.attempted);
+        assert!(owner.fail_submission("opaque", 7, "write error"));
+        assert!(
+            owner.stop.as_ref().unwrap().0,
+            "cancellation remains sticky"
+        );
+        let (mut owner, _cancel, _dir2) = upload_owner();
+        owner.mark_command_attempted("opaque", 7).unwrap();
+        assert!(owner.fail_submission("opaque", 7, "unknown write"));
+        assert!(owner.attempted);
+        assert!(matches!(
+            owner.complete(true, "late success", |_| panic!("no commit")),
+            TerminalOutcome::Failed(_)
+        ));
     }
 
     #[test]

@@ -118,7 +118,12 @@ impl ServerHandler for McpServer {
             let schema: JsonObject = serde_json::from_str(m.schema_json).map_err(|e| {
                 ErrorData::internal_error(format!("工具 {} 的 schema 非法：{e}", m.name), None)
             })?;
-            tools.push(Tool::new(m.name, m.description, schema));
+            let mut tool = Tool::new(m.name, m.description, schema);
+            if matches!(m.name, "terminal.upload" | "terminal.download") {
+                tool =
+                    tool.with_annotations(rmcp::model::ToolAnnotations::default().read_only(false));
+            }
+            tools.push(tool);
         }
         Ok(ListToolsResult::with_all_items(tools))
     }
