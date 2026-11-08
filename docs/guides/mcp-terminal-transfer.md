@@ -1,6 +1,6 @@
-# MCP 终端文件传输（1.1.1 开发版）
+# MCP 终端文件传输（1.1.1）
 
-1.1.1 开发版为当前交互终端增加 `terminal.upload`、`terminal.download`。
+1.1.1 为当前交互终端增加 `terminal.upload`、`terminal.download`。
 工具接线与验证状态见[开发记录](../design/plan-1.0.5-mcp.md)，正式版本以 Release 为准。
 
 ## 选择传输通道
