@@ -360,3 +360,24 @@ B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和
 
 完整Docker lrzsz+sshd依赖构建因OOMKilled137失败，已核状态并删除仅本任务失败容器，不重放或更改Docker/业务容器资源。复用下载的Debian包构建低内存futureshell-zmodem-tools:1.1.1（cb544d536581，仅GNU0.12.21rc工具，无sshd）；Homebrew官方core GNU0.13.1安装完成，供本机独立sshd真PTY。基础外部PTY探测确认两版本rz收到8CAN+8BS后退出128（2/24毫秒），仅证明对端支持，不证明FutureShell发送链。
 独立GUI/PTY验收工程已冻结16854993593a23ded46348561c20a1a6af90d1be，源exe SHA `faf7f619b671a088977132792e6ea8dcd9cb1124b29f0cc7e5636ce96c3b330b`；唯一合成bundle重签后exe `a9ca896b016eeef76cf8cf773f772e7b6d37d3598e94d3101a61a74061159845`。只在独立/tmp便携DB/agent/strict hostkey及home唯一合成payload目录测试；GUI先开可见profile，再用独立bridge定位会话，不能MCP headless open后假定有标签。当前包版本仍1.1.0，这是1.1.1功能开发候选，最终V才统一版本。原生UI测试尚在进行，新回修SHA需按影响补验；未更改安装版或生产服务器。
+
+### 已发现条目分轮对账与当前恢复入口
+
+本批复杂回修已加载 audit-fix-rounds，沿本记录对账，不另设平行台账；以下编号用于后续续接，早先阶段文字按其当时版本理解。
+
+| 编号/来源 | 分诊及交付版本 | 已核范围/剩余条件 |
+| --- | --- | --- |
+| READ-1、READ-CANCEL-1 / 代码机制与独立真SSH | A全部本地合入1685499；7186995取消回修已独立D2放行 | 保留text/structured与脱敏、headless/重连、只读ct取消和审计真值。GUI/MCP重连来源部分为同core等价，不写双向GUI实测。 |
+| ZM-CANCEL-1、ZM-IO-1 / 原取消与驱动独审 | dad49c9主要代码防线已核，后续归属缺口另列下行 | 168原生GUI两次等待取消实际exit128、后续PTY/下一传输通过；完整驱动故障交错仍有静态/局部证据，不能统称全真测。 |
+| SAVE-RECOVERY-1、EOF-1 / A/B归属及重复ZRINIT | 0a5a8c0关闭原‘保A丢B’与双FileSent跳文件反例 | 最多2项FIFO、EOF确认去重/有效重传；旧决策身份缺口另列，不拿锁串行冒充身份绑定。 |
+| SAVE-ID-1 / 存量旧A操作可能误B | 军师在两轮后裁定换opaque decision_id；7478789代码层关闭 | 后端UUID/必填expected ID/锁内匹配/无默认front，迟到回包与事件按session+ID，stale不动B不写remember。过期A精确原生GUI调度未实测，Rust真实文件操作+前端归约是限定等价证据。 |
+| SAVE-PATH-1 / 独立168 GUI错落cwd | 7478789单一HOME目录helper，所有写入/固定读取接通，已独审 | 747真GUI HOME所选saved实际落点/hash正确、cwd无误落、关框、fixed后续空/4MiB自动下载和PTY返回通过。新helper拒HOME不可确定/逃逸/悬空等，显式绝对兼容。 |
+| SAVE-PRESENT-1 / 747新stale刷新P2 | 原P1身份/路径已闭；军师另裁单点展示修，ef3216c独立D2放行 | 完整presentation同一构造/缓存/重放；同对象/radio/目录选择保留，Rust26、前端及契约61、check0错误2旧警告。真实AppState settings库未测；纯helper不触settings+stale早返为代码等价，ef真GUI仍待后续统一候选。 |
+| ZM-END-1 / 747真GUI protect skip卡远端 | 新独立协议L3卡已D1放行，正在另一工作区实施 | 原始哨兵实际28B，未覆盖；本端Done(false)但远端rz仍前台且取消入口消失。ZSKIP只Done无Send为直接根因；正常ZFIN/ZFIN/OO闭环亦未完整，但不能据此断言普通上传首复合输入丢失已定因。 |
+| ZM-INPUT-OBS / 同原生fixture观察 | 仅观察、未定因，不计已修 | 普通上传后首条复合输入两次无回显，稍后短哨兵可用；未用换触发器冒充原复合场景通过。 |
+
+第三轮军师保护目标：用户对A的保存/覆盖/跳过只作用A，每个已收文件有稳定恢复身份，目录对应HOME。原互斥锁不足，改为UUID决策和统一目录链；没有缩双向范围或新增用户逐次授权。747第三轮原P1/PATH停止线已满足，新增展示P2单独分诊，不以其否定已关闭安全反例，也不带已知新P2发布。默认范围偏离已明确批准：P2多纳组件1文件以保持同ID本地radio，生产151行较150多1行，不删注释凑数；以固定diff和独立完整复审替代机械压行，保护不降级。
+
+747独立真GUI补验使用源exe `f07e22fa57905aa2dbda47e6942db127ab95e9012766493446d8f2ef5c885972`，每SHA唯一bundleID后重签exe `5e6b44c9548650d8cd5ad89da7607b608dd71bd7e4f3224be0028f9c42b22480`；复用bundleID曾白屏，新唯一ID恢复（未核具体缓存机制，不判源码缺陷）。已实测空/96KiB/4MiB双向与批量hash和同PTY退出/哨兵，活动取消仍未验；protect skip暴露上表阻断。原始无秘密记录为 `/tmp/fs111-zmodem-public-1685499.json`、`/tmp/fs111-zmodem-public-7478789.json`；fixture app/原rz/sshd/agent/控制服务/secret DB/home合成文件均已正常精确回收，用户应用未动。
+
+当前集成工作区fix-mcp-revocation在ef3216c；协议独立工作区fix-sftp-unknown-size的新分支codex/1.1.1-zmodem-end同源ef3216c，正在仅协议+closing timer修复，尚未整合。协议D1要求ZSKIP失败前单次CAN、发送等peer ZFIN后OO、接收增量等OO并保留shell尾部，静默收尾有界且末写失败沿unknown粘滞；不注入shell命令假造退出。B1/B2尚未实施，须底座协议/总体GUI闭合后再接；两新终端工具已裁Dangerous/readOnlyHint=false，沿既有免确认但不绕过Deny，不冒充SFTP原端点语义。
