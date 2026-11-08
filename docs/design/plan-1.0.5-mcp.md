@@ -347,3 +347,16 @@ B0 D1 放行 B0a→B0b 串行：先修等待选择时取消及下载目录同锁
 A截至452f65b：pipe 19、MCP 126单测+21协议通过；实际隔离OpenSSH验证零文本超时、延迟输出、持门锁后的输出等待口径、等待读期间撤权/DB失效、同peer发送/关闭、自动重连后3MB末尾标记。精确开发候选重签后exe SHA256 `d74fb088c9665621498b1f5f0d9a174e5ac8dd69bc7420567cc4c2559242dc8c`；原始日志在A工作区 `.cache/1.1.1-terminal-read-ssh.log`。独审明确这些不能证明双方向手动GUI/MCP重连、等待读精确换代或协议取消；另派独立验收补证，暂未整合/最终放行。empty按零文本判断，合法空格/换行不被trim，不能声称所有人眼空白现象均已根治。
 
 B0a独审中项已采纳：同轮重复取消必须幂等且不重复CAN，不能第二次弹取消失败；并入B0b回修。B0b机制经独立D1复核可继续：每轮Effect带序号、排队数据/完成动作排空前不提前清cur；旧tap以operation_gate+原代次+当前tap身份复核，不向新连接写；初次注册可有界等待而失效旧tap不能等待后重绑；写失败/断线/startup超时不能被迟到Done覆盖为成功。对端真正退出、尾部shell字节透传与下一轮传输须真实验证。
+
+### 1.1.1 第二轮实现与验收现场
+
+A独立补验发现452f65b忽略rmcp context.ct，真实取消后读取仍10.023秒才Settled；换代等待返回TARGET_UNAVAILABLE，无旧文本。已换新实现上下文回修7186995，仅server/transport：token只取消read执行，不drop Intent/Settled或写工具；完成竞争取消优先，Settled中才取消保留实际审计结果，再给取消响应；审计失败优先。136项模块测试及10个真实rmcp取消交错用例通过，真实SSH及时单次Settled、超过原预算无迟到成功/第二Settled，raw/structured兼容和换代通过。新候选exe SHA256 `6e657f22a3c5eb48c513c8f1985ad15f63fe30d0fc8cb7b9998ed5a430358694`。注意日志0.235秒从读取请求开始计时，不是精确的取消后耗时。
+A D2独立放行本地整合：取消作用域、审计真值与统一脱敏已核；GUI/MCP重连来源接受固定同core代码链+真实headless自动重连为有限等价，不能写GUI实测。A四提交已顺序整合为6afbc02/030bc64/18f4a6b/1685499。原GUI/MCP交叉重连无双向GUI实测、非macOS平台留最终验证。
+
+B0b阶段WIP2358923在生产变更超400行后主动停交；独审核出三组必修：IO失败会跳过CAN，取消后FileSent可能推进下一文件并迟到成功；归置错误丢pending/Done盖成功；gate和SSH写无界会堵取消及关闭。新上下文B0c dad49c9修显式Cancel/CancelDone、取消粘滞/终态推进轮次、归置失败保留pending、gate/write/data五秒预算，桥接21项及旧行为mutation4红后恢复全绿。静态主防线已核，但独审仍阻断最终完成：已有待决A时B已收妥，A兜底归置失败会令B失去可恢复原名/大小归属；另有存量EOF重复ZRINIT可重复FileSent跳过批量文件。再换新上下文限定两根因回修，未放行B0最终完成/发布。
+不可采用的误修已记录：首次未绑定tap在正常装配窗口可能看到旧tap；session装配先启动pipe、再清旧、插registry、登记新tap，不能遇不同tap就立即拒绝。保留有界首次等待及每效果执行前原gen/当前Arc复核。
+
+B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和terminal.download(session_id,remote_path)，两项默认关闭、沿用原授权与档位；local_path是上传根相对普通文件，上传目录与旧sftp.upload的目标文件remote_path语义不同。先被动预约而不发协议字节，再发固定严格POSIX引用rz/sz命令，匹配方向握手才激活；不得把现begin_send直接当arm。明确当前PTY干净POSIX提示符前提和主机身份未验证，不猜prompt/不切SFTP目标/不自动安装或base64回退。上传basename拒绝会被trim改变的名字；下载单文件、实际字节与队列有界、未收完整文件不成功，profile沙箱create_new不覆盖。GUI/MCP普通输入在任务占用时拒绝但取消可达，已开源句柄不重开，IO错误/取消/超时粘滞；协议确认不冒充远端SHA/path/身份核验。复用transfer.list/status/cancel窄backend，不造第二任务框架。enabled=false拒绝，auto=false仅明确MCP预约临时捕获，结束还原；B2须等B0真协议及A整合，未提前派实现。GNU rz-p保护及sz参数/末握手仍待实证，参考[Debian rz](https://manpages.debian.org/trixie/lrzsz/rz.1.en.html)、[Debian sz](https://manpages.debian.org/trixie/lrzsz/sz.1.en.html)，help存在不等于冲突已验。
+
+完整Docker lrzsz+sshd依赖构建因OOMKilled137失败，已核状态并删除仅本任务失败容器，不重放或更改Docker/业务容器资源。复用下载的Debian包构建低内存futureshell-zmodem-tools:1.1.1（cb544d536581，仅GNU0.12.21rc工具，无sshd）；Homebrew官方core GNU0.13.1安装完成，供本机独立sshd真PTY。基础外部PTY探测确认两版本rz收到8CAN+8BS后退出128（2/24毫秒），仅证明对端支持，不证明FutureShell发送链。
+独立GUI/PTY验收工程已冻结16854993593a23ded46348561c20a1a6af90d1be，源exe SHA `faf7f619b671a088977132792e6ea8dcd9cb1124b29f0cc7e5636ce96c3b330b`；唯一合成bundle重签后exe `a9ca896b016eeef76cf8cf773f772e7b6d37d3598e94d3101a61a74061159845`。只在独立/tmp便携DB/agent/strict hostkey及home唯一合成payload目录测试；GUI先开可见profile，再用独立bridge定位会话，不能MCP headless open后假定有标签。当前包版本仍1.1.0，这是1.1.1功能开发候选，最终V才统一版本。原生UI测试尚在进行，新回修SHA需按影响补验；未更改安装版或生产服务器。
