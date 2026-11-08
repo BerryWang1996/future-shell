@@ -807,8 +807,10 @@ pub(crate) async fn submit_core(
                         },
                         profile_id: registration.profile_id,
                         generation,
-                        engine_id: id,
-                        manager: Arc::downgrade(&mgr),
+                        backend: crate::mcp::tasks::TaskBackend::Sftp {
+                            engine_id: id,
+                            manager: Arc::downgrade(&mgr),
+                        },
                         settled_at: None,
                     });
                 }

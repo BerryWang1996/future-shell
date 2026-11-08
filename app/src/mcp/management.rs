@@ -239,14 +239,26 @@ impl McpManagement {
                 serde_json::to_value(snapshot).map_err(failed)
             }
             ManagedTool::Cancel { transfer_id } => {
-                let (terminal, id, manager, _) = self
+                let (terminal, backend, generation) = self
                     .state
                     .mcp_tasks
                     .request_cancel(transfer_id)
                     .ok_or_else(unavailable)?;
                 if !terminal {
-                    let manager = manager.upgrade().ok_or_else(unavailable)?;
-                    manager.cancel(id).await;
+                    match backend {
+                        super::tasks::TaskBackend::Sftp { engine_id, manager } => {
+                            let manager = manager.upgrade().ok_or_else(unavailable)?;
+                            manager.cancel(engine_id).await;
+                        }
+                        super::tasks::TaskBackend::Zmodem { cancel } => {
+                            self.state
+                                .mcp_tasks
+                                .cancel_zmodem(transfer_id, generation, &cancel)
+                                .map_err(|error| {
+                                    ManagementError::new("FS_MCP_TARGET_UNAVAILABLE", error)
+                                })?;
+                        }
+                    }
                 }
                 Ok(
                     json!({"transfer_id":transfer_id,"cancel_requested":!terminal,"already_terminal":terminal}),
