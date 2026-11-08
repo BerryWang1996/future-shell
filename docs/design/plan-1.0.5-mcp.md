@@ -375,6 +375,8 @@ B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和
 | SAVE-PRESENT-1 / 747新stale刷新P2 | 原P1身份/路径已闭；军师另裁单点展示修，ef3216c独立D2放行 | 完整presentation同一构造/缓存/重放；同对象/radio/目录选择保留，Rust26、前端及契约61、check0错误2旧警告。真实AppState settings库未测；纯helper不触settings+stale早返为代码等价，ef真GUI仍待后续统一候选。 |
 | ZM-END-1 / 747真GUI protect skip卡远端 | 33297ef独立D2放行本地整合为08205fa，真实GUI及驱动补验在途 | 原始哨兵实际28B，未覆盖；ZSKIP先CAN再失败，发送等ZFIN后OO，接收增量消费OO并保留shell尾部，静默closing有期限。GNU0.13.1真PTY双向/批量hash、protect原进程exit128和marker通过；不能据此断言普通上传首复合输入丢失已定因。 |
 | ZM-INPUT-OBS / 同原生fixture观察 | 仅观察、未定因，不计已修 | 普通上传后首条复合输入两次无回显，稍后短哨兵可用；未用换触发器冒充原复合场景通过。 |
+| SAVE-STATUS-1 / a1a8e04真GUI | b3fccdc一生产行修复，独审在途 | saved仅在原ok=true更新当前文件已保存文案，null不提前宣称协议完成、false保留失败，ID/session防线不变。定向19通过，先红2项；真实新界面待最终候选。 |
+| ZM-LINUX-OO-OBS / GNU0.12.21rc容器PTY | 新兼容边界，独立军师复核收尾策略 | send全矩阵、recv空文件/protect及同TTY下一传输通过；纯管道+容器内部真PTY96KiB见OO且hash/DONE正确，但4MiB仍hash正确、peer exit0而未见OO。不能全归旧双PTY或宣称完整兼容。GNU receiver缺OO可正常返回的源码事实已核，TCIOFLUSH丢OO仅假设；停动态同义重试，先裁契约。 |
 
 第三轮军师保护目标：用户对A的保存/覆盖/跳过只作用A，每个已收文件有稳定恢复身份，目录对应HOME。原互斥锁不足，改为UUID决策和统一目录链；没有缩双向范围或新增用户逐次授权。747第三轮原P1/PATH停止线已满足，新增展示P2单独分诊，不以其否定已关闭安全反例，也不带已知新P2发布。默认范围偏离已明确批准：P2多纳组件1文件以保持同ID本地radio，生产151行较150多1行，不删注释凑数；以固定diff和独立完整复审替代机械压行，保护不降级。
 
@@ -396,3 +398,9 @@ B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和
 | B2 两工具及真链路 | managed/tool/gate/server、management和授权UI接两项默认off Dangerous/readOnlyHint=false工具。固定POSIX命令与路径引用；原免确认规则保留Deny。 | 双向真实PTY及嵌套目标、任务查询/取消、无GUI手工会话、引用/中文/冲突/超时/断线/撤权及旧SFTP回归，最终统一候选集中验收。 |
 
 B1b—B2由同一新应用/MCP实现上下文串行接续，避免共享文件并行覆盖；实现者不自审。单文件MCP完整性需明确检查ZDATA/ZEOF位置与预期大小，不能只看ZFIN就成功；协议确认仍不是远端SHA/主机/路径认证。各卡独立可编译、按新风险验证，若真实耦合超默认范围先给证据调整，不删取消出口凑行数。
+
+在途依赖调整（独立军师复核）：a1a8e04（源码同08205fa）真实GUI protect保持本轮30B sentinel hash、rz退出128、同TTY下一复合命令及上传；活动128MiB上传/下载分别在可见1.6/18.7MiB时取消，原TTY rz/sz均退出128并恢复命令，后续sz96KiB保存HOME/hash/关框通过。基于这些新证据允许B1a仅资源边界并行独立开发，不提前接B1b/B2、不免除timer/失败门禁。随后同app实际drive静默负测已得CAN（10.015秒）、失败未知提示及原TTY marker；是假peer合法空文件/ZFIN后不发OO，与GNU正测分开，不是手调expire。GNU0.12.21rc recv缺OO新观察独立定位，B1a不改收尾逻辑；若发现与预算相交问题先停该部分定根因，最终整合/交付门禁仍保留。
+
+上述a1a8e04真实GUI证据已冻结为`/tmp/fs111-zmodem-public-a1a8e04.json`，源exe SHA256 `04fe1185f9c1015e18e5e4d5c979d51bbb291ee43337a27166bcd9da5dfa418c`，唯一bundle重签后`a659daf104ba365eb53fefeffb8ecd8b0cd617842adcc25176ff2a7250198200`；QA逐项核owned进程、DB/秘密、socket及合成文件清理完成。新候选所测首条复合命令未复现旧观察，但不由此倒推旧根因。空/4MiB GUI矩阵沿用747和协议PTY原证据，不声称每版全重跑。
+
+GNU源码依据：[lrz.c ackbibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lrz.c/#L2289)最多三次等OO、超时自然返回且调用方返回ZCOMPL；[lsz.c saybibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lsz.c/#L2398)收到ZFIN发送OO，超时/ZCAN也直接返回。它们是实现事实，不冒充通用标准。原始GNU/innerPTY日志和无秘密脚本保存在协议工作区`.cache/1.1.1-protocol-end/`，容器及数据fixture均已清理，无额外依赖或业务环境改动。
