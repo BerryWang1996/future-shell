@@ -232,9 +232,7 @@ impl McpManagement {
                     })
                     .ok_or_else(unavailable)?;
                 if !allowed(&self.state, &profile).await {
-                    snapshot.local_relative_path = None;
-                    snapshot.remote_path = None;
-                    snapshot.error = None;
+                    snapshot.hide_paths();
                 }
                 serde_json::to_value(snapshot).map_err(failed)
             }

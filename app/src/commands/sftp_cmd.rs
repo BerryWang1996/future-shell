@@ -804,6 +804,7 @@ pub(crate) async fn submit_core(
                             verification: verify_state.into(),
                             remote_path: Some(remote.clone()),
                             local_relative_path: local_relative,
+                            terminal: None,
                         },
                         profile_id: registration.profile_id,
                         generation,

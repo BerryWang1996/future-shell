@@ -27,6 +27,8 @@
 //! - 不自动决定覆盖：目标同名时改名为 `name (1).ext` 而不是覆盖或询问——传输
 //!   是异步发生的，弹窗询问期间对端在等，超时会让整条传输失败得莫名其妙。
 
+use crate::mcp::tasks::{Snapshot, Task, TaskBackend, TerminalMetadata, TerminalOutcome};
+use crate::zmodem_mcp_io::{DownloadSink, UploadSource};
 use fs_terminal::pipe::ByteTap;
 use fs_terminal::zmodem::detect_start;
 use fs_terminal::zsession::{Action, Direction, ZmodemSession};
@@ -34,7 +36,8 @@ use std::borrow::Cow;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
 
@@ -323,6 +326,205 @@ struct Transfer {
     file_count: u32,
 }
 
+pub(crate) enum McpTransferIo {
+    Upload(UploadSource),
+    Download {
+        basename: String,
+        sink: DownloadSink,
+        expected: Option<u64>,
+    },
+}
+pub(crate) struct McpReservation {
+    pub handle: String,
+    pub generation: u64,
+    pub remote_path: String,
+    pub local_relative_path: Option<String>,
+    pub io: McpTransferIo,
+}
+// 一个 guard 只绑定原 driver 的通道和 owner 槽，不会清理新 tap 的任务。
+struct McpDriverGuard(Weak<Mutex<Option<McpOwner>>>, Weak<EffectChannel>);
+impl Drop for McpDriverGuard {
+    fn drop(&mut self) {
+        if let Some(effects) = self.1.upgrade() {
+            effects
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .closed = true;
+        }
+        if let Some(owner) = self.0.upgrade() {
+            owner.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
+    }
+}
+enum McpProbe {
+    Echo(Vec<u8>),
+    Start { echo: Vec<u8>, protocol: Vec<u8> },
+    Reject { echo: Vec<u8>, reason: &'static str },
+}
+struct McpOwner {
+    request: McpReservation,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    started: Instant,
+    activity: Instant,
+    active: bool,
+    attempted: bool,
+    stop: Option<(bool, String)>,
+    done: u64,
+    total: Option<u64>,
+}
+impl McpOwner {
+    fn new(request: McpReservation, cancel: tokio::sync::watch::Receiver<bool>) -> Self {
+        let total = match &request.io {
+            McpTransferIo::Upload(source) => Some(source.size()),
+            _ => None,
+        };
+        Self {
+            request,
+            cancel,
+            started: Instant::now(),
+            activity: Instant::now(),
+            active: false,
+            attempted: false,
+            stop: None,
+            done: 0,
+            total,
+        }
+    }
+    fn direction(&self) -> Direction {
+        match self.request.io {
+            McpTransferIo::Upload(_) => Direction::Send,
+            _ => Direction::Receive,
+        }
+    }
+    /// pending 只存未向终端输出的潜在头前缀，不能沿用 GUI 的已输出滑窗语义。
+    fn probe(&self, mut bytes: Vec<u8>, pending: &mut Vec<u8>) -> McpProbe {
+        use fs_terminal::zmodem::{parse_header, Parsed, ZPAD};
+        for at in 0..bytes.len() {
+            if bytes[at] != ZPAD {
+                continue;
+            }
+            match parse_header(&bytes[at..]) {
+                Parsed::Incomplete => {
+                    *pending = bytes.split_off(at);
+                    return if pending.len() <= SNIFF_WINDOW {
+                        McpProbe::Echo(bytes)
+                    } else {
+                        McpProbe::Reject {
+                            echo: bytes,
+                            reason: "握手前缀超过上限",
+                        }
+                    };
+                }
+                Parsed::Header(header, _) if classify_start(header.kind).is_some() => {
+                    let matches = matches!(
+                        (self.direction(), classify_start(header.kind)),
+                        (Direction::Send, Some(Detected::NeedLocalFile))
+                            | (Direction::Receive, Some(Detected::Receive))
+                    );
+                    let protocol = bytes.split_off(at);
+                    return if matches {
+                        McpProbe::Start {
+                            echo: bytes,
+                            protocol,
+                        }
+                    } else {
+                        McpProbe::Reject {
+                            echo: bytes,
+                            reason: "握手方向与预约不一致",
+                        }
+                    };
+                }
+                _ => (),
+            }
+        }
+        McpProbe::Echo(bytes)
+    }
+    fn paths(&self) -> (Option<String>, Option<String>) {
+        match &self.request.io {
+            McpTransferIo::Download { sink, .. } => (
+                Some(sink.local_relative_path().to_string_lossy().into_owned()),
+                sink.partial_path().file_name().map(|name| {
+                    Path::new(".incoming")
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            ),
+            _ => (self.request.local_relative_path.clone(), None),
+        }
+    }
+    fn session(&self) -> Result<ZmodemSession, String> {
+        match &self.request.io {
+            McpTransferIo::Upload(source) => {
+                Ok(ZmodemSession::new_send(source.basename(), source.size()))
+            }
+            McpTransferIo::Download { basename, .. } => {
+                ZmodemSession::new_receive_single(basename).map_err(str::to_string)
+            }
+        }
+    }
+    fn poll_stop(&mut self, now: Instant) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        let cancelled = *self.cancel.borrow(); // bool copy；不把 watch guard 带到其他锁/await。
+        let expired = if self.active {
+            now.duration_since(self.activity) >= Duration::from_secs(30)
+        } else {
+            now.duration_since(self.started) >= Duration::from_secs(15)
+        };
+        if !cancelled && !expired {
+            return false;
+        }
+        self.stop = Some((
+            cancelled,
+            if cancelled {
+                "本地取消已受理"
+            } else {
+                "终端传输握手/空闲等待超时"
+            }
+            .into(),
+        ));
+        true
+    }
+    fn complete(
+        &mut self,
+        ok: bool,
+        message: &str,
+        commit: impl FnOnce(&mut McpTransferIo) -> Result<(), String>,
+    ) -> TerminalOutcome {
+        if self.stop.is_none() && *self.cancel.borrow() {
+            self.stop = Some((true, "本地取消已受理".into()));
+        }
+        if let Some((cancelled, reason)) = &self.stop {
+            let message = format!(
+                "{reason}；{}",
+                if self.attempted {
+                    "对端退出状态未知"
+                } else {
+                    "尚未尝试发送远端命令"
+                }
+            );
+            return if *cancelled {
+                TerminalOutcome::Cancelled(message)
+            } else {
+                TerminalOutcome::Failed(message)
+            };
+        }
+        if !ok {
+            return TerminalOutcome::Failed(format!("{message}；传输/对端退出未验证"));
+        }
+        // 此处最后一次核取消后同步提交。提交期间迟到的 request 不能推翻 Ok Receipt。
+        match commit(&mut self.request.io) {
+            Ok(()) => TerminalOutcome::Completed,
+            Err(error) => {
+                TerminalOutcome::Failed(format!("{error}；暂存/目标文件可能已保留，请核对"))
+            }
+        }
+    }
+}
+
 /// 终端字节拦截器 + 传输态持有者。
 pub struct ZmodemTap {
     session_id: String,
@@ -333,6 +535,8 @@ pub struct ZmodemTap {
     auto: bool,
     /// 当前传输；None = 空闲
     cur: Mutex<Option<Transfer>>,
+    // 所有组合访问严格 cur → mcp；整个预约/活动轮次共用同一 owner。
+    mcp: Arc<Mutex<Option<McpOwner>>>,
     /// 跨读块嗅探滑窗
     sniff: Mutex<Vec<u8>>,
     /// 快路径判定：空闲且不需嗅探时避免加锁
@@ -429,6 +633,7 @@ impl ZmodemTap {
             sandbox,
             auto,
             cur: Mutex::new(None),
+            mcp: Arc::new(Mutex::new(None)),
             sniff: Mutex::new(Vec::new()),
             busy: AtomicBool::new(false),
             need_file_announced: AtomicBool::new(false),
@@ -445,6 +650,166 @@ impl ZmodemTap {
         });
         tokio::spawn(drive(app, state, session_id, Arc::downgrade(&tap), rx));
         tap
+    }
+
+    /// 返回同会话 gate，调用方须持有到固定命令写入结束。预约本身不发协议字节。
+    pub(crate) async fn reserve_mcp(
+        self: &Arc<Self>,
+        state: &crate::state::AppState,
+        request: McpReservation,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let (generation, live) = state
+            .registry
+            .get_with_generation(&self.session_id)
+            .ok_or("会话已失效")?;
+        let gate = live.operation_gate.clone().lock_owned().await;
+        let same_tap = state
+            .zmodem
+            .lock()
+            .unwrap()
+            .get(&self.session_id)
+            .is_some_and(|t| Arc::ptr_eq(t, self));
+        if generation != request.generation
+            || state.registry.generation_of(&self.session_id) != Some(generation)
+            || !same_tap
+        {
+            return Err("会话代次或终端传输入口已变化".into());
+        }
+        let cur = self
+            .cur
+            .lock()
+            .map_err(|_| "终端传输状态异常，driver 不可用")?;
+        let mut owner = self
+            .mcp
+            .lock()
+            .map_err(|_| "终端传输 owner 异常，driver 不可用")?;
+        if self
+            .effects
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed
+        {
+            return Err("终端传输 driver 已停止".into());
+        }
+        if cur.is_some()
+            || owner.is_some()
+            || self.active()
+            || self.need_file_announced.load(Ordering::SeqCst)
+            || !self.pending_finalize.lock().unwrap().is_empty()
+        {
+            return Err("终端已有传输或待保存文件".into());
+        }
+        // 预校验严格构造，取消通道与 task 在同一临界区内创建，不存在无 owner 的任务。
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let next = McpOwner::new(request, receiver);
+        next.session()?;
+        let (local, partial) = next.paths();
+        state.mcp_tasks.register(Task {
+            snapshot: Snapshot {
+                transfer_id: next.request.handle.clone(),
+                session_id: self.session_id.clone(),
+                direction: if next.direction() == Direction::Send {
+                    "up"
+                } else {
+                    "down"
+                }
+                .into(),
+                state: "queued".into(),
+                bytes_done: 0,
+                bytes_total: next.total,
+                error: None,
+                verification: "pending".into(),
+                remote_path: Some(next.request.remote_path.clone()),
+                local_relative_path: local,
+                terminal: Some(TerminalMetadata::zmodem(partial)),
+            },
+            profile_id: live.profile_id.clone(),
+            generation,
+            backend: TaskBackend::Zmodem { cancel },
+            settled_at: None,
+        });
+        self.next_round();
+        *self.failure.lock().unwrap() = None;
+        self.connection_generation
+            .store(generation, Ordering::SeqCst);
+        self.sniff.lock().unwrap().clear();
+        *owner = Some(next);
+        self.busy.store(true, Ordering::SeqCst);
+        Ok(gate)
+    }
+
+    /// B2 必须已持 gate 和 SSH write 锁，随后紧接 data_bytes，不能提前标记尝试。
+    pub(crate) fn mark_mcp_command_attempted(
+        &self,
+        handle: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        let mut slot = self.mcp.lock().unwrap();
+        let owner = slot.as_mut().ok_or("终端传输预约已结束")?;
+        if owner.request.handle != handle
+            || owner.request.generation != generation
+            || owner.stop.is_some()
+            || *owner.cancel.borrow()
+        {
+            return Err("终端传输预约已变化或取消".into());
+        }
+        owner.attempted = true;
+        Ok(())
+    }
+
+    pub(crate) fn mcp_busy(&self) -> bool {
+        self.mcp.lock().unwrap().is_some()
+    }
+
+    fn settle_mcp(&self, state: &crate::state::AppState, ok: bool, message: &str) {
+        let mut slot = self.mcp.lock().unwrap();
+        if let Some(owner) = slot.as_mut() {
+            if let Some(error) = self.failure_message() {
+                owner.stop = Some((false, error));
+            }
+            let outcome = owner.complete(ok, message, |io| match io {
+                McpTransferIo::Download { sink, expected, .. } => expected
+                    .ok_or_else(|| "未取得完整文件计数".to_string())
+                    .and_then(|n| sink.finish(n)),
+                _ => Ok(()),
+            });
+            let (local, mut partial) = owner.paths();
+            if matches!(&outcome, TerminalOutcome::Completed) {
+                partial = None;
+            }
+            state.mcp_tasks.terminal_update(
+                &owner.request.handle,
+                owner.request.generation,
+                owner.done,
+                owner.total,
+                Some(outcome),
+                local,
+                partial,
+            );
+        }
+        // settle-before-drop：读查询遇 closed receiver 时不会把已知成功覆盖成未知。
+        *slot = None;
+    }
+
+    fn stop_mcp(&self, cur: &mut Option<Transfer>, owner: &mut McpOwner) -> Result<(), String> {
+        if self.cancelling.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let peer_active = !cur.as_ref().is_some_and(|t| t.session.is_finished());
+        if let Some(t) = cur.as_mut() {
+            let _ = t.session.cancel();
+        }
+        let round = self.transfer_id.load(Ordering::SeqCst);
+        if owner.attempted && peer_active {
+            self.queue(round, Effect::Cancel)?;
+        }
+        self.queue(
+            round,
+            Effect::CancelDone {
+                message: "本地终止；对端退出未验证".into(),
+            },
+        )
     }
 
     /// 用户选定本地文件，开始上传（对端已在跑 `rz`）。多文件：一次入队，逐个发。
@@ -476,7 +841,7 @@ impl ZmodemTap {
         }
         let total = opened.len() as u32;
         let mut cur = self.cur.lock().unwrap();
-        if cur.is_some() || self.cancelling.load(Ordering::SeqCst) {
+        if cur.is_some() || self.mcp_busy() || self.cancelling.load(Ordering::SeqCst) {
             return Err("该会话已有传输在进行或正在取消".into());
         }
         if !self.pending_finalize.lock().unwrap().is_empty() {
@@ -554,6 +919,10 @@ impl ZmodemTap {
     /// 用户取消当前传输。
     pub fn cancel(&self) -> Result<(), String> {
         let mut cur = self.cur.lock().unwrap();
+        if let Some(owner) = self.mcp.lock().unwrap().as_mut() {
+            owner.stop.get_or_insert((true, "本地取消已受理".into()));
+            return self.stop_mcp(&mut cur, owner);
+        }
         let transfer_id = cur
             .as_ref()
             .map(|t| t.id)
@@ -795,6 +1164,16 @@ impl ByteTap for ZmodemTap {
         std::mem::take(&mut *tail)
     }
     fn filter<'a>(&self, chunk: &'a [u8]) -> Cow<'a, [u8]> {
+        // driver 已结束时旧 cur 不再拥有输入；普通 SSH 输出必须恢复透传。
+        if self
+            .effects
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed
+        {
+            return Cow::Borrowed(chunk);
+        }
         // 空闲且不自动检测：整条链路零成本透传
         if !self.auto && !self.busy.load(Ordering::SeqCst) {
             return Cow::Borrowed(chunk);
@@ -822,6 +1201,13 @@ impl ByteTap for ZmodemTap {
             };
             let (done, total) = (t.session.transferred(), t.session.declared_size());
             let dir = t.session.direction();
+            if let Some(owner) = self.mcp.lock().unwrap().as_mut() {
+                owner.done = done;
+                owner.total = total;
+                if !acts.is_empty() {
+                    owner.activity = Instant::now();
+                }
+            }
             // 里程碑事件带上「第 i/N 个」：不带的话，多文件传输中每个 64 KiB 里程碑
             // 都会把进度条上的计数洗回 null（前端有 prev 兜底，但事件本身说全才是对的）。
             let (fi, fc) = (t.file_index, t.file_count);
@@ -862,6 +1248,52 @@ impl ByteTap for ZmodemTap {
         let s = sniff.len();
         let mut probe = std::mem::take(&mut *sniff);
         probe.extend_from_slice(chunk);
+        if let Some(owner) = self.mcp.lock().unwrap().as_mut() {
+            return match owner.probe(probe, &mut sniff) {
+                McpProbe::Echo(echo) => Cow::Owned(echo),
+                McpProbe::Reject { echo, reason } => {
+                    owner.stop = Some((false, reason.into()));
+                    let _ = self.stop_mcp(&mut cur, owner);
+                    Cow::Owned(echo)
+                }
+                McpProbe::Start { echo, protocol } => {
+                    sniff.clear();
+                    let mut session = match owner.session() {
+                        Ok(s) => s,
+                        Err(error) => {
+                            *self.failure.lock().unwrap() = Some(error);
+                            return Cow::Owned(echo);
+                        }
+                    };
+                    let hello = session.start();
+                    let acts = session.feed(&protocol);
+                    let round = self.transfer_id.load(Ordering::SeqCst);
+                    owner.active = true;
+                    owner.activity = Instant::now();
+                    owner.done = session.transferred();
+                    owner.total = session.declared_size();
+                    *cur = Some(Transfer {
+                        id: round,
+                        session,
+                        sink: None,
+                        sink_path: None,
+                        source: None,
+                        recv_name: None,
+                        reported: 0,
+                        pending: Default::default(),
+                        file_index: 1,
+                        file_count: 1,
+                    });
+                    if let Err(error) = self
+                        .queue(round, Effect::Send(hello))
+                        .and_then(|_| self.dispatch(round, acts))
+                    {
+                        *self.failure.lock().unwrap() = Some(error);
+                    }
+                    Cow::Owned(echo)
+                }
+            };
+        }
         match detect_start(&probe) {
             None => {
                 // 只留尾巴，别让滑窗随输出无界增长
@@ -1015,6 +1447,9 @@ async fn drive(
     tap: std::sync::Weak<ZmodemTap>,
     rx: EffectReceiver,
 ) {
+    let _mcp_lifetime = tap
+        .upgrade()
+        .map(|t| McpDriverGuard(Arc::downgrade(&t.mcp), Arc::downgrade(&t.effects)));
     let mut close_timer = tokio::time::interval(std::time::Duration::from_millis(100));
     close_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1023,6 +1458,11 @@ async fn drive(
             _ = close_timer.tick() => {
                 let Some(tap) = tap.upgrade() else { return };
                 let mut cur = tap.cur.lock().unwrap();
+                if let Some(owner) = tap.mcp.lock().unwrap().as_mut() {
+                    if owner.poll_stop(Instant::now()) {
+                        let _ = tap.stop_mcp(&mut cur, owner);
+                    }
+                }
                 if let Some(transfer) = cur.as_mut() {
                     let acts = transfer.session.expire_close(std::time::Instant::now());
                     if acts.iter().any(|a| matches!(a, Action::Done { ok: true, .. })) {
@@ -1058,6 +1498,7 @@ async fn drive(
                 {
                     emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
                 }
+                tap.settle_mcp(&state, false, &error);
                 *tap.cur.lock().unwrap() = None;
                 tap.busy.store(false, Ordering::SeqCst);
                 tap.cancelling.store(false, Ordering::SeqCst);
@@ -1073,6 +1514,46 @@ async fn drive(
             tap.cancelling.load(Ordering::SeqCst),
             tap.failure_message().is_some(),
         ) {
+            continue;
+        }
+        // MCP IO 仍由这一条 driver 按原效果顺序执行，不走 GUI 保存决策。
+        let mcp_io = {
+            let mut slot = tap.mcp.lock().unwrap();
+            slot.as_mut().and_then(|owner| {
+                state.mcp_tasks.terminal_update(
+                    &owner.request.handle,
+                    owner.request.generation,
+                    owner.done,
+                    owner.total,
+                    None,
+                    None,
+                    None,
+                );
+                match (&mut owner.request.io, &queued.effect) {
+                    (McpTransferIo::Download { .. }, Effect::Begin { size, .. }) => {
+                        owner.total = *size;
+                        Some(Ok(()))
+                    }
+                    (McpTransferIo::Download { sink, .. }, Effect::Write(bytes)) => {
+                        Some(sink.write_chunk(bytes))
+                    }
+                    (McpTransferIo::Download { sink, expected, .. }, Effect::Finish { bytes }) => {
+                        *expected = Some(*bytes);
+                        Some(if sink.bytes() == *bytes {
+                            Ok(())
+                        } else {
+                            Err("落盘与协议计数不一致".into())
+                        })
+                    }
+                    _ => None,
+                }
+            })
+        };
+        if let Some(result) = mcp_io {
+            if let Err(error) = result {
+                *tap.failure.lock().unwrap() = Some(error);
+                let _ = tap.cancel();
+            }
             continue;
         }
         match queued.effect {
@@ -1283,26 +1764,45 @@ async fn drive(
                         continue;
                     }
                     let Some(t) = cur.as_mut() else { continue };
-                    match t.source.as_mut() {
-                        None => Err("待发文件不可用".to_string()),
-                        Some(src) => {
-                            use std::io::Seek as _;
-                            src.seek(std::io::SeekFrom::Start(offset))
-                                .and_then(|_| read_full(src, &mut buf))
-                                .and_then(|n| {
-                                    if n == 0
-                                        && t.session
-                                            .declared_size()
-                                            .is_some_and(|size| offset < size)
-                                    {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::UnexpectedEof,
-                                            "待发文件提前结束",
-                                        ));
-                                    }
-                                    Ok(t.session.feed_file_chunk(&buf[..n]))
-                                })
-                                .map_err(|e| e.to_string())
+                    let mut owner = tap.mcp.lock().unwrap();
+                    if let Some(McpOwner {
+                        request:
+                            McpReservation {
+                                io: McpTransferIo::Upload(source),
+                                ..
+                            },
+                        activity,
+                        done,
+                        ..
+                    }) = owner.as_mut()
+                    {
+                        source.read_chunk(offset, buf.len()).map(|bytes| {
+                            *activity = Instant::now();
+                            *done = offset + bytes.len() as u64;
+                            t.session.feed_file_chunk(&bytes)
+                        })
+                    } else {
+                        match t.source.as_mut() {
+                            None => Err("待发文件不可用".to_string()),
+                            Some(src) => {
+                                use std::io::Seek as _;
+                                src.seek(std::io::SeekFrom::Start(offset))
+                                    .and_then(|_| read_full(src, &mut buf))
+                                    .and_then(|n| {
+                                        if n == 0
+                                            && t.session
+                                                .declared_size()
+                                                .is_some_and(|size| offset < size)
+                                        {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::UnexpectedEof,
+                                                "待发文件提前结束",
+                                            ));
+                                        }
+                                        Ok(t.session.feed_file_chunk(&buf[..n]))
+                                    })
+                                    .map_err(|e| e.to_string())
+                            }
                         }
                     }
                 };
@@ -1330,6 +1830,14 @@ async fn drive(
                     || (tap.cancelling.load(Ordering::SeqCst) && !cancellation_terminal)
                 {
                     continue;
+                }
+                if tap.mcp_busy() {
+                    let failure = tap.failure_message();
+                    tap.settle_mcp(
+                        &state,
+                        ok && failure.is_none(),
+                        failure.as_deref().unwrap_or(&message),
+                    );
                 }
                 let path = cur.as_mut().and_then(|t| {
                     if let Some(mut sink) = t.sink.take() {
@@ -2581,6 +3089,329 @@ mod tests {
             read_full(&mut src2, &mut big).unwrap(),
             4096,
             "文件末尾返回实读字节数"
+        );
+    }
+    fn upload_owner() -> (
+        McpOwner,
+        tokio::sync::watch::Sender<bool>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"data").unwrap();
+        let io = McpTransferIo::Upload(
+            UploadSource::new(std::fs::File::open(path).unwrap(), "source".into(), 4).unwrap(),
+        );
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        (
+            McpOwner::new(
+                McpReservation {
+                    handle: "opaque".into(),
+                    generation: 7,
+                    remote_path: "intent".into(),
+                    local_relative_path: Some("source".into()),
+                    io,
+                },
+                receiver,
+            ),
+            sender,
+            dir,
+        )
+    }
+
+    #[test]
+    fn mcp_owner_handshake_and_idle_budgets_and_repeated_cancel_are_latched() {
+        let (mut owner, sender, _dir) = upload_owner();
+        assert!(!owner.attempted && !owner.active);
+        assert_eq!(owner.direction(), Direction::Send);
+        assert!(!owner.poll_stop(owner.started + Duration::from_secs(14)));
+        assert!(owner.poll_stop(owner.started + Duration::from_secs(15)));
+        assert!(!owner.poll_stop(owner.started + Duration::from_secs(16)));
+        assert!(matches!(
+            owner.complete(false, "timeout", |_| panic!("must not commit")),
+            TerminalOutcome::Failed(_)
+        ));
+        let (mut owner, _, _dir2) = upload_owner();
+        owner.active = true;
+        assert!(!owner.poll_stop(owner.activity + Duration::from_secs(29)));
+        assert!(owner.poll_stop(owner.activity + Duration::from_secs(30)));
+        let (mut owner, sender2, _dir3) = upload_owner();
+        sender2.send(true).unwrap();
+        assert!(owner.poll_stop(Instant::now()));
+        sender2.send(true).unwrap();
+        assert!(!owner.poll_stop(Instant::now()));
+        assert!(
+            matches!(owner.complete(true, "done", |_| panic!("must not commit")), TerminalOutcome::Cancelled(message) if message.contains("尚未尝试"))
+        );
+        assert!(!*sender.borrow());
+    }
+
+    #[test]
+    fn mcp_commit_receipt_wins_cancel_arriving_after_last_watch_check() {
+        let (mut owner, sender, _dir) = upload_owner();
+        owner.attempted = true;
+        let result = owner.complete(true, "done", |_| {
+            sender.send(true).unwrap(); // 精确注入：最后 watch 检查后、同步 commit 内。
+            Ok(())
+        });
+        assert!(matches!(result, TerminalOutcome::Completed));
+        assert!(owner.stop.is_none());
+        let (mut before, sender, _dir2) = upload_owner();
+        sender.send(true).unwrap();
+        assert!(matches!(
+            before.complete(true, "done", |_| panic!("cancel before commit")),
+            TerminalOutcome::Cancelled(_)
+        ));
+    }
+
+    #[test]
+    fn mcp_download_uses_strict_session_and_real_spool_commit_without_gui_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut sink = DownloadSink::new(&root, "a:b", "a%3Ab").unwrap();
+        sink.write_chunk(b"abc").unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let mut owner = McpOwner::new(
+            McpReservation {
+                handle: "download".into(),
+                generation: 1,
+                remote_path: "a:b".into(),
+                local_relative_path: None,
+                io: McpTransferIo::Download {
+                    basename: "a:b".into(),
+                    sink,
+                    expected: Some(3),
+                },
+            },
+            receiver,
+        );
+        assert_eq!(owner.direction(), Direction::Receive);
+        let mut session = owner.session().unwrap();
+        let wrong = [
+            fs_terminal::zmodem::FrameHeader {
+                kind: fs_terminal::zmodem::FrameKind::ZFILE,
+                flags: [0; 4],
+            }
+            .to_hex(),
+            fs_terminal::zmodem::encode_subpacket(
+                b"wrong\0",
+                fs_terminal::zmodem::SubpacketEnd::AckEnd,
+                false,
+            ),
+        ]
+        .concat();
+        assert!(session
+            .feed(&wrong)
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        let result = owner.complete(true, "protocol confirmed", |io| {
+            sender.send(true).unwrap(); // Receipt 竞争同时使用真实 finish/硬链/同FD计数。
+            match io {
+                McpTransferIo::Download { sink, expected, .. } => sink.finish(expected.unwrap()),
+                _ => unreachable!(),
+            }
+        });
+        assert!(matches!(result, TerminalOutcome::Completed));
+        assert_eq!(std::fs::read(root.join("a%3Ab")).unwrap(), b"abc");
+        assert!(owner.stop.is_none());
+    }
+    #[test]
+    fn mcp_passive_probe_preserves_echo_and_buffers_every_header_boundary() {
+        let (owner, _sender, _dir) = upload_owner();
+        let header = fs_terminal::zmodem::FrameHeader {
+            kind: fs_terminal::zmodem::FrameKind::ZRINIT,
+            flags: [0; 4],
+        }
+        .to_hex();
+        let all = [b"ordinary echo\r\n".as_slice(), &header].concat();
+        for split in 0..=all.len() {
+            let mut pending = Vec::new();
+            let mut echo = Vec::new();
+            let mut protocol = Vec::new();
+            for chunk in [&all[..split], &all[split..]] {
+                if !protocol.is_empty() {
+                    protocol.extend_from_slice(chunk);
+                    continue;
+                }
+                let mut bytes = std::mem::take(&mut pending);
+                bytes.extend_from_slice(chunk);
+                match owner.probe(bytes, &mut pending) {
+                    McpProbe::Echo(bytes) => echo.extend(bytes),
+                    McpProbe::Start {
+                        echo: bytes,
+                        protocol: frame,
+                    } => {
+                        echo.extend(bytes);
+                        protocol = frame;
+                    }
+                    McpProbe::Reject { reason, .. } => panic!("{reason}"),
+                }
+            }
+            assert_eq!(echo, b"ordinary echo\r\n", "split={split}");
+            assert_eq!(
+                protocol, header,
+                "first handshake cannot leak or disappear split={split}"
+            );
+            assert!(pending.is_empty());
+        }
+        let wrong = fs_terminal::zmodem::FrameHeader {
+            kind: fs_terminal::zmodem::FrameKind::ZRQINIT,
+            flags: [0; 4],
+        }
+        .to_hex();
+        assert!(
+            matches!(owner.probe(wrong, &mut Vec::new()), McpProbe::Reject {reason, ..} if reason.contains("方向"))
+        );
+        assert!(!owner.active && !owner.attempted);
+        assert!(
+            matches!(owner.probe(b"literal * ordinary".to_vec(), &mut Vec::new()), McpProbe::Echo(bytes) if bytes==b"literal * ordinary")
+        );
+    }
+
+    #[test]
+    fn mcp_driver_drop_closes_original_slot_and_status_reconciles_unknown() {
+        let (owner, sender, _dir) = upload_owner();
+        let registry = crate::mcp::tasks::TaskRegistry::default();
+        registry.register(Task {
+            snapshot: Snapshot {
+                transfer_id: "opaque".into(),
+                session_id: "session".into(),
+                direction: "up".into(),
+                state: "queued".into(),
+                bytes_done: 0,
+                bytes_total: Some(4),
+                error: None,
+                verification: "pending".into(),
+                remote_path: Some("intent".into()),
+                local_relative_path: None,
+                terminal: Some(TerminalMetadata::zmodem(None)),
+            },
+            profile_id: "profile".into(),
+            generation: 7,
+            backend: TaskBackend::Zmodem {
+                cancel: sender.clone(),
+            },
+            settled_at: None,
+        });
+        let old_slot = Arc::new(Mutex::new(Some(owner)));
+        let old_effects = Arc::new(EffectChannel::default());
+        let guard = McpDriverGuard(Arc::downgrade(&old_slot), Arc::downgrade(&old_effects));
+        let (new, new_sender, _dir2) = upload_owner();
+        let new_slot = Arc::new(Mutex::new(Some(new)));
+        let new_effects = Arc::new(EffectChannel::default());
+        drop(guard);
+        assert!(old_slot.lock().unwrap().is_none());
+        assert!(
+            old_effects.queue.lock().unwrap().closed,
+            "reserve checks this exact closed flag"
+        );
+        assert!(sender.is_closed());
+        assert!(new_slot.lock().unwrap().is_some());
+        assert!(!new_sender.is_closed());
+        assert!(!new_effects.queue.lock().unwrap().closed);
+        assert_eq!(
+            registry
+                .inspect("opaque", |t| t.snapshot.state.clone())
+                .unwrap(),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn mcp_driver_guard_recovers_poison_without_double_panic() {
+        let (owner, sender, _dir) = upload_owner();
+        let slot = Arc::new(Mutex::new(Some(owner)));
+        let effects = Arc::new(EffectChannel::default());
+        let guard = McpDriverGuard(Arc::downgrade(&slot), Arc::downgrade(&effects));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _locked = slot.lock().unwrap();
+            panic!("controlled owner poison");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _locked = effects.queue.lock().unwrap();
+            panic!("controlled channel poison");
+        }));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard))).is_ok());
+        assert!(sender.is_closed());
+        assert!(
+            effects
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .closed
+        );
+    }
+    #[test]
+    fn mcp_download_driver_drop_preserves_initial_partial_recovery_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut sink = DownloadSink::new(&root, "target", "target").unwrap();
+        sink.write_chunk(b"partial").unwrap();
+        let actual_partial = sink.partial_path().to_path_buf();
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let owner = McpOwner::new(
+            McpReservation {
+                handle: "download".into(),
+                generation: 1,
+                remote_path: "intent".into(),
+                local_relative_path: None,
+                io: McpTransferIo::Download {
+                    basename: "target".into(),
+                    sink,
+                    expected: None,
+                },
+            },
+            receiver,
+        );
+        let (local, partial) = owner.paths(); // reserve 实际共用的路径证据构造。
+        let registry = crate::mcp::tasks::TaskRegistry::default();
+        registry.register(Task {
+            snapshot: Snapshot {
+                transfer_id: "download".into(),
+                session_id: "s".into(),
+                direction: "down".into(),
+                state: "running".into(),
+                bytes_done: 7,
+                bytes_total: None,
+                error: None,
+                verification: "pending".into(),
+                remote_path: Some("intent".into()),
+                local_relative_path: local,
+                terminal: Some(TerminalMetadata::zmodem(partial.clone())),
+            },
+            profile_id: "p".into(),
+            generation: 1,
+            backend: TaskBackend::Zmodem { cancel: sender },
+            settled_at: None,
+        });
+        let slot = Arc::new(Mutex::new(Some(owner)));
+        let channel = Arc::new(EffectChannel::default());
+        drop(McpDriverGuard(
+            Arc::downgrade(&slot),
+            Arc::downgrade(&channel),
+        ));
+        let wire = registry
+            .inspect("download", |task| {
+                serde_json::to_value(&task.snapshot).unwrap()
+            })
+            .unwrap();
+        assert_eq!(wire["state"], "failed");
+        assert_eq!(wire["verification"], "unverified");
+        assert_eq!(wire["local_relative_path"], "target");
+        assert_eq!(wire["partial_relative_path"], partial.unwrap());
+        assert_eq!(std::fs::read(actual_partial).unwrap(), b"partial");
+        assert!(!root.join("target").exists());
+    }
+
+    #[test]
+    fn mcp_commit_failure_keeps_known_failure_even_if_cancel_arrives_inside_commit() {
+        let (mut owner, sender, _dir) = upload_owner();
+        let result = owner.complete(true, "done", |_| {
+            sender.send(true).unwrap();
+            Err("target may exist; cleanup failed".into())
+        });
+        assert!(
+            matches!(result, TerminalOutcome::Failed(message) if message.contains("cleanup failed"))
         );
     }
 }

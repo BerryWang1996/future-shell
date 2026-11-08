@@ -19,6 +19,44 @@ pub struct Snapshot {
     pub remote_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_relative_path: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalMetadata>,
+}
+
+impl Snapshot {
+    pub fn hide_paths(&mut self) {
+        self.local_relative_path = None;
+        self.remote_path = None;
+        self.error = None;
+        if let Some(metadata) = self.terminal.as_mut() {
+            metadata.partial_relative_path = None;
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct TerminalMetadata {
+    transport: &'static str,
+    scope: &'static str,
+    peer_identity_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_relative_path: Option<String>,
+}
+impl TerminalMetadata {
+    pub fn zmodem(partial_relative_path: Option<String>) -> Self {
+        Self {
+            transport: "terminal_zmodem",
+            scope: "interactive_terminal",
+            peer_identity_verified: false,
+            partial_relative_path,
+        }
+    }
+}
+
+pub enum TerminalOutcome {
+    Completed,
+    Cancelled(String),
+    Failed(String),
 }
 
 /// 取消绑定原后端实例；ZMODEM 不通过 session_id 回查当前 tap。
@@ -84,12 +122,14 @@ impl TaskRegistry {
 
     pub fn inspect<T>(&self, handle: &str, read: impl FnOnce(&Task) -> T) -> Option<T> {
         let mut tasks = self.tasks.lock().unwrap();
+        Self::reconcile_terminal(&mut tasks);
         Self::prune(&mut tasks);
         tasks.get(handle).map(read)
     }
 
     pub fn list(&self) -> Vec<(String, Snapshot)> {
         let mut tasks = self.tasks.lock().unwrap();
+        Self::reconcile_terminal(&mut tasks);
         Self::prune(&mut tasks);
         let mut result: Vec<_> = tasks
             .values()
@@ -97,6 +137,64 @@ impl TaskRegistry {
             .collect();
         result.sort_by(|a, b| a.1.transfer_id.cmp(&b.1.transfer_id));
         result
+    }
+
+    fn reconcile_terminal(tasks: &mut HashMap<String, Task>) {
+        for task in tasks.values_mut() {
+            if !task.terminal()
+                && matches!(&task.backend, TaskBackend::Zmodem {cancel} if cancel.is_closed())
+            {
+                task.snapshot.state = "failed".into();
+                task.snapshot.error = Some("终端传输驱动结束，结果未知；请核对目标文件".into());
+                task.snapshot.verification = "unverified".into();
+                task.settled_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 原 owner 是唯一协议事实来源；取消请求本身不推翻已经提交的 Receipt。
+    pub fn terminal_update(
+        &self,
+        handle: &str,
+        generation: u64,
+        done: u64,
+        total: Option<u64>,
+        outcome: Option<TerminalOutcome>,
+        local: Option<String>,
+        partial: Option<String>,
+    ) -> Option<Snapshot> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let task = tasks.get_mut(handle)?;
+        if task.generation != generation
+            || !matches!(task.backend, TaskBackend::Zmodem { .. })
+            || task.terminal()
+        {
+            return None;
+        }
+        task.snapshot.bytes_done = done;
+        task.snapshot.bytes_total = total;
+        if local.is_some() {
+            task.snapshot.local_relative_path = local;
+        }
+        if let Some(metadata) = task.snapshot.terminal.as_mut() {
+            if outcome.is_some() || partial.is_some() {
+                metadata.partial_relative_path = partial;
+            }
+        }
+        if let Some(outcome) = outcome {
+            let (state, verification, error) = match outcome {
+                TerminalOutcome::Completed => ("completed", "protocol_confirmed", None),
+                TerminalOutcome::Cancelled(error) => ("cancelled", "unverified", Some(error)),
+                TerminalOutcome::Failed(error) => ("failed", "unverified", Some(error)),
+            };
+            task.snapshot.state = state.into();
+            task.snapshot.verification = verification.into();
+            task.snapshot.error = error;
+            task.settled_at = Some(Instant::now());
+        } else if task.snapshot.state != "cancel_requested" {
+            task.snapshot.state = "running".into();
+        }
+        Some(task.snapshot.clone())
     }
 
     pub fn event(&self, event: &TransferEvent) -> Option<Snapshot> {
@@ -239,6 +337,7 @@ mod tests {
                 verification: "pending".into(),
                 remote_path: Some("/synthetic/remote".into()),
                 local_relative_path: None,
+                terminal: None,
             },
             profile_id: "profile".into(),
             generation,
@@ -502,5 +601,139 @@ mod tests {
                 "verification":"pending", "remote_path":"/synthetic/remote"
             })
         );
+    }
+    #[test]
+    fn closed_terminal_receiver_is_reconciled_by_queries_without_cancel() {
+        for list in [false, true] {
+            let registry = TaskRegistry::default();
+            let (task, receiver) = zmodem_task("lost", 1);
+            registry.register(task);
+            drop(receiver);
+            if list {
+                assert_eq!(registry.list()[0].1.state, "failed");
+            }
+            registry
+                .inspect("lost", |t| {
+                    assert_eq!(t.snapshot.state, "failed");
+                    assert_eq!(t.snapshot.verification, "unverified");
+                    assert!(t.settled_at.is_some());
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_updates_bind_backend_generation_and_preserve_final_receipt() {
+        let registry = TaskRegistry::default();
+        let (mut task, receiver) = zmodem_task("terminal", 7);
+        task.snapshot.terminal = Some(TerminalMetadata::zmodem(Some(
+            ".incoming/original.part".into(),
+        )));
+        registry.register(task);
+        assert!(registry
+            .terminal_update("terminal", 6, 0, None, None, None, None)
+            .is_none());
+        registry.register(super::tests::task(1, 7));
+        assert!(registry
+            .terminal_update("1", 7, 0, None, None, None, None)
+            .is_none());
+        registry.request_cancel("terminal"); // request 可以晚于最后一次取消检查，但早于 durable Receipt 登记。
+        let completed = registry
+            .terminal_update(
+                "terminal",
+                7,
+                4,
+                Some(4),
+                Some(TerminalOutcome::Completed),
+                Some("file".into()),
+                None,
+            )
+            .unwrap();
+        let wire = serde_json::to_value(completed).unwrap();
+        assert_eq!(wire["transport"], "terminal_zmodem");
+        assert_eq!(wire["scope"], "interactive_terminal");
+        assert_eq!(wire["peer_identity_verified"], false);
+        assert_eq!(wire["verification"], "protocol_confirmed");
+        assert!(wire.get("terminal").is_none());
+        assert!(
+            wire.get("partial_relative_path").is_none(),
+            "success clears old partial evidence"
+        );
+        drop(receiver);
+        assert!(registry
+            .terminal_update(
+                "terminal",
+                7,
+                0,
+                None,
+                Some(TerminalOutcome::Failed("late".into())),
+                None,
+                None
+            )
+            .is_none());
+        assert_eq!(
+            registry
+                .inspect("terminal", |t| t.snapshot.state.clone())
+                .unwrap(),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn failed_terminal_keeps_recoverable_relative_paths_and_late_success_is_ignored() {
+        let registry = TaskRegistry::default();
+        let (mut task, _receiver) = zmodem_task("terminal", 1);
+        task.snapshot.terminal = Some(TerminalMetadata::zmodem(None));
+        registry.register(task);
+        let result = registry
+            .terminal_update(
+                "terminal",
+                1,
+                3,
+                None,
+                Some(TerminalOutcome::Failed(
+                    "cleanup failed; target may exist".into(),
+                )),
+                Some("file".into()),
+                Some(".incoming/test.part".into()),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["local_relative_path"], "file");
+        assert_eq!(wire["partial_relative_path"], ".incoming/test.part");
+        assert!(registry
+            .terminal_update(
+                "terminal",
+                1,
+                3,
+                Some(3),
+                Some(TerminalOutcome::Completed),
+                None,
+                None
+            )
+            .is_none());
+    }
+    #[test]
+    fn revoked_snapshot_hides_old_and_partial_paths_but_keeps_transport_facts() {
+        let mut snapshot = task(1, 1).snapshot;
+        snapshot.local_relative_path = Some("final".into());
+        snapshot.error = Some("path detail".into());
+        snapshot.terminal = Some(TerminalMetadata::zmodem(Some(
+            ".incoming/private.part".into(),
+        )));
+        let allowed = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(allowed["partial_relative_path"], ".incoming/private.part");
+        snapshot.hide_paths();
+        let revoked = serde_json::to_value(snapshot).unwrap();
+        for field in [
+            "remote_path",
+            "local_relative_path",
+            "partial_relative_path",
+        ] {
+            assert!(revoked.get(field).is_none());
+        }
+        assert!(revoked["error"].is_null());
+        assert_eq!(revoked["transport"], "terminal_zmodem");
+        assert_eq!(allowed["local_relative_path"], "final");
     }
 }
