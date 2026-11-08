@@ -142,7 +142,23 @@ impl SessionPipe {
     ///（`SessionPipe::spawn(channel.into_stream(), …)`，可取消性在底层读取）；
     /// 二者皆须满足本前置（注 30 F10：旧文「duplex / russh channel 读取均可
     /// 取消」枚举不全且与桥接形相矛盾）。
-    pub fn spawn<S: AsyncRead + Unpin + Send + 'static>(mut source: S, opts: PipeOpts) -> Self {
+    pub fn spawn<S: AsyncRead + Unpin + Send + 'static>(source: S, opts: PipeOpts) -> Self {
+        Self::spawn_with_render(source, opts, true)
+    }
+
+    /// Create a session without a GUI renderer; bytes still reach all other sinks.
+    pub fn spawn_headless<S: AsyncRead + Unpin + Send + 'static>(
+        source: S,
+        opts: PipeOpts,
+    ) -> Self {
+        Self::spawn_with_render(source, opts, false)
+    }
+
+    fn spawn_with_render<S: AsyncRead + Unpin + Send + 'static>(
+        mut source: S,
+        opts: PipeOpts,
+        render: bool,
+    ) -> Self {
         // record 先于 async move 取走（Self 结构体留一份；任务里另 clone 一份）
         let record_for_self = opts.record.clone();
         let grid = Arc::new(Mutex::new(Grid::new(
@@ -362,7 +378,9 @@ impl SessionPipe {
                             };
                             rb.push(chunk); // ② 环形缓冲（录制/调试）
                             drop(rb);
-                            batcher_c.push(chunk); // ③ 渲染队列（合批 emit）
+                            if render {
+                                batcher_c.push(chunk); // ③ 渲染队列（合批 emit）
+                            }
                         }
                     }
                 }

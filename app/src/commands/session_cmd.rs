@@ -163,6 +163,7 @@ pub(crate) async fn open_session_core(
                 handle,
                 24,
                 80,
+                require_mcp_permission,
                 None,
             )
             .await
@@ -207,6 +208,7 @@ pub async fn establish_session(
     handle: russh::client::Handle<fs_sshengine::connect::Connector>,
     rows: u32,
     cols: u32,
+    headless: bool,
     expected_generation: Option<u64>,
 ) -> Result<(), String> {
     let app = state.app.clone();
@@ -282,33 +284,35 @@ pub async fn establish_session(
             fs_terminal::decode::StreamDecoder::default()
         }
     };
-    let mut pipe = fs_terminal::SessionPipe::spawn(
-        reader,
-        fs_terminal::PipeOpts {
-            grid_rows: rows as u16,
-            grid_cols: cols as u16,
-            // 审计2 #35：滚动回看行数取自连接配置（档案校验已拦 >MAX；0/None 按默认）。
-            // 旧实现恒用固定默认值——用户在档案里改的 scrollback 从不生效。
-            scrollback_lines: profile
-                .term
-                .scrollback_lines
-                .map(|v| v as usize)
-                .unwrap_or(fs_terminal::grid::DEFAULT_SCROLLBACK_LINES),
-            flow: Default::default(),
-            ring_bytes: fs_terminal::ring::DEFAULT_RING_BYTES,
-            // M4a 会话纯文本日志：settings 键 session.log 决定开关/目录/模板/追加。
-            // 未开启时为 None（零开销）；建不出来（目录不可写）亦为 None，不阻断连接。
-            session_log: state
-                .build_session_log(&session_id, &profile.host, &profile.username)
-                .await,
-            // 未启用（沙箱不可用）时为 None：整条 fan-out 零开销，不是「装一个恒透传的」
-            tap: zmodem_tap
-                .clone()
-                .map(|t| t as std::sync::Arc<dyn fs_terminal::pipe::ByteTap>),
-            record: Some(recorder),
-            decoder,
-        },
-    );
+    let pipe_opts = fs_terminal::PipeOpts {
+        grid_rows: rows as u16,
+        grid_cols: cols as u16,
+        // 审计2 #35：滚动回看行数取自连接配置（档案校验已拦 >MAX；0/None 按默认）。
+        // 旧实现恒用固定默认值——用户在档案里改的 scrollback 从不生效。
+        scrollback_lines: profile
+            .term
+            .scrollback_lines
+            .map(|v| v as usize)
+            .unwrap_or(fs_terminal::grid::DEFAULT_SCROLLBACK_LINES),
+        flow: Default::default(),
+        ring_bytes: fs_terminal::ring::DEFAULT_RING_BYTES,
+        // M4a 会话纯文本日志：settings 键 session.log 决定开关/目录/模板/追加。
+        // 未开启时为 None（零开销）；建不出来（目录不可写）亦为 None，不阻断连接。
+        session_log: state
+            .build_session_log(&session_id, &profile.host, &profile.username)
+            .await,
+        // 未启用（沙箱不可用）时为 None：整条 fan-out 零开销，不是「装一个恒透传的」
+        tap: zmodem_tap
+            .clone()
+            .map(|t| t as std::sync::Arc<dyn fs_terminal::pipe::ByteTap>),
+        record: Some(recorder),
+        decoder,
+    };
+    let mut pipe = if headless {
+        fs_terminal::SessionPipe::spawn_headless(reader, pipe_opts)
+    } else {
+        fs_terminal::SessionPipe::spawn(reader, pipe_opts)
+    };
     let rx = pipe.render_rx(); // take 语义：rx 交给泵任务，pipe 本体进注册表
                                // 审计 P0-4/P0-5（重连的另一半）：旧连接的 SFTP 通道与传输管理器必须在此关停。
                                // 只换注册表条目而不动这两张表，旧代次的 worker 会带着一条已死的 russh Handle
@@ -359,6 +363,7 @@ pub async fn establish_session(
     let generation = registry.insert(
         session_id.clone(),
         Arc::new(crate::sessions::LiveSession {
+            headless,
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             pipe: Arc::new(pipe),
             write: tokio::sync::Mutex::new(write_half),
@@ -1124,6 +1129,7 @@ pub async fn reconnect_loop(
                     handle,
                     rows,
                     cols,
+                    session.headless,
                     Some(generation),
                 )
                 .await
