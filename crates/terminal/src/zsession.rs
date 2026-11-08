@@ -124,6 +124,8 @@ pub struct ZmodemSession {
     crc32_mode: bool,
     close_deadline: Option<std::time::Instant>,
     cancel_sent: bool,
+    recv_open: bool,
+    recv_complete: bool,
 }
 
 impl ZmodemSession {
@@ -144,6 +146,8 @@ impl ZmodemSession {
             crc32_mode: true,
             close_deadline: None,
             cancel_sent: false,
+            recv_open: false,
+            recv_complete: false,
         }
     }
 
@@ -170,6 +174,8 @@ impl ZmodemSession {
             crc32_mode: true,
             close_deadline: None,
             cancel_sent: false,
+            recv_open: false,
+            recv_complete: false,
         }
     }
 
@@ -375,12 +381,15 @@ impl ZmodemSession {
         self.close_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     }
 
-    /// 驱动必须独立于输入唤醒；超时只取消一次，不猜测对端已退出。
+    /// 驱动独立唤醒：发送超时取消；完整接收仅结束 OO 尾清理，不猜测对端退出。
     pub fn expire_close(&mut self, now: std::time::Instant) -> Vec<Action> {
         if !matches!(self.phase, Phase::Closing | Phase::AwaitOverAndOut)
             || !self.close_deadline.is_some_and(|deadline| now >= deadline)
         {
             return Vec::new();
+        }
+        if self.phase == Phase::AwaitOverAndOut {
+            return self.receive_done(false);
         }
         self.phase = Phase::Finished;
         self.cancel_sent = true;
@@ -393,22 +402,57 @@ impl ZmodemSession {
         ]
     }
 
-    fn step_over_and_out(&mut self, out: &mut Vec<Action>) {
-        // 十六进制头的 CR/LF/XON 也可能被拆到下一读块。
-        while self
-            .buf
-            .first()
-            .is_some_and(|b| matches!(b, b'\r' | b'\n' | 0x8a | 0x8d | 0x11 | 0x91))
-        {
-            self.buf.remove(0);
-        }
-        if self.buf.starts_with(b"OO") {
-            self.buf.drain(..2);
+    fn receive_done(&mut self, saw_oo: bool) -> Vec<Action> {
+        self.phase = Phase::Finished;
+        vec![Action::Done {
+            ok: true,
+            message: if saw_oo {
+                "接收完成"
+            } else {
+                "文件接收完成；未观察到 OO 收尾"
+            }
+            .into(),
+        }]
+    }
+
+    /// 仅有效接收收尾可在 EOF 排空；活动文件的二进制不能当终端文本。
+    pub fn receive_tail_at_eof(&mut self) -> Vec<u8> {
+        if self.phase == Phase::AwaitOverAndOut {
             self.phase = Phase::Finished;
-            out.push(Action::Done {
-                ok: true,
-                message: "接收完成".into(),
-            });
+            return self.take_remainder();
+        }
+        Vec::new()
+    }
+
+    fn step_over_and_out(&mut self, out: &mut Vec<Action>) {
+        let skip = self
+            .buf
+            .iter()
+            .take_while(|b| matches!(**b, b'\r' | b'\n' | 0x8a | 0x8d | 0x11 | 0x91))
+            .count();
+        let tail = &self.buf[skip..];
+        if tail.is_empty() || tail == b"O" {
+            return;
+        }
+        if tail.starts_with(b"OO") {
+            self.buf.drain(..skip + 2);
+            out.extend(self.receive_done(true));
+        } else if tail[0] == crate::zmodem::ZPAD {
+            match parse_header(tail) {
+                Parsed::Incomplete => (),
+                Parsed::Header(h, used) => {
+                    self.buf.drain(..skip + used);
+                    if matches!(
+                        h.kind,
+                        FrameKind::ZCAN | FrameKind::ZABORT | FrameKind::ZFERR | FrameKind::ZSKIP
+                    ) {
+                        self.on_header(h, out);
+                    }
+                }
+                Parsed::Bad(_) => out.extend(self.receive_done(false)),
+            }
+        } else {
+            out.extend(self.receive_done(false));
         }
     }
 
@@ -491,6 +535,10 @@ impl ZmodemSession {
             (Direction::Receive, FrameKind::ZRQINIT) => out.push(Action::Send(zrinit())),
             // 文件信息在紧随其后的子包里，可能还没到齐 → 切到显式等待态
             (Direction::Receive, FrameKind::ZFILE) => {
+                if self.recv_open {
+                    out.extend(self.cancel());
+                    return;
+                }
                 self.phase = Phase::AwaitFileInfo;
                 self.step_file_info(out);
             }
@@ -498,10 +546,23 @@ impl ZmodemSession {
                 self.phase = Phase::Receiving;
             }
             (Direction::Receive, FrameKind::ZEOF) => {
+                if !self.recv_open
+                    || h.position() as u64 != self.offset
+                    || self.declared.is_some_and(|size| size != self.offset)
+                {
+                    out.extend(self.cancel());
+                    return;
+                }
+                self.recv_open = false;
+                self.recv_complete = true;
                 out.push(Action::FinishRecv { bytes: self.offset });
                 out.push(Action::Send(zrinit()));
             }
             (Direction::Receive, FrameKind::ZFIN) => {
+                if !self.recv_complete || self.recv_open {
+                    out.extend(self.cancel());
+                    return;
+                }
                 self.begin_close(Phase::AwaitOverAndOut);
                 out.push(Action::Send(
                     FrameHeader {
@@ -639,6 +700,7 @@ impl ZmodemSession {
                 }
                 self.declared = info.size;
                 self.offset = 0;
+                self.recv_open = true;
                 out.push(Action::BeginRecv(info));
                 out.push(Action::Send(
                     FrameHeader {
@@ -787,6 +849,30 @@ mod tests {
             stream = rest;
         }
         out
+    }
+
+    fn completed_receive() -> ZmodemSession {
+        let mut s = ZmodemSession::new_receive();
+        let mut file = hdr(FrameKind::ZFILE, 0);
+        file.extend(encode_subpacket(
+            b"empty.bin\x000 0 0 0",
+            SubpacketEnd::AckEnd,
+            false,
+        ));
+        s.feed(&file);
+        s.feed(&hdr(FrameKind::ZEOF, 0));
+        s
+    }
+
+    #[test]
+    fn complete_receive_without_oo_is_not_cancelled() {
+        let mut s = completed_receive();
+        s.feed(&hdr(FrameKind::ZFIN, 0));
+        let actions =
+            s.expire_close(std::time::Instant::now() + std::time::Duration::from_secs(11));
+        assert!(
+            matches!(&actions[..], [Action::Done { ok: true, message }] if message.contains("未观察到 OO"))
+        );
     }
 
     #[test]
@@ -1273,7 +1359,7 @@ mod tests {
         assert_eq!(send.cancel().len(), 2);
         assert!(send.cancel().is_empty());
         for split in 0..=2 {
-            let mut recv = ZmodemSession::new_receive();
+            let mut recv = completed_receive();
             let actions = recv.feed(&hdr(FrameKind::ZFIN, 0));
             assert!(!actions.iter().any(|a| matches!(a, Action::Done { .. })));
             assert!(!recv.is_finished());
@@ -1293,7 +1379,7 @@ mod tests {
         let end = stream.len();
         stream.extend_from_slice(b"\r\nshell$ ");
         for split in 0..=end {
-            let mut s = ZmodemSession::new_receive();
+            let mut s = completed_receive();
             let mut actions = s.feed(&stream[..split]);
             actions.extend(s.feed(&stream[split..]));
             assert_eq!(
@@ -1310,7 +1396,7 @@ mod tests {
 
     #[test]
     fn closing_deadline_fails_once_without_peer_input() {
-        for receive in [false, true] {
+        for receive in [false] {
             let mut s = if receive {
                 ZmodemSession::new_receive()
             } else {
@@ -1336,6 +1422,71 @@ mod tests {
     }
 
     #[test]
+    fn receive_completion_rejects_empty_batch_missing_eof_and_wrong_length() {
+        for declared in [0, 1] {
+            let mut s = ZmodemSession::new_receive();
+            if declared == 1 {
+                let mut file = hdr(FrameKind::ZFILE, 0);
+                file.extend(encode_subpacket(
+                    b"x\x001 0 0 0",
+                    SubpacketEnd::AckEnd,
+                    false,
+                ));
+                s.feed(&file);
+                assert!(s
+                    .feed(&hdr(FrameKind::ZEOF, 0))
+                    .iter()
+                    .any(|a| matches!(a, Action::Done { ok: false, .. })));
+            } else {
+                assert!(s
+                    .feed(&hdr(FrameKind::ZFIN, 0))
+                    .iter()
+                    .any(|a| matches!(a, Action::Done { ok: false, .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_eof_and_wrong_eof_position_cannot_complete() {
+        for ending in [FrameKind::ZFIN, FrameKind::ZEOF] {
+            let mut s = ZmodemSession::new_receive();
+            let mut file = hdr(FrameKind::ZFILE, 0);
+            file.extend(encode_subpacket(
+                b"empty.bin\x000 0 0 0",
+                SubpacketEnd::AckEnd,
+                false,
+            ));
+            s.feed(&file);
+            let actions = s.feed(&hdr(ending, 1));
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: false, .. })));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: true, .. })));
+            assert!(s
+                .expire_close(std::time::Instant::now() + std::time::Duration::from_secs(11))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn ambiguous_receive_tail_is_preserved_on_timeout_and_eof() {
+        for tail in [b"O".as_slice(), b"**\x18B08", b"\r\n"] {
+            let mut s = completed_receive();
+            s.feed(&hdr(FrameKind::ZFIN, 0));
+            s.feed(tail);
+            s.expire_close(std::time::Instant::now() + std::time::Duration::from_secs(11));
+            assert_eq!(s.take_remainder(), tail);
+            let mut s = completed_receive();
+            s.feed(&hdr(FrameKind::ZFIN, 0));
+            s.feed(tail);
+            assert_eq!(s.receive_tail_at_eof(), tail);
+            assert!(s.receive_tail_at_eof().is_empty());
+        }
+    }
+
+    #[test]
     fn skip_aborts_remote_before_done() {
         let mut session = ZmodemSession::new_send("x", 1);
         assert!(matches!(&session.feed(&hdr(FrameKind::ZSKIP, 0))[..],
@@ -1347,7 +1498,7 @@ mod tests {
     /// 不交还的表现是「传完文件提示符消失、敲回车才回来」，用户读作卡死。
     #[test]
     fn trailing_shell_bytes_are_returned_after_session_ends() {
-        let mut s = ZmodemSession::new_receive();
+        let mut s = completed_receive();
         let mut stream = hdr(FrameKind::ZFIN, 0);
         stream.extend_from_slice(b"OO\r\nuser@host:~$ ");
         let acts = s.feed(&stream);

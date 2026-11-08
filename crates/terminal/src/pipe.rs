@@ -91,6 +91,13 @@ pub trait ByteTap: Send + Sync {
     /// `Cow::Borrowed(&[])` 吞掉；传输刚结束的那一块可能返回 `Cow::Owned`
     /// （帧尾之后属于 shell 的残留字节）。
     fn filter<'a>(&self, chunk: &'a [u8]) -> std::borrow::Cow<'a, [u8]>;
+    /// 有限协议尾字节就绪；只允许原读取任务消费。
+    fn output_ready(&self) -> Option<&tokio::sync::Notify> {
+        None
+    }
+    fn drain_output(&self, _eof: bool) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// 读取任务 panic 兜底守卫：任务任何退出路径（含 panic）都关闭渲染流。
@@ -204,6 +211,7 @@ impl SessionPipe {
                 // S180：等待点带 stop 臂——背压中 shutdown 亦即时退出（纵深防御；
                 // 该形状经 ack 释放后可被主 select 的 stop 臂兜住，单独不可钉，
                 // 诚实记录同 S87 类）。S214：stop 臂发起合批收尾（与 EOF 臂对称）。
+                let mut close_requested = false;
                 let bp = batcher_c.backpressure_active();
                 if bp != bp_was {
                     // 两维并列采样：背压可由字节（queue_bytes ≥ high）或帧数（frames ≥
@@ -244,8 +252,8 @@ impl SessionPipe {
                 while batcher_c.backpressure_active() {
                     tokio::select! {
                         _ = stop_c.notified() => {
-                            batcher_c.shutdown();
-                            return;
+                            close_requested = true;
+                            break;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_millis(8)) => {
                             let qb = batcher_c.queue_bytes();
@@ -274,114 +282,156 @@ impl SessionPipe {
                         }
                     }
                 }
-                tokio::select! {
-                    // S180：用户关闭协同停止——read 臂与 push 之间无 await 点，
-                    // 已读字节必完成 fan-out、未读字节随退出弃置；旧 `abort` 直杀
-                    // 在「read 返回→push」窗口可丢 ≤16 KiB 已读尾块，故改此臂
-                    // （abort 路径随之移除，S181）。
-                    // S214 次序握手：stop 臂发起合批收尾（与 EOF 臂对称）——读取
-                    // 先退出、合批后收尾；旧形（SessionPipe 同发 stop 与
-                    // batcher.shutdown）在多线程运行时下可让最后一次 fan-out 与收尾
-                    // 交错，违反 flow.rs push 前置（迟到推送落孤儿 pending：grid/ring
-                    // 有账而渲染独失 + queue_bytes 幽灵水位，注 30 F2）。
-                    _ = stop_c.notified() => {
-                        batcher_c.shutdown();
-                        return;
+                let mut closing = false;
+                let mut draining = false;
+                let read = if close_requested {
+                    closing = true;
+                    draining = true;
+                    Ok(0)
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = async {
+                            match tap.as_ref().and_then(|t| t.output_ready()) {
+                                Some(ready) => ready.notified().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => { draining = true; Ok(0) },
+                        // S180：用户关闭协同停止——read 臂与 push 之间无 await 点，
+                        // 已读字节必完成 fan-out、未读字节随退出弃置；旧 `abort` 直杀
+                        // 在「read 返回→push」窗口可丢 ≤16 KiB 已读尾块，故改此臂
+                        // （abort 路径随之移除，S181）。
+                        // S214 次序握手：stop 臂发起合批收尾（与 EOF 臂对称）——读取
+                        // 先退出、合批后收尾；旧形（SessionPipe 同发 stop 与
+                        // batcher.shutdown）在多线程运行时下可让最后一次 fan-out 与收尾
+                        // 交错，违反 flow.rs push 前置（迟到推送落孤儿 pending：grid/ring
+                        // 有账而渲染独失 + queue_bytes 幽灵水位，注 30 F2）。
+                        _ = stop_c.notified() => {
+                            closing = true; draining = true; Ok(0)
+                        }
+                        r = source.read(&mut buf) => r,
                     }
-                    r = source.read(&mut buf) => match r {
-                        Ok(0) | Err(_) => {
-                            // EOF/读错 → 传播关闭：合批进入收尾模式，正常发末帧后退出
-                            //（消费者停摆且满时丢帧退出，flow.rs 收尾分支，S87），render_tx
-                            // 随任务结束 drop → 下游 recv() 得 None（EOF 泵仅自退、不代发
-                            // 事件；session:closed 仅 app 层 user_closed / watchdog
-                            // remote_exit 两来源，Task 19 定案）。
-                            // S179：Err 与 EOF 同臂——读错同样关闭渲染流，
-                            // 不循环重试、不挂死。
+                };
+                let n = match read {
+                    Ok(0) if !draining => {
+                        closing = true;
+                        draining = true;
+                        0
+                    }
+                    Ok(n) => n,
+                    Err(_) => {
+                        closing = true;
+                        draining = true;
+                        0
+                    }
+                };
+                {
+                    let chunk = &buf[..n];
+                    // fan-out 顺序（spec §2.2）：
+                    // ⓪ 会话纯文本日志 tap（M4a）：**先于一切丢弃/合批**——
+                    //    屏幕可以丢一帧重绘（背压 drop_backlog），日志丢一段
+                    //    命令输出是证据缺口。写入只剥离+缓冲、恒不阻塞。
+                    // [Phase 4b] 录屏 tap（全量字节+时序）将并列插在此处
+                    if let Some(log) = session_log.as_mut().filter(|_| !draining) {
+                        log.write(chunk);
+                        // 每块即 flush：会话日志的价值在「出事时文件里已经有」，
+                        // 攒着等 drop 会在崩溃/断电时丢掉最后一段——而那一段
+                        // 恰是最需要的。8 KiB 缓冲 + 顺序追加，代价可接受。
+                        log.flush();
+                    }
+                    // ⓪′ 字节拦截器（M4a ZMODEM）：日志之后、网格之前。
+                    //    传输期间返回空切片吞掉二进制帧——否则 vt100 既刷
+                    //    乱码又可能被帧里的转义字节改掉终端状态。
+                    let chunk: &[u8] = match tap.as_ref() {
+                        None => chunk,
+                        Some(t) => match if draining {
+                            std::borrow::Cow::Borrowed(&[][..])
+                        } else {
+                            t.filter(chunk)
+                        } {
+                            std::borrow::Cow::Borrowed(b) => b,
+                            std::borrow::Cow::Owned(v) => {
+                                // 借用期跨越下面三路 fan-out，需就地存活
+                                tap_owned = v;
+                                &tap_owned
+                            }
+                        },
+                    };
+                    let pending = tap
+                        .as_ref()
+                        .map(|t| t.drain_output(closing))
+                        .unwrap_or_default();
+                    let joined;
+                    let chunk = if pending.is_empty() {
+                        chunk
+                    } else {
+                        joined = [pending.as_slice(), chunk].concat();
+                        &joined
+                    };
+                    if chunk.is_empty() {
+                        if closing {
                             batcher_c.shutdown();
                             return;
                         }
-                        Ok(n) => {
-                            let chunk = &buf[..n];
-                            // fan-out 顺序（spec §2.2）：
-                            // ⓪ 会话纯文本日志 tap（M4a）：**先于一切丢弃/合批**——
-                            //    屏幕可以丢一帧重绘（背压 drop_backlog），日志丢一段
-                            //    命令输出是证据缺口。写入只剥离+缓冲、恒不阻塞。
-                            // [Phase 4b] 录屏 tap（全量字节+时序）将并列插在此处
-                            if let Some(log) = session_log.as_mut() {
-                                log.write(chunk);
-                                // 每块即 flush：会话日志的价值在「出事时文件里已经有」，
-                                // 攒着等 drop 会在崩溃/断电时丢掉最后一段——而那一段
-                                // 恰是最需要的。8 KiB 缓冲 + 顺序追加，代价可接受。
-                                log.flush();
-                            }
-                            // ⓪′ 字节拦截器（M4a ZMODEM）：日志之后、网格之前。
-                            //    传输期间返回空切片吞掉二进制帧——否则 vt100 既刷
-                            //    乱码又可能被帧里的转义字节改掉终端状态。
-                            let chunk: &[u8] = match tap.as_ref() {
-                                None => chunk,
-                                Some(t) => match t.filter(chunk) {
-                                    std::borrow::Cow::Borrowed(b) => b,
-                                    std::borrow::Cow::Owned(v) => {
-                                        // 借用期跨越下面三路 fan-out，需就地存活
-                                        tap_owned = v;
-                                        &tap_owned
-                                    }
-                                },
-                            };
-                            if chunk.is_empty() {
-                                continue; // 全被吞掉：三路 fan-out 都无事可做
-                            }
-                            // ⓪‴ 编码解码（M7.4）：拦截器**之后**（见 PipeOpts::decoder 的
-                            //    次序论证），其余 fan-out **之前**——网格（vt100/AI 取文）、
-                            //    环形缓冲、录屏、渲染要看到的是同一份已经转成 UTF-8 的字节。
-                            //    UTF-8 档在此零拷贝借用原块，与接这一段之前逐字节一致。
-                            let decoded = {
-                                let mut d = recover_poison(decoder_c.lock());
-                                d.decode(chunk)
-                            };
-                            let chunk: &[u8] = match decoded {
-                                std::borrow::Cow::Borrowed(b) => b,
-                                std::borrow::Cow::Owned(v) => {
-                                    dec_owned = v;
-                                    &dec_owned
-                                }
-                            };
-                            if chunk.is_empty() {
-                                continue; // 整块都是半个多字符，留在解码器状态里等下一块
-                            }
-                            // ⓪″ 录屏 tap（M4a）：拦截器**之后**——录用户看到的字节。
-                            // 时间在**此处**取而不是喂入时传进来：读块到达的时刻就是
-                            // 事件时刻，调用方没有更早的时间戳可给。
-                            if let Some(rec) = record.as_ref() {
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as i64)
-                                    .unwrap_or(0);
-                                rec.lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .write(chunk, now_ms);
-                            }
-                            // S183：毒锁恢复——std Mutex 仅在持锁线程 panic 时染毒；
-                            // into_inner 取回内部状态继续（feed/push 为尽力面，活性优先：
-                            // panic 上抛会静默杀死读取任务，渲染流永不关闭而挂死，
-                            // 比带病状态更糟）。该恢复经 pub API 不可达（染毒需跨
-                            // 线程同锁 panic），纵深防御无钉例，先例 S87 类。
-                            let mut g = match grid_c.lock() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner(),
-                            };
-                            g.feed(chunk); // ① headless 网格
-                            drop(g);
-                            let mut rb = match ring_c.lock() {
-                                Ok(r) => r,
-                                Err(p) => p.into_inner(),
-                            };
-                            rb.push(chunk); // ② 环形缓冲（录制/调试）
-                            drop(rb);
-                            if render {
-                                batcher_c.push(chunk); // ③ 渲染队列（合批 emit）
-                            }
+                        continue; // 全被吞掉：三路 fan-out 都无事可做
+                    }
+                    // ⓪‴ 编码解码（M7.4）：拦截器**之后**（见 PipeOpts::decoder 的
+                    //    次序论证），其余 fan-out **之前**——网格（vt100/AI 取文）、
+                    //    环形缓冲、录屏、渲染要看到的是同一份已经转成 UTF-8 的字节。
+                    //    UTF-8 档在此零拷贝借用原块，与接这一段之前逐字节一致。
+                    let decoded = {
+                        let mut d = recover_poison(decoder_c.lock());
+                        d.decode(chunk)
+                    };
+                    let chunk: &[u8] = match decoded {
+                        std::borrow::Cow::Borrowed(b) => b,
+                        std::borrow::Cow::Owned(v) => {
+                            dec_owned = v;
+                            &dec_owned
                         }
+                    };
+                    if chunk.is_empty() {
+                        if closing {
+                            batcher_c.shutdown();
+                            return;
+                        }
+                        continue; // 整块都是半个多字符，留在解码器状态里等下一块
+                    }
+                    // ⓪″ 录屏 tap（M4a）：拦截器**之后**——录用户看到的字节。
+                    // 时间在**此处**取而不是喂入时传进来：读块到达的时刻就是
+                    // 事件时刻，调用方没有更早的时间戳可给。
+                    if let Some(rec) = record.as_ref() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        rec.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .write(chunk, now_ms);
+                    }
+                    // S183：毒锁恢复——std Mutex 仅在持锁线程 panic 时染毒；
+                    // into_inner 取回内部状态继续（feed/push 为尽力面，活性优先：
+                    // panic 上抛会静默杀死读取任务，渲染流永不关闭而挂死，
+                    // 比带病状态更糟）。该恢复经 pub API 不可达（染毒需跨
+                    // 线程同锁 panic），纵深防御无钉例，先例 S87 类。
+                    let mut g = match grid_c.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    g.feed(chunk); // ① headless 网格
+                    drop(g);
+                    let mut rb = match ring_c.lock() {
+                        Ok(r) => r,
+                        Err(p) => p.into_inner(),
+                    };
+                    rb.push(chunk); // ② 环形缓冲（录制/调试）
+                    drop(rb);
+                    if render {
+                        batcher_c.push(chunk); // ③ 渲染队列（合批 emit）
+                    }
+                    if closing {
+                        batcher_c.shutdown();
+                        return;
                     }
                 }
             }
@@ -504,5 +554,123 @@ impl SessionPipe {
     }
     pub fn grid_cols(&self) -> u16 {
         recover_poison(self.grid.lock()).cols()
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use std::borrow::Cow;
+    use tokio::io::AsyncWriteExt;
+    struct TailTap {
+        pending: Mutex<Vec<u8>>,
+        eof: Mutex<Vec<u8>>,
+        ready: tokio::sync::Notify,
+    }
+    impl ByteTap for TailTap {
+        fn filter<'a>(&self, b: &'a [u8]) -> Cow<'a, [u8]> {
+            Cow::Borrowed(b)
+        }
+        fn output_ready(&self) -> Option<&tokio::sync::Notify> {
+            Some(&self.ready)
+        }
+        fn drain_output(&self, eof: bool) -> Vec<u8> {
+            let mut b = std::mem::take(&mut *self.pending.lock().unwrap());
+            if eof {
+                b.extend(std::mem::take(&mut *self.eof.lock().unwrap()));
+            }
+            b
+        }
+    }
+    #[tokio::test]
+    async fn tail_wake_eof_and_simultaneous_read_use_normal_fanout_once() {
+        for mode in 0..4 {
+            let tap = Arc::new(TailTap {
+                pending: Mutex::new(Vec::new()),
+                eof: Mutex::new(Vec::new()),
+                ready: Default::default(),
+            });
+            let (mut writer, reader) = tokio::io::duplex(128);
+            if mode == 2 {
+                *tap.pending.lock().unwrap() = b"OLD".to_vec();
+                tap.ready.notify_one();
+                writer.write_all(b"NEW").await.unwrap();
+            }
+            if mode == 1 {
+                *tap.eof.lock().unwrap() = b"**\x18B08".to_vec();
+            }
+            let path =
+                std::env::temp_dir().join(format!("fs111-tail-{}-{mode}.cast", std::process::id()));
+            let recorder = Arc::new(Mutex::new(
+                crate::record::Recorder::start(path.clone(), 80, 24, 0).unwrap(),
+            ));
+            let mut pipe = SessionPipe::spawn(
+                reader,
+                PipeOpts {
+                    grid_rows: 24,
+                    grid_cols: 80,
+                    scrollback_lines: 10,
+                    flow: Default::default(),
+                    ring_bytes: 1024,
+                    session_log: None,
+                    record: Some(recorder.clone()),
+                    tap: Some(tap.clone()),
+                    decoder: crate::decode::StreamDecoder::new(Some("gbk")).unwrap(),
+                },
+            );
+            let mut rx = pipe.render_rx();
+            if mode == 0 || mode == 3 {
+                *tap.pending.lock().unwrap() = if mode == 0 {
+                    b"O".to_vec()
+                } else {
+                    b"\xd6\xd0".to_vec()
+                };
+                tap.ready.notify_one();
+            }
+            if mode == 1 {
+                writer.shutdown().await.unwrap();
+            }
+            let expected = [b"O".as_slice(), b"**\x18B08", b"OLDNEW", "中".as_bytes()][mode];
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while pipe.ring_snapshot_text().as_bytes() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode != 1 {
+                writer.shutdown().await.unwrap();
+            }
+            let mut rendered = Vec::new();
+            while let Some((_, b)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+            {
+                rendered.extend(b);
+            }
+            assert_eq!(rendered, expected);
+            assert_eq!(pipe.ring_snapshot_text().as_bytes(), expected);
+            if mode != 1 {
+                assert!(pipe
+                    .grid_text()
+                    .contains(std::str::from_utf8(expected).unwrap()));
+            }
+            recorder.lock().unwrap().stop(100);
+            let cast = std::fs::read_to_string(&path).unwrap();
+            let (_, events) = crate::record::parse_cast(&cast).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == "o")
+                    .map(|e| e.data.as_str())
+                    .collect::<String>()
+                    .as_bytes(),
+                expected
+            );
+            std::fs::remove_file(path).unwrap();
+            assert!(tap.pending.lock().unwrap().is_empty());
+            assert!(tap.eof.lock().unwrap().is_empty());
+        }
     }
 }

@@ -350,6 +350,8 @@ pub struct ZmodemTap {
     connection_generation: AtomicU64,
     /// 通道/驱动失败，不得被后续成功状态覆盖。
     failure: Mutex<Option<String>>,
+    tail: Mutex<Vec<u8>>,
+    tail_ready: tokio::sync::Notify,
     /// 本会话已确定的下载目录（2026-08-26 两段式）。
     ///
     /// 一次 `sz` 批量传多个文件时，第一个文件做的「去哪」决定对**本次会话**
@@ -434,6 +436,8 @@ impl ZmodemTap {
             cancelling: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
             failure: Mutex::new(None),
+            tail: Mutex::new(Vec::new()),
+            tail_ready: tokio::sync::Notify::new(),
             session_download_dir: Mutex::new(None),
             pending_finalize: Mutex::new(Default::default()),
             finalized: Mutex::new(Default::default()),
@@ -770,6 +774,26 @@ fn emit_progress_full(
 }
 
 impl ByteTap for ZmodemTap {
+    fn output_ready(&self) -> Option<&tokio::sync::Notify> {
+        Some(&self.tail_ready)
+    }
+    fn drain_output(&self, eof: bool) -> Vec<u8> {
+        let mut cur = self.cur.lock().unwrap();
+        let mut tail = self.tail.lock().unwrap();
+        if eof {
+            if let Some(t) = cur.as_mut() {
+                tail.extend(t.session.receive_tail_at_eof());
+                let _ = self.dispatch(
+                    t.id,
+                    vec![Action::Done {
+                        ok: false,
+                        message: "终端连接关闭，传输结果未知".into(),
+                    }],
+                );
+            }
+        }
+        std::mem::take(&mut *tail)
+    }
     fn filter<'a>(&self, chunk: &'a [u8]) -> Cow<'a, [u8]> {
         // 空闲且不自动检测：整条链路零成本透传
         if !self.auto && !self.busy.load(Ordering::SeqCst) {
@@ -978,6 +1002,11 @@ async fn bound_session(
     }
 }
 
+fn publish_tail(tap: &ZmodemTap, tail: Vec<u8>) {
+    tap.tail.lock().unwrap().extend(tail);
+    tap.tail_ready.notify_one();
+}
+
 /// 驱动任务：串行执行副作用。
 async fn drive(
     app: AppHandle,
@@ -996,6 +1025,12 @@ async fn drive(
                 let mut cur = tap.cur.lock().unwrap();
                 if let Some(transfer) = cur.as_mut() {
                     let acts = transfer.session.expire_close(std::time::Instant::now());
+                    if acts.iter().any(|a| matches!(a, Action::Done { ok: true, .. })) {
+                        let tail = transfer.session.take_remainder();
+                        if !tail.is_empty() {
+                            publish_tail(&tap, tail);
+                        }
+                    }
                     if let Err(error) = tap.dispatch(transfer.id, acts) {
                         *tap.failure.lock().unwrap() = Some(error);
                     }
@@ -1316,7 +1351,10 @@ async fn drive(
                 let failure = tap.failure_message();
                 let ok = ok && failure.is_none();
                 let message = failure.unwrap_or_else(|| {
-                    if ok && !tap.pending_finalize.lock().unwrap().is_empty() {
+                    if ok
+                        && !message.contains("未观察到 OO")
+                        && !tap.pending_finalize.lock().unwrap().is_empty()
+                    {
                         "协议传输完成，文件等待保存".into()
                     } else {
                         message
@@ -1807,6 +1845,21 @@ mod tests {
     #[test]
     fn io_failure_after_protocol_finished_can_cancel_once() {
         let mut session = ZmodemSession::new_receive();
+        let header = |kind| {
+            fs_terminal::zmodem::FrameHeader {
+                kind,
+                flags: [0; 4],
+            }
+            .to_hex()
+        };
+        let mut file = header(fs_terminal::zmodem::FrameKind::ZFILE);
+        file.extend(fs_terminal::zmodem::encode_subpacket(
+            b"empty\x000 0 0 0",
+            fs_terminal::zmodem::SubpacketEnd::AckEnd,
+            false,
+        ));
+        session.feed(&file);
+        session.feed(&header(fs_terminal::zmodem::FrameKind::ZEOF));
         let mut end = fs_terminal::zmodem::FrameHeader {
             kind: fs_terminal::zmodem::FrameKind::ZFIN,
             flags: [0; 4],
