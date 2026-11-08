@@ -12,10 +12,10 @@
 //!
 //! **接收（远端 `sz`）**：对端发 ZRQINIT → 我们回 ZRINIT → 对端 ZFILE（文件名/大小）
 //! → 我们回 ZRPOS(0) → 对端 ZDATA + 子包流 → 我们攒盘 → 对端 ZEOF → 我们回 ZRINIT
-//! → 对端 ZFIN → 我们回 ZFIN 并结束。
+//! → 对端 ZFIN → 我们回 ZFIN → 等待并消费 OO。
 //!
 //! **发送（远端 `rz`）**：对端发 ZRINIT → 我们发 ZFILE → 对端回 ZRPOS → 我们发
-//! ZDATA + 子包流 → 发 ZEOF → 对端回 ZRINIT → 我们发 ZFIN → 对端回 ZFIN，结束。
+//! ZDATA + 子包流 → 发 ZEOF → 对端回 ZRINIT → 我们发 ZFIN → 对端回 ZFIN → 我们发 OO 后结束。
 
 use crate::zmodem::{
     cancel_sequence, encode_subpacket, parse_file_info, parse_header, parse_subpacket, FileInfo,
@@ -76,6 +76,8 @@ enum Phase {
     Receiving,
     /// 发数据中
     Sending,
+    Closing,
+    AwaitOverAndOut,
     Finished,
 }
 
@@ -117,6 +119,8 @@ pub struct ZmodemSession {
     zfile_sent: bool,
     /// 数据帧用 CRC-32（握手后固定：我们发的 ZRINIT/ZFILE 都声明支持）
     crc32_mode: bool,
+    close_deadline: Option<std::time::Instant>,
+    cancel_sent: bool,
 }
 
 impl ZmodemSession {
@@ -135,6 +139,8 @@ impl ZmodemSession {
             file_sent: false,
             zfile_sent: false,
             crc32_mode: true,
+            close_deadline: None,
+            cancel_sent: false,
         }
     }
 
@@ -159,6 +165,8 @@ impl ZmodemSession {
             file_sent: false,
             zfile_sent: false,
             crc32_mode: true,
+            close_deadline: None,
+            cancel_sent: false,
         }
     }
 
@@ -209,6 +217,7 @@ impl ZmodemSession {
             }
             let before = self.buf.len();
             match self.phase {
+                Phase::AwaitOverAndOut => self.step_over_and_out(&mut out),
                 Phase::Receiving => self.step_receiving(&mut out),
                 Phase::AwaitFileInfo => self.step_file_info(&mut out),
                 _ => self.step_frames(&mut out),
@@ -285,6 +294,12 @@ impl ZmodemSession {
     /// 重置的是**单文件**状态（offset / eof_sent / frame_open）；CRC 宽度不重置
     /// ——会话级协商结果对整个会话有效。
     pub fn next_file(&mut self, name: &str, size: u64) -> Vec<Action> {
+        if matches!(
+            self.phase,
+            Phase::Closing | Phase::AwaitOverAndOut | Phase::Finished
+        ) {
+            return Vec::new();
+        }
         let base = name
             .rsplit(['/', '\\'])
             .next()
@@ -304,25 +319,67 @@ impl ZmodemSession {
 
     /// 多文件发送：队列已空，发 ZFIN 收尾整个会话。
     pub fn finish(&mut self) -> Vec<Action> {
+        if matches!(
+            self.phase,
+            Phase::Closing | Phase::AwaitOverAndOut | Phase::Finished
+        ) {
+            return Vec::new();
+        }
+        self.begin_close(Phase::Closing);
+        vec![Action::Send(
+            FrameHeader {
+                kind: FrameKind::ZFIN,
+                flags: [0; 4],
+            }
+            .to_hex(),
+        )]
+    }
+
+    fn begin_close(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.close_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    }
+
+    /// 驱动必须独立于输入唤醒；超时只取消一次，不猜测对端已退出。
+    pub fn expire_close(&mut self, now: std::time::Instant) -> Vec<Action> {
+        if !matches!(self.phase, Phase::Closing | Phase::AwaitOverAndOut)
+            || !self.close_deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Vec::new();
+        }
         self.phase = Phase::Finished;
+        self.cancel_sent = true;
         vec![
-            Action::Send(
-                FrameHeader {
-                    kind: FrameKind::ZFIN,
-                    flags: [0; 4],
-                }
-                .to_hex(),
-            ),
+            Action::Send(cancel_sequence()),
             Action::Done {
-                ok: true,
-                message: "发送完成".into(),
+                ok: false,
+                message: "协议收尾超时；对端退出状态未知".into(),
             },
         ]
     }
 
+    fn step_over_and_out(&mut self, out: &mut Vec<Action>) {
+        // 十六进制头的 CR/LF/XON 也可能被拆到下一读块。
+        while self
+            .buf
+            .first()
+            .is_some_and(|b| matches!(b, b'\r' | b'\n' | 0x8a | 0x8d | 0x11 | 0x91))
+        {
+            self.buf.remove(0);
+        }
+        if self.buf.starts_with(b"OO") {
+            self.buf.drain(..2);
+            self.phase = Phase::Finished;
+            out.push(Action::Done {
+                ok: true,
+                message: "接收完成".into(),
+            });
+        }
+    }
+
     /// 取走会话结束后残留在缓冲区里的字节。
     ///
-    /// ZFIN 之后对端通常紧跟 `OO`（over-and-out）与 shell 提示符，而这些字节是在
+    /// 接收侧消费 `OO`（over-and-out）之后的 shell 提示符，而这些字节是在
     /// 同一个读块里到达的。传输拦截器在会话活跃期间吞掉全部字节，若不把残留交还
     /// 终端，用户传完文件会看到「光标停在空行、提示符不见了」——按一下回车才回来。
     /// 那种表现极易被当成卡死。
@@ -332,6 +389,10 @@ impl ZmodemSession {
 
     /// 主动取消（用户点「取消」）。
     pub fn cancel(&mut self) -> Vec<Action> {
+        if self.cancel_sent {
+            return Vec::new();
+        }
+        self.cancel_sent = true;
         self.phase = Phase::Finished;
         vec![
             Action::Send(cancel_sequence()),
@@ -374,6 +435,22 @@ impl ZmodemSession {
     }
 
     fn on_header(&mut self, h: FrameHeader, out: &mut Vec<Action>) {
+        if self.phase == Phase::Closing
+            && !matches!(
+                h.kind,
+                FrameKind::ZCAN | FrameKind::ZABORT | FrameKind::ZFERR | FrameKind::ZSKIP
+            )
+        {
+            if h.kind == FrameKind::ZFIN {
+                self.phase = Phase::Finished;
+                out.push(Action::Send(b"OO".to_vec()));
+                out.push(Action::Done {
+                    ok: true,
+                    message: "发送完成".into(),
+                });
+            }
+            return;
+        }
         match (self.dir, h.kind) {
             // ── 接收侧 ──
             (Direction::Receive, FrameKind::ZRQINIT) => out.push(Action::Send(zrinit())),
@@ -390,7 +467,7 @@ impl ZmodemSession {
                 out.push(Action::Send(zrinit()));
             }
             (Direction::Receive, FrameKind::ZFIN) => {
-                self.phase = Phase::Finished;
+                self.begin_close(Phase::AwaitOverAndOut);
                 out.push(Action::Send(
                     FrameHeader {
                         kind: FrameKind::ZFIN,
@@ -398,10 +475,6 @@ impl ZmodemSession {
                     }
                     .to_hex(),
                 ));
-                out.push(Action::Done {
-                    ok: true,
-                    message: "接收完成".into(),
-                });
             }
 
             // ── 发送侧 ──
@@ -438,6 +511,7 @@ impl ZmodemSession {
                 if pos > self.out_size {
                     // 超过文件长度就是无从满足的请求，取消并说清楚
                     self.phase = Phase::Finished;
+                    self.cancel_sent = true;
                     out.push(Action::Send(cancel_sequence()));
                     out.push(Action::Done {
                         ok: false,
@@ -462,13 +536,6 @@ impl ZmodemSession {
                 ));
                 out.push(Action::NeedChunk { offset: pos });
             }
-            (Direction::Send, FrameKind::ZFIN) => {
-                self.phase = Phase::Finished;
-                out.push(Action::Done {
-                    ok: true,
-                    message: "发送完成".into(),
-                });
-            }
 
             // ── 双向 ──
             (_, FrameKind::ZCAN | FrameKind::ZABORT | FrameKind::ZFERR) => {
@@ -480,6 +547,8 @@ impl ZmodemSession {
             }
             (_, FrameKind::ZSKIP) => {
                 self.phase = Phase::Finished;
+                self.cancel_sent = true;
+                out.push(Action::Send(cancel_sequence()));
                 out.push(Action::Done {
                     ok: false,
                     message: "对端跳过了该文件".into(),
@@ -512,6 +581,7 @@ impl ZmodemSession {
                 if info.name.is_empty() {
                     // 名字不可用（纯 `..`／空）→ 取消，一个字节都不落盘
                     self.phase = Phase::Finished;
+                    self.cancel_sent = true;
                     out.push(Action::Send(cancel_sequence()));
                     out.push(Action::Done {
                         ok: false,
@@ -521,6 +591,7 @@ impl ZmodemSession {
                 }
                 if info.size.is_some_and(|s| s > MAX_RECV_BYTES) {
                     self.phase = Phase::Finished;
+                    self.cancel_sent = true;
                     out.push(Action::Send(cancel_sequence()));
                     out.push(Action::Done {
                         ok: false,
@@ -709,8 +780,9 @@ mod tests {
                 assert_eq!(zfile_names(&s.next_file(next, 1)), vec![next.to_string()]);
             }
         }
+        s.finish();
         assert!(s
-            .finish()
+            .feed(&hdr(FrameKind::ZFIN, 0))
             .iter()
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
     }
@@ -764,8 +836,9 @@ mod tests {
         // 收妥 → FileSent → 队列空 → finish
         let acts = s.feed(&hdr(FrameKind::ZRINIT, 0));
         assert!(acts.iter().any(|a| matches!(a, Action::FileSent)));
+        s.finish();
         assert!(s
-            .finish()
+            .feed(&hdr(FrameKind::ZFIN, 0))
             .iter()
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
         assert!(s.is_finished());
@@ -796,8 +869,9 @@ mod tests {
             "0 字节文件的收妥 ZRINIT 被误判成初始（eof_sent 判据失效）"
         );
         // 且队列空时 finish 收得了尾
+        s.finish();
         assert!(s
-            .finish()
+            .feed(&hdr(FrameKind::ZFIN, 0))
             .iter()
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
     }
@@ -933,7 +1007,7 @@ mod tests {
             "ZEOF 须产出 FinishRecv，实得 {acts:?}"
         );
 
-        acts = s.feed(&hdr(FrameKind::ZFIN, 0));
+        acts = s.feed(&[hdr(FrameKind::ZFIN, 0), b"OO".to_vec()].concat());
         assert!(
             acts.iter()
                 .any(|a| matches!(a, Action::Done { ok: true, .. })),
@@ -968,6 +1042,7 @@ mod tests {
         stream.extend_from_slice(&encode_subpacket(&payload, SubpacketEnd::EndFrame, true));
         stream.extend_from_slice(&hdr(FrameKind::ZEOF, 200));
         stream.extend_from_slice(&hdr(FrameKind::ZFIN, 0));
+        stream.extend_from_slice(b"OO");
 
         let mut s = ZmodemSession::new_receive();
         let mut got = Vec::new();
@@ -1056,7 +1131,8 @@ mod tests {
         let acts = s.feed(&hdr(FrameKind::ZRINIT, 0));
         assert!(acts.iter().any(|a| matches!(a, Action::FileSent)));
         // 队列空 → finish 收尾
-        let acts = s.finish();
+        s.finish();
+        let acts = s.feed(&hdr(FrameKind::ZFIN, 0));
         assert!(acts
             .iter()
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
@@ -1138,6 +1214,91 @@ mod tests {
         assert_eq!(header_crc32(b""), None);
     }
 
+    #[test]
+    fn closing_waits_for_peer_and_consumes_split_oo() {
+        let mut send = ZmodemSession::new_send("x", 0);
+        let actions = send.finish();
+        assert!(!send.is_finished());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Done { .. })));
+        assert!(send.finish().is_empty());
+        assert!(send.feed(&hdr(FrameKind::ZRPOS, 0)).is_empty());
+        assert!(send.feed(&hdr(FrameKind::ZRINIT, 0)).is_empty());
+        let actions = send.feed(&hdr(FrameKind::ZFIN, 0));
+        assert!(
+            matches!(&actions[..], [Action::Send(b), Action::Done { ok: true, .. }] if b == b"OO")
+        );
+        assert_eq!(send.cancel().len(), 2);
+        assert!(send.cancel().is_empty());
+        for split in 0..=2 {
+            let mut recv = ZmodemSession::new_receive();
+            let actions = recv.feed(&hdr(FrameKind::ZFIN, 0));
+            assert!(!actions.iter().any(|a| matches!(a, Action::Done { .. })));
+            assert!(!recv.is_finished());
+            recv.feed(&b"OO"[..split]);
+            let mut rest = b"OO"[split..].to_vec();
+            rest.extend_from_slice(b"shell$ ");
+            recv.feed(&rest);
+            assert!(recv.is_finished());
+            assert_eq!(recv.take_remainder(), b"shell$ ");
+        }
+    }
+
+    #[test]
+    fn zfin_oo_and_shell_survive_every_input_boundary() {
+        let mut stream = hdr(FrameKind::ZFIN, 0);
+        stream.extend_from_slice(b"\r\x8a\x11OO");
+        let end = stream.len();
+        stream.extend_from_slice(b"\r\nshell$ ");
+        for split in 0..=end {
+            let mut s = ZmodemSession::new_receive();
+            let mut actions = s.feed(&stream[..split]);
+            actions.extend(s.feed(&stream[split..]));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::Done { ok: true, .. }))
+                    .count(),
+                1,
+                "split {split}"
+            );
+            assert_eq!(s.take_remainder(), b"\r\nshell$ ", "split {split}");
+        }
+    }
+
+    #[test]
+    fn closing_deadline_fails_once_without_peer_input() {
+        for receive in [false, true] {
+            let mut s = if receive {
+                ZmodemSession::new_receive()
+            } else {
+                ZmodemSession::new_send("x", 0)
+            };
+            if receive {
+                s.feed(&hdr(FrameKind::ZFIN, 0));
+            } else {
+                s.finish();
+            }
+            let deadline = s.close_deadline.unwrap();
+            assert!(s
+                .expire_close(deadline - std::time::Duration::from_millis(1))
+                .is_empty());
+            let actions = s.expire_close(deadline);
+            assert!(
+                matches!(&actions[..], [Action::Send(b), Action::Done { ok: false, message }]
+                if *b == cancel_sequence() && message.contains("未知"))
+            );
+            assert!(s.expire_close(deadline).is_empty());
+            assert!(s.cancel().is_empty());
+        }
+    }
+
+    #[test]
+    fn skip_aborts_remote_before_done() {
+        let mut session = ZmodemSession::new_send("x", 1);
+        assert!(matches!(&session.feed(&hdr(FrameKind::ZSKIP, 0))[..],
+            [Action::Send(bytes), Action::Done { ok: false, .. }] if *bytes == cancel_sequence()));
+    }
+
     /// S336：ZFIN 之后同一读块里的 shell 字节要能交还终端。
     ///
     /// 不交还的表现是「传完文件提示符消失、敲回车才回来」，用户读作卡死。
@@ -1152,7 +1313,7 @@ mod tests {
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
         assert_eq!(
             String::from_utf8_lossy(&s.take_remainder()),
-            "OO\r\nuser@host:~$ ",
+            "\r\nuser@host:~$ ",
             "ZFIN 之后的 shell 字节须原样交还"
         );
         assert!(

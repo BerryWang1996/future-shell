@@ -211,8 +211,11 @@ fn cancellation_actions(
         return Ok(Vec::new());
     }
     if let Some(transfer) = cur.as_mut() {
-        cancelling.store(true, Ordering::SeqCst);
-        return Ok(transfer.session.cancel());
+        let acts = transfer.session.cancel();
+        if !acts.is_empty() {
+            cancelling.store(true, Ordering::SeqCst);
+        }
+        return Ok(acts);
     }
     if waiting.load(Ordering::SeqCst) {
         cancelling.store(true, Ordering::SeqCst);
@@ -811,7 +814,24 @@ async fn drive(
     tap: std::sync::Weak<ZmodemTap>,
     mut rx: mpsc::UnboundedReceiver<QueuedEffect>,
 ) {
-    while let Some(queued) = rx.recv().await {
+    let mut close_timer = tokio::time::interval(std::time::Duration::from_millis(100));
+    close_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let queued = tokio::select! {
+            biased;
+            _ = close_timer.tick() => {
+                let Some(tap) = tap.upgrade() else { return };
+                let mut cur = tap.cur.lock().unwrap();
+                if let Some(transfer) = cur.as_mut() {
+                    let acts = transfer.session.expire_close(std::time::Instant::now());
+                    if let Err(error) = tap.dispatch(transfer.id, acts) {
+                        *tap.failure.lock().unwrap() = Some(error);
+                    }
+                }
+                continue;
+            }
+            queued = rx.recv() => match queued { Some(queued) => queued, None => return },
+        };
         let Some(tap) = tap.upgrade() else { return };
         let transfer_id = queued.transfer_id;
         if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
@@ -1298,9 +1318,41 @@ mod tests {
     }
 
     #[test]
+    fn cancel_after_skip_keeps_queued_failure_admitted() {
+        let mut session = ZmodemSession::new_send("protected", 1);
+        let skip = fs_terminal::zmodem::FrameHeader {
+            kind: fs_terminal::zmodem::FrameKind::ZSKIP,
+            flags: [0; 4],
+        }
+        .to_hex();
+        session.feed(&skip);
+        let mut cur = Some(transfer(session));
+        let waiting = AtomicBool::new(false);
+        let cancelling = AtomicBool::new(false);
+        assert!(cancellation_actions(&mut cur, &waiting, &cancelling)
+            .unwrap()
+            .is_empty());
+        assert!(!cancelling.load(Ordering::SeqCst));
+        assert!(effect_admitted(
+            &Effect::Done {
+                ok: false,
+                message: "skipped".into()
+            },
+            cancelling.load(Ordering::SeqCst),
+            false
+        ));
+    }
+
+    #[test]
     fn io_failure_after_protocol_finished_can_cancel_once() {
         let mut session = ZmodemSession::new_receive();
-        session.cancel(); // 协议终态先到达，文件效果尚在驱动队列。
+        let mut end = fs_terminal::zmodem::FrameHeader {
+            kind: fs_terminal::zmodem::FrameKind::ZFIN,
+            flags: [0; 4],
+        }
+        .to_hex();
+        end.extend_from_slice(b"OO");
+        session.feed(&end); // 协议终态先到达，文件效果尚在驱动队列。
         let mut cur = Some(transfer(session));
         let waiting = AtomicBool::new(false);
         let cancelling = AtomicBool::new(false);
