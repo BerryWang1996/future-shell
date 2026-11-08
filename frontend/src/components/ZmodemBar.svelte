@@ -18,9 +18,8 @@
    * pickerOpen 设回 false，effect 重跑、条件又成立、弹窗立刻重开——关闭按钮
    * 形同虚设。
    *
-   * 现在的修法是**边沿触发**：只在 false→true 的跳变瞬间开一次。加上条上常驻的
-   * 「选择本地文件…」按钮（手动重开）与「取消」（通知远端退出），三件合起来
-   * 才算修完：能关、关了不弹回、想继续有入口。
+   * 现在只在 needFile 从 false 变为 true 时打开一次；关闭选择器即请求取消
+   * 远端传输。等待后端结果期间不得重新弹出选择器。
    */
   import { invoke } from "@tauri-apps/api/core";
   import { IDLE, formatBytes, progressText, type TransferView } from "../lib/zmodem";
@@ -34,6 +33,19 @@
   let dirPickerOpen = $state(false);
   /** 决策框里当前选定的目录。`null` = 未换过（用后端建议）；`""` = 用户主目录
    *  （目录选择器以相对家目录的路径回报，根就是空串——**与「未选」不是一个值**）。 */
+  let confirmDirectory = $state<(paths: string[]) => void>(() => {});
+  function openDirectoryPicker() {
+    const id = sessionId;
+    const decisionId = view.decision?.decisionId;
+    confirmDirectory = (paths) => {
+      if (sessionId !== id || view.decision?.decisionId !== decisionId) return;
+      dirPickerOpen = false;
+      if (paths[0] !== undefined) decisionDir = paths[0];
+    };
+    dirPickerOpen = true;
+  }
+  let lastDecisionId = "";
+  let lastDecisionSession = "";
   let decisionDir = $state<string | null>(null);
   /** 首次引导的「记住选择」：null=未选（不让确认），"fixed"/"ask"。 */
   let rememberChoice = $state<"fixed" | "ask" | null>(null);
@@ -73,12 +85,22 @@
   // 问去向（first-run/choose-dir）→ 复位记忆单选（目录保持 null=跟随建议）。
   $effect(() => {
     const d = view.decision;
+    if (lastDecisionSession !== sessionId) {
+      lastDecisionSession = sessionId;
+      applyPolicy = null;
+      applyToRest = false;
+    }
     if (!d) return;
+    if (lastDecisionId !== d.decisionId) {
+      lastDecisionId = d.decisionId;
+      decisionDir = null;
+      rememberChoice = null;
+      dirPickerOpen = false;
+    }
     if (d.conflict && applyPolicy) {
       void finalize(effDir(), applyPolicy, null);
       return;
     }
-    rememberChoice = null;
   });
 
   // 会话终态复位「其余同此处理」：下次传输重新问（与后端 session 目录的
@@ -107,7 +129,7 @@
     }
     void (async () => {
       try {
-        const s = await invoke<{ active: boolean; sandbox: string | null; auto: boolean }>(
+        const s = await invoke<{ active: boolean; sandbox: string | null; auto: boolean; error?: string | null }>(
           "zmodem_status",
           { sessionId: id },
         );
@@ -115,6 +137,7 @@
         if (sessionId !== id) return;
         backendActive = s.active;
         sandbox = s.sandbox;
+        if (s.error) toast.error(s.error);
       } catch {
         // 查不到就按未启用处理：这条只影响「要不要显示恢复条」，不该弹错提示
         if (sessionId === id) {
@@ -127,7 +150,10 @@
 
   async function pick(paths: string[]) {
     pickerOpen = false;
-    if (paths.length === 0) return;
+    if (paths.length === 0) {
+      await cancel();
+      return;
+    }
     try {
       await invoke("zmodem_send", { sessionId, localPaths: paths });
     } catch (e) {
@@ -141,16 +167,24 @@
     onConflict: "overwrite" | "keep-both" | "skip",
     remember: "fixed" | "ask" | null,
   ) {
+    const d = view.decision;
+    const id = sessionId;
+    if (!d || !d.decisionId || d.sessionId !== id) return false;
+    const current = () => sessionId === id && (!view.decision || view.decision.decisionId === d.decisionId);
     try {
-      await invoke("zmodem_finalize", {
-        sessionId,
+      const applied = await invoke<boolean>("zmodem_finalize", {
+        sessionId: id,
+        expectedDecisionId: d.decisionId,
         dir,
         onConflict,
         remember: remember === null ? null : remember === "fixed",
       });
+      if (!applied || !current()) return false;
       if (onConflict === "skip") toast.info("已跳过该文件");
+      return true;
     } catch (e) {
-      toast.error(`保存失败：${e}`);
+      if (current()) toast.error(`保存失败：${e}`);
+      return false;
     }
   }
 
@@ -166,8 +200,8 @@
   async function dismissDecision() {
     const d = view.decision;
     if (!d) return;
-    await finalize(effDir(), "keep-both", null);
-    toast.info(`已保存到 ${dirLabel()}`);
+    const label = dirLabel();
+    if (await finalize(effDir(), "keep-both", null)) toast.info(`已保存到 ${label}`);
   }
 
   async function cancel() {
@@ -240,7 +274,7 @@
     multi={true}
     note={sandbox ? `收到的文件保存到：${sandbox}` : ""}
     onConfirm={(paths) => void pick(paths)}
-    onCancel={() => (pickerOpen = false)}
+    onCancel={() => { pickerOpen = false; void cancel(); }}
   />
 {/if}
 
@@ -250,10 +284,7 @@
     title="选择保存位置"
     mode="directory"
     confirmLabel="用这个目录"
-    onConfirm={(paths) => {
-      dirPickerOpen = false;
-      if (paths[0] !== undefined) decisionDir = paths[0];
-    }}
+    onConfirm={confirmDirectory}
     onCancel={() => (dirPickerOpen = false)}
   />
 {/if}
@@ -299,7 +330,7 @@
         </p>
         <p class="dirline">
           <code data-testid="zm-dec-dir">{dirLabel()}</code>
-          <button data-testid="zm-dec-change" onclick={() => (dirPickerOpen = true)}>更改…</button>
+          <button data-testid="zm-dec-change" onclick={openDirectoryPicker}>更改…</button>
         </p>
         {#if view.decision.reason === "first-run"}
           <fieldset class="remember">

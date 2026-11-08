@@ -35,6 +35,7 @@ pub enum McpTool {
         session_id: String,
         source: ReadSource,
         max_lines: Option<usize>,
+        wait_ms: u64,
     },
     /// ⚠ 向终端发送 payload。分类目标 = **完整 payload 字符串**，基线至少 `Write`；
     /// 含控制/不可打印字符或超阈值 → `Dangerous`（§4.5，实现见 `gate.rs`）。
@@ -104,6 +105,18 @@ pub struct ManifestEntry {
 /// 对外 MCP 的完整工具清单。`tools/list` 从这里**过滤**生成（过滤器 = 授权层，
 /// 见 [`crate::authz::Authorization::enumerable`]），而不是另写一份。
 pub const MCP_MANIFEST: &[ManifestEntry] = &[
+    ManifestEntry {
+        name: "terminal.upload",
+        description: "通过当前交互终端的 ZMODEM 上传单个文件到 remote_dir 目录。先 terminal.read 核对目标与干净的 sh/bash/zsh 交互提示符；目标须有 /bin/sh 和 rz，上传通过固定 /bin/sh 子进程切换目录后执行 rz，无需手工切换 shell；不要猜主机、安装软件或用 SFTP/Base64 回退。相对本地源须在授权上传根内。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"local_path":{"type":"string","description":"授权上传根内的相对文件路径"},"remote_dir":{"type":"string","description":"远端目标目录"}},"required":["session_id","local_path","remote_dir"],"additionalProperties":false}"#,
+        gated: true, vault_class: false,
+    },
+    ManifestEntry {
+        name: "terminal.download",
+        description: "通过当前交互终端的 ZMODEM 下载 remote_path 单个文件到固定下载沙箱。先 terminal.read 核对目标与干净的 sh/bash/zsh 交互提示符，目标须已安装 sz；不要猜主机、安装软件或用 SFTP/Base64 回退。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"remote_path":{"type":"string","description":"远端单个源文件路径"}},"required":["session_id","remote_path"],"additionalProperties":false}"#,
+        gated: true, vault_class: false,
+    },
     ManifestEntry {
         name: "sftp.upload",
         description: "上传已授权本地目录中的普通文件到 SSH 原始连接端点，支持二进制，拒绝覆盖。PTY 菜单切换主机不会改变 SFTP 目标。返回任务 ID 后用 transfer.status 查询结果。",
@@ -234,8 +247,8 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "terminal.read",
-        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines。查看提示符或回显后再决定输入。",
-        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer"}},"required":["session_id","source"],"additionalProperties":false}"#,
+        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines（正数）；空屏可设置 wait_ms（0-10000，推荐 1000），仅在当前快照文本为空时等待输出，计时不包含授权、门锁和审计耗时；非空文本（包括空格和换行）无需等待。查看提示符或回显后再决定输入。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer","minimum":1},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0}},"required":["session_id","source"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
     },
@@ -375,6 +388,8 @@ struct ReadArgs {
     source: ReadSource,
     #[serde(default)]
     max_lines: Option<usize>,
+    #[serde(default)]
+    wait_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -445,7 +460,9 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
     };
     if matches!(
         name,
-        "sftp.upload"
+        "terminal.upload"
+            | "terminal.download"
+            | "sftp.upload"
             | "sftp.download"
             | "transfer.list"
             | "transfer.status"
@@ -494,7 +511,14 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
         }
         "terminal.read" => {
             let a: ReadArgs = serde_json::from_str(args_json).map_err(bad)?;
+            if a.max_lines == Some(0) || a.wait_ms > 10_000 {
+                return Err(ParseError::BadArgs {
+                    tool: name.to_string(),
+                    detail: "max_lines 必须大于 0，wait_ms 必须在 0..=10000".into(),
+                });
+            }
             McpTool::TerminalRead {
+                wait_ms: a.wait_ms,
                 session_id: a.session_id,
                 source: a.source,
                 max_lines: a.max_lines,
@@ -573,6 +597,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "terminal.upload",
+                "terminal.download",
                 "sftp.upload",
                 "sftp.download",
                 "transfer.list",
@@ -614,6 +640,8 @@ mod tests {
         assert_eq!(
             gated,
             vec![
+                "terminal.upload",
+                "terminal.download",
                 "sftp.upload",
                 "sftp.download",
                 "transfer.cancel",
@@ -709,6 +737,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::Screen,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::TerminalSend {
                 session_id: "s".into(),
@@ -826,6 +855,25 @@ mod tests {
     }
 
     #[test]
+    fn read_wait_and_line_bounds_are_validated() {
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","wait_ms":10000,"max_lines":1}"#
+        )
+        .is_ok());
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","wait_ms":10001}"#
+        )
+        .is_err());
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","max_lines":0}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn read_source_is_a_closed_set() {
         assert!(parse_tool("terminal.read", r#"{"session_id":"s","source":"screen"}"#).is_ok());
         assert!(parse_tool(
@@ -842,6 +890,7 @@ mod tests {
                 session_id: "s1".into(),
                 source: ReadSource::All,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::CommandRun {
                 session_id: "s2".into(),

@@ -28,10 +28,28 @@ pub async fn settings_set(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     validate_setting(&key, &value)?;
+    let value = normalize_download_setting(&key, value)?;
     fs_connmgr::SettingsRepo::new(state.db.pool())
         .set(&key, &value)
         .await
         .map_err(|e| e.to_string())
+}
+
+fn normalize_download_setting(key: &str, value: String) -> Result<String, String> {
+    if key != "term.zmodem" {
+        return Ok(value);
+    }
+    let mut cfg: serde_json::Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
+    if cfg["download"]["mode"] == "fixed" {
+        let raw = cfg["download"]["dir"]
+            .as_str()
+            .ok_or("固定下载目录必须是字符串")?;
+        cfg["download"]["dir"] = crate::commands::sftp_cmd::resolve_download_dir(raw)?
+            .to_string_lossy()
+            .into_owned()
+            .into();
+    }
+    serde_json::to_string(&cfg).map_err(|e| e.to_string())
 }
 
 // ───────────── 审计2 #40：设置键白名单与运行期 schema ─────────────
@@ -753,6 +771,27 @@ pub(crate) fn validate_setting(key: &str, value_json: &str) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_download_setting_normalizes_picker_directory_without_creating_it() {
+        for raw in ["", "new/空 格/~"] {
+            let value = serde_json::json!({"enabled":true,"autoReceive":true,"download":{"mode":"fixed","dir":raw}}).to_string();
+            let normalized = super::normalize_download_setting("term.zmodem", value).unwrap();
+            let preserved: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+            assert_eq!(preserved["autoReceive"], true);
+            let cfg: crate::state::ZmodemConfig = serde_json::from_str(&normalized).unwrap();
+            let expected = crate::commands::sftp_cmd::resolve_download_dir(raw).unwrap();
+            assert_eq!(
+                std::path::PathBuf::from(cfg.download.unwrap().dir),
+                expected
+            );
+            let again =
+                super::normalize_download_setting("term.zmodem", normalized.clone()).unwrap();
+            assert_eq!(again, normalized);
+        }
+        let bad = serde_json::json!({"enabled":true,"autoReceive":true,"download":{"mode":"fixed","dir":"../escape"}}).to_string();
+        assert!(super::normalize_download_setting("term.zmodem", bad).is_err());
+    }
 
     /// 白名单上每一个键的最常见合法值：逐键过一遍，防 match 分支写坏。
     #[test]

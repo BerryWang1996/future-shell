@@ -126,7 +126,7 @@ describe("SettingsDialog MCP 免逐次确认", () => {
     store.clear();
     await openAt("AI");
     await flush();
-    for (const name of ["sftp.upload", "sftp.download", "transfer.list", "transfer.status", "transfer.cancel",
+    for (const name of ["terminal.upload", "terminal.download", "sftp.upload", "sftp.download", "transfer.list", "transfer.status", "transfer.cancel",
       "sftp.stat", "sftp.walk", "sftp.mkdir", "sftp.rename", "sftp.copy", "sftp.delete", "sftp.symlink",
       "sessions.details", "sessions.close", "sessions.reconnect"]) {
       expect(screen.getByRole("checkbox", { name: new RegExp(name.replaceAll(".", "\\.")) })).toHaveProperty("checked", false);
@@ -162,12 +162,12 @@ describe("SettingsDialog MCP 工具批量选择", () => {
 
   it("空名单全选一次，重新打开后反选清空", async () => {
     await openAt("AI"); await flush();
-    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 25");
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 27");
     await fireEvent.click(screen.getByRole("button", { name: "全选" }));
-    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(25));
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(27));
     expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(1);
     cleanup(); await openAt("AI"); await flush();
-    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25");
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("27 / 27");
     await fireEvent.click(screen.getByRole("button", { name: "反选" }));
     await waitFor(() => expect(store.get("mcp.tools")).toEqual([]));
   });
@@ -175,16 +175,16 @@ describe("SettingsDialog MCP 工具批量选择", () => {
   it("部分选择反选可见工具，保留未知项；全选不重复添加", async () => {
     store.set("mcp.tools", ["future.tool", "terminal.read", "sftp.delete"]);
     await openAt("AI"); await flush();
-    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("2 / 25");
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("2 / 27");
     await fireEvent.click(screen.getByRole("button", { name: "反选" }));
-    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(24));
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(26));
     const inverted = store.get("mcp.tools") as string[];
     expect(inverted).toContain("future.tool");
     expect(inverted).not.toContain("terminal.read");
     expect(inverted).not.toContain("sftp.delete");
     await fireEvent.click(screen.getByRole("button", { name: "全选" }));
-    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(26));
-    expect(new Set(store.get("mcp.tools") as string[]).size).toBe(26);
+    await waitFor(() => expect((store.get("mcp.tools") as string[]).length).toBe(28));
+    expect(new Set(store.get("mcp.tools") as string[]).size).toBe(28);
   });
 
   it("保存失败保持旧值，重试成功才同步选择", async () => {
@@ -194,11 +194,11 @@ describe("SettingsDialog MCP 工具批量选择", () => {
     await fireEvent.click(screen.getByRole("button", { name: "全选" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "重试保存" })).toBeTruthy());
     expect(store.get("mcp.tools")).toEqual(["terminal.read"]);
-    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("1 / 25");
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("1 / 27");
     failSettingWrites = false;
     await fireEvent.click(screen.getByRole("button", { name: "重试保存" }));
-    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25"));
-    expect((store.get("mcp.tools") as string[]).length).toBe(25);
+    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("27 / 27"));
+    expect((store.get("mcp.tools") as string[]).length).toBe(27);
   });
 
   it("慢保存期间禁用单项及批量按钮，阻止乱序写入", async () => {
@@ -210,7 +210,7 @@ describe("SettingsDialog MCP 工具批量选择", () => {
     expect(screen.getByRole("checkbox", { name: /terminal\.read/ })).toHaveProperty("disabled", true);
     await fireEvent.click(screen.getByRole("button", { name: "反选" }));
     release();
-    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("25 / 25"));
+    await waitFor(() => expect(screen.getByTestId("mcp-tools-count").textContent).toContain("27 / 27"));
     expect(writes.filter((w) => w.key === "mcp.tools")).toHaveLength(1);
   });
 
@@ -261,7 +261,7 @@ describe("SettingsDialog MCP 工具批量选择", () => {
     await fireEvent.click(screen.getByRole("button", { name: "全选" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "重试保存" })).toBeTruthy());
     expect(store.get("mcp.tools")).toEqual(unknown);
-    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 25");
+    expect(screen.getByTestId("mcp-tools-count").textContent).toContain("0 / 27");
   });
 });
 

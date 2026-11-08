@@ -20,6 +20,14 @@ fn failed(error: impl std::fmt::Display) -> ManagementError {
     ManagementError::new("FS_MCP_OPERATION_FAILED", error.to_string())
 }
 
+fn operation_failed(error: String) -> ManagementError {
+    if error == fs_mcpbridge::ports::SESSION_BUSY {
+        ManagementError::new("FS_MCP_CONFLICT", error)
+    } else {
+        failed(error)
+    }
+}
+
 fn session_failed(error: crate::commands::session_cmd::SessionControlError) -> ManagementError {
     use crate::commands::session_cmd::SessionControlError;
     let code = match &error {
@@ -139,6 +147,49 @@ fn open_upload(root: &str, raw: &str) -> Result<(PathBuf, std::fs::File), String
     Ok((canonical, source))
 }
 
+fn check_upload_root(expected: &str, current: Option<&str>) -> Result<(), ManagementError> {
+    if current == Some(expected) {
+        Ok(())
+    } else {
+        Err(ManagementError::new(
+            "FS_MCP_PATH_DENIED",
+            "上传目录授权已变化",
+        ))
+    }
+}
+
+fn terminal_reservation_error(message: String, partial: Option<PathBuf>) -> ManagementError {
+    let mut details = json!({"accepted":false,"command_attempted":false});
+    if let Some(name) = partial.as_ref().and_then(|path| path.file_name()) {
+        // DownloadSink creates this exact name under the fixed sandbox's .incoming.
+        details["partial_relative_path"] =
+            json!(Path::new(".incoming").join(name).to_string_lossy());
+    }
+    ManagementError {
+        code: "FS_MCP_CONFLICT",
+        message,
+        partial: Some(details),
+    }
+}
+
+async fn terminal_submit_budget(
+    handle: &str,
+    write: impl std::future::Future<Output = Result<(), ManagementError>>,
+) -> Result<(), ManagementError> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ManagementError::new(
+                "FS_MCP_TIMEOUT",
+                "终端命令提交超时，结果未知；先查询 transfer.status，禁止重放",
+            ))
+        });
+    result.map_err(|mut error| {
+        error.partial = Some(json!({"transfer_id":handle,"observe_with":"transfer.status"}));
+        error
+    })
+}
+
 impl McpManagement {
     async fn submit(&self, tool: &ManagedTool, generation: u64) -> Result<Value, ManagementError> {
         use crate::commands::sftp_cmd::{submit_core, McpSubmission, TransferSpec};
@@ -204,7 +255,164 @@ impl McpManagement {
             &self.state,
         )
         .await
-        .map_err(failed)?;
+        .map_err(operation_failed)?;
+        Ok(json!({"transfer_id":handle,"accepted":true,"observe_with":"transfer.status"}))
+    }
+
+    async fn submit_terminal(
+        &self,
+        tool: &ManagedTool,
+        generation: u64,
+    ) -> Result<Value, ManagementError> {
+        use super::terminal_command::{download_command, upload_basename, upload_command};
+        use crate::zmodem_bridge::{McpReservation, McpTransferIo};
+        use crate::zmodem_mcp_io::{DownloadSink, UploadSource};
+        let sid = tool.session_id().ok_or_else(unavailable)?;
+        let live = self.state.registry.get(sid).ok_or_else(unavailable)?;
+        if !self.state.zmodem_config().await.enabled {
+            return Err(ManagementError::new(
+                "FS_MCP_UNSUPPORTED",
+                "请在设置中启用终端内文件传输",
+            ));
+        }
+        let tap = self
+            .state
+            .zmodem
+            .lock()
+            .unwrap()
+            .get(sid)
+            .cloned()
+            .ok_or_else(|| {
+                ManagementError::new(
+                    "FS_MCP_UNSUPPORTED",
+                    "该会话未装配终端传输入口，请启用终端内文件传输后重连",
+                )
+            })?;
+        let mut upload_root = None;
+        let (command, remote_path, local_relative_path, io) = match tool {
+            ManagedTool::TerminalUpload {
+                local_path,
+                remote_dir,
+                ..
+            } => {
+                let basename = upload_basename(Path::new(local_path))
+                    .map_err(|e| ManagementError::new("FS_MCP_PATH_DENIED", e))?
+                    .to_owned();
+                let command = upload_command(remote_dir)
+                    .map_err(|e| ManagementError::new("FS_MCP_PATH_DENIED", e))?;
+                let value = SettingsRepo::new(self.state.db.pool())
+                    .get(&upload_root_key(&live.profile_id))
+                    .await
+                    .map_err(failed)?
+                    .ok_or_else(|| {
+                        ManagementError::new("FS_MCP_PATH_DENIED", "请先授权本地上传目录")
+                    })?;
+                let root: String = serde_json::from_str(&value).map_err(failed)?;
+                upload_root = Some(value);
+                let raw = local_path.clone();
+                let (_, file) = tokio::task::spawn_blocking(move || open_upload(&root, &raw))
+                    .await
+                    .map_err(failed)?
+                    .map_err(|e| ManagementError::new("FS_MCP_PATH_DENIED", e))?;
+                let size = file.metadata().map_err(failed)?.len();
+                let source = UploadSource::new(file, basename, size).map_err(failed)?;
+                (
+                    command,
+                    remote_dir.clone(),
+                    Some(local_path.clone()),
+                    McpTransferIo::Upload(source),
+                )
+            }
+            ManagedTool::TerminalDownload { remote_path, .. } => {
+                let plan = download_command(remote_path)
+                    .map_err(|e| ManagementError::new("FS_MCP_PATH_DENIED", e))?;
+                let root = self.state.download_sandbox_for(sid).await.map_err(failed)?;
+                let sink = DownloadSink::new(&root, &plan.basename, &plan.local_basename)
+                    .map_err(failed)?;
+                (
+                    plan.command,
+                    remote_path.clone(),
+                    Some(plan.local_basename),
+                    McpTransferIo::Download {
+                        basename: plan.basename,
+                        sink,
+                        expected: None,
+                    },
+                )
+            }
+            _ => unreachable!(),
+        };
+        let handle = uuid::Uuid::new_v4().to_string();
+        let partial = match &io {
+            McpTransferIo::Download { sink, .. } => Some(sink.partial_path().to_path_buf()),
+            _ => None,
+        };
+        let _gate = tap
+            .reserve_mcp(
+                &self.state,
+                McpReservation {
+                    handle: handle.clone(),
+                    generation,
+                    remote_path,
+                    local_relative_path,
+                    io,
+                },
+            )
+            .await
+            .map_err(|e| terminal_reservation_error(e, partial))?;
+        // Accepted reservations survive caller cancellation. Every failure preserves its handle.
+        let result = async {
+            if self.state.registry.generation_of(sid) != Some(generation)
+                || !self
+                    .state
+                    .zmodem
+                    .lock()
+                    .unwrap()
+                    .get(sid)
+                    .is_some_and(|t| Arc::ptr_eq(t, &tap))
+            {
+                return Err(unavailable());
+            }
+            if !allowed(&self.state, &live.profile_id).await {
+                return Err(ManagementError::new(
+                    "FS_POLICY_FORBIDDEN",
+                    "该连接已撤销 MCP 授权",
+                ));
+            }
+            if let Some(expected_root) = upload_root {
+                let current = SettingsRepo::new(self.state.db.pool())
+                    .get(&upload_root_key(&live.profile_id))
+                    .await
+                    .map_err(failed)?;
+                check_upload_root(&expected_root, current.as_deref())?;
+            }
+            let mut bytes = command.into_bytes();
+            bytes.push(b'\r');
+            terminal_submit_budget(&handle, async {
+                let writer = live.write.lock().await;
+                if self.state.registry.generation_of(sid) != Some(generation)
+                    || !self
+                        .state
+                        .zmodem
+                        .lock()
+                        .unwrap()
+                        .get(sid)
+                        .is_some_and(|t| Arc::ptr_eq(t, &tap))
+                {
+                    return Err(unavailable());
+                }
+                tap.mark_mcp_command_attempted(&handle, generation)
+                    .map_err(failed)?;
+                writer.data_bytes(bytes).await.map_err(failed)
+            })
+            .await
+        }
+        .await;
+        if let Err(mut error) = result {
+            tap.fail_mcp_submission(&handle, generation, &error.message);
+            error.partial = Some(json!({"transfer_id":handle,"observe_with":"transfer.status"}));
+            return Err(error);
+        }
         Ok(json!({"transfer_id":handle,"accepted":true,"observe_with":"transfer.status"}))
     }
 
@@ -232,21 +440,31 @@ impl McpManagement {
                     })
                     .ok_or_else(unavailable)?;
                 if !allowed(&self.state, &profile).await {
-                    snapshot.local_relative_path = None;
-                    snapshot.remote_path = None;
-                    snapshot.error = None;
+                    snapshot.hide_paths();
                 }
                 serde_json::to_value(snapshot).map_err(failed)
             }
             ManagedTool::Cancel { transfer_id } => {
-                let (terminal, id, manager, _) = self
+                let (terminal, backend, generation) = self
                     .state
                     .mcp_tasks
                     .request_cancel(transfer_id)
                     .ok_or_else(unavailable)?;
                 if !terminal {
-                    let manager = manager.upgrade().ok_or_else(unavailable)?;
-                    manager.cancel(id).await;
+                    match backend {
+                        super::tasks::TaskBackend::Sftp { engine_id, manager } => {
+                            let manager = manager.upgrade().ok_or_else(unavailable)?;
+                            manager.cancel(engine_id).await;
+                        }
+                        super::tasks::TaskBackend::Zmodem { cancel } => {
+                            self.state
+                                .mcp_tasks
+                                .cancel_zmodem(transfer_id, generation, &cancel)
+                                .map_err(|error| {
+                                    ManagementError::new("FS_MCP_TARGET_UNAVAILABLE", error)
+                                })?;
+                        }
+                    }
                 }
                 Ok(
                     json!({"transfer_id":transfer_id,"cancel_requested":!terminal,"already_terminal":terminal}),
@@ -280,7 +498,15 @@ impl McpManagement {
                 "该 SSH 连接未允许 MCP 操作，请在连接编辑器核对授权",
             ));
         }
+        if !matches!(tool, ManagedTool::Details { .. })
+            && crate::zmodem_bridge::mcp_terminal_busy(&self.state, sid)
+        {
+            return Err(operation_failed(fs_mcpbridge::ports::SESSION_BUSY.into()));
+        }
         match tool {
+            ManagedTool::TerminalUpload { .. } | ManagedTool::TerminalDownload { .. } => {
+                return self.submit_terminal(tool, generation).await
+            }
             ManagedTool::Upload { .. } | ManagedTool::Download { .. } => {
                 return self.submit(tool, generation).await
             }
@@ -305,7 +531,15 @@ impl McpManagement {
             }
             _ => {}
         }
-        let _guard = live.operation_gate.lock().await;
+        let _guard = if matches!(tool, ManagedTool::Details { .. }) {
+            live.operation_gate.clone().lock_owned().await
+        } else {
+            crate::zmodem_bridge::idle_operation_gate(live.operation_gate.clone(), || {
+                crate::zmodem_bridge::mcp_terminal_busy(&self.state, sid)
+            })
+            .await
+            .map_err(operation_failed)?
+        };
         if self.state.registry.generation_of(sid) != Some(generation) {
             return Err(unavailable());
         }
@@ -414,6 +648,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_terminal_reservation_discloses_real_retained_download_partial_without_task() {
+        use crate::zmodem_mcp_io::DownloadSink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sink = DownloadSink::new(&root, "file", "file").unwrap();
+        let partial = sink.partial_path().to_path_buf();
+        assert!(partial.is_file());
+        drop(sink); // reserve_mcp rejects and drops its request before returning Err.
+        let error =
+            terminal_reservation_error("终端已有传输或待保存文件".into(), Some(partial.clone()));
+        assert_eq!(error.code, "FS_MCP_CONFLICT");
+        let details = error
+            .partial
+            .expect("rejected download must disclose its retained partial");
+        assert_eq!(details["accepted"], false);
+        assert_eq!(details["command_attempted"], false);
+        assert!(details.get("transfer_id").is_none());
+        assert!(details.get("observe_with").is_none());
+        let relative = Path::new(details["partial_relative_path"].as_str().unwrap());
+        assert!(!relative.is_absolute());
+        assert_eq!(root.join(relative), partial);
+        assert_eq!(std::fs::metadata(root.join(relative)).unwrap().len(), 0);
+        let upload = terminal_reservation_error("busy".into(), None);
+        assert!(upload
+            .partial
+            .unwrap()
+            .get("partial_relative_path")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_submission_failure_keeps_written_download_partial_and_handle() {
+        use crate::zmodem_mcp_io::DownloadSink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut sink = DownloadSink::new(&root, "file", "file").unwrap();
+        sink.write_chunk(b"retained data").unwrap();
+        let partial = sink.partial_path().to_path_buf();
+        let error =
+            terminal_submit_budget("registered-handle", async { Err(failed("channel closed")) })
+                .await
+                .unwrap_err();
+        drop(sink);
+        assert_eq!(std::fs::read(partial).unwrap(), b"retained data");
+        let details = error.partial.unwrap();
+        assert_eq!(details["transfer_id"], "registered-handle");
+        assert_eq!(details["observe_with"], "transfer.status");
+        assert!(details.get("accepted").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_submission_budget_preserves_original_handle_and_never_replays() {
+        let gate = tokio::sync::Mutex::new(());
+        let held = gate.lock().await;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let error = terminal_submit_budget("original-handle", async {
+            let _write = gate.lock().await;
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert_eq!(error.code, "FS_MCP_TIMEOUT");
+        assert_eq!(error.partial.unwrap()["transfer_id"], "original-handle");
+        drop(held);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let error = terminal_submit_budget("write-error", async { Err(failed("channel closed")) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.partial.unwrap()["transfer_id"], "write-error");
+    }
+
+    #[test]
+    fn upload_root_recheck_rejects_revocation_or_changed_json_before_command() {
+        let captured = serde_json::to_string("/authorized").unwrap();
+        assert!(check_upload_root(&captured, Some(&captured)).is_ok());
+        for current in [None, Some("null"), Some("\"/another\""), Some("\"\"")] {
+            assert_eq!(
+                check_upload_root(&captured, current).unwrap_err().code,
+                "FS_MCP_PATH_DENIED"
+            );
+        }
+    }
+
+    #[test]
     fn remote_errors_identify_file_scope_and_preserve_partial_results() {
         for (status, code, text) in [
             (2, "FS_MCP_TARGET_UNAVAILABLE", "远端路径不存在"),
@@ -491,5 +812,20 @@ mod tests {
             fs_sshengine::sandbox::prepare_destination(root.path(), Path::new("a/b/file")).unwrap();
         assert!(good.parent().unwrap().is_dir());
         assert!(good.starts_with(root.path().canonicalize().unwrap()));
+    }
+    #[test]
+    fn occupied_terminal_is_conflict_not_unavailable_or_forbidden() {
+        assert_eq!(
+            operation_failed(fs_mcpbridge::ports::SESSION_BUSY.into()).code,
+            "FS_MCP_CONFLICT"
+        );
+        assert_eq!(
+            session_failed(crate::commands::session_cmd::SessionControlError::Busy).code,
+            "FS_MCP_CONFLICT"
+        );
+        assert_eq!(
+            operation_failed("unrelated IO failure".into()).code,
+            "FS_MCP_OPERATION_FAILED"
+        );
     }
 }

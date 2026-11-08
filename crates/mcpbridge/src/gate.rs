@@ -225,9 +225,10 @@ pub(crate) fn classify_managed(tool: &crate::managed::ManagedTool) -> Verdict {
         | M::Stat { .. }
         | M::Walk { .. }
         | M::Details { .. } => return read_only(),
-        M::Delete { .. } | M::Symlink { .. } => {
-            return one("mcp_managed_dangerous", Tier::Dangerous, tool.name())
-        }
+        M::TerminalUpload { .. }
+        | M::TerminalDownload { .. }
+        | M::Delete { .. }
+        | M::Symlink { .. } => return one("mcp_managed_dangerous", Tier::Dangerous, tool.name()),
         M::Upload { remote_path, .. } => classify_transfer_path(remote_path),
         M::Mkdir { path, .. } => classify_transfer_path(path),
         M::Rename { from, to, .. } | M::Copy { from, to, .. } => {
@@ -412,6 +413,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::All,
                 max_lines: None,
+                wait_ms: 0,
             },
         ] {
             let g = classify_for_mcp(&t, "test");
@@ -507,6 +509,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::Screen,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::TerminalSend {
                 session_id: "s".into(),
@@ -573,6 +576,7 @@ mod tests {
                         session_id: "s".into(),
                         source,
                         max_lines: Some(999_999),
+                        wait_ms: 0,
                     })
                     .collect(),
             ),
@@ -671,7 +675,7 @@ mod tests {
             }
         }
         assert_eq!(free.len(), 10);
-        assert_eq!(gated.len(), 15);
+        assert_eq!(gated.len(), 17);
         let covered: std::collections::BTreeSet<&str> = free
             .iter()
             .map(|(n, _)| *n)

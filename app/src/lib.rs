@@ -16,6 +16,7 @@ mod state;
 mod update_check;
 mod window_layout;
 mod zmodem_bridge;
+mod zmodem_mcp_io;
 
 use state::AppState;
 use std::sync::Arc;

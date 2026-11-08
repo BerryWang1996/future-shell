@@ -138,13 +138,20 @@ impl TerminalPort for Term {
         _session_id: &str,
         _source: ReadSource,
         _max_lines: Option<usize>,
+        _wait_ms: u64,
         _generation: Option<u64>,
-    ) -> Fut<'_, PortResult<String>> {
+    ) -> Fut<'_, PortResult<fs_mcpbridge::ports::TerminalSnapshot>> {
         // 故意回吐一个已知机密：脱敏必须发生在字节**离开本进程之前**。
         // 端口自己不脱敏（ports.rs 明写脱敏统一在 server.rs 做，
         // 那样只有一个脱敏点可以被守卫钉住）——所以这里裸着回，
         // 由协议对面收到的东西来判断那个唯一的脱敏点在不在。
-        Box::pin(async { Ok("$ echo hunter2\nhunter2\n".to_string()) })
+        Box::pin(async {
+            Ok(fs_mcpbridge::ports::TerminalSnapshot {
+                text: "$ echo hunter2\nhunter2\n".to_string(),
+                timed_out: false,
+                connection_state: "connected".into(),
+            })
+        })
     }
     fn send(
         &self,
@@ -454,10 +461,15 @@ async fn known_secrets_are_redacted_before_the_bytes_leave_the_process() {
     )
     .await;
     assert!(!is_err, "terminal.read 是只读，不该被拒：{text}");
-    let all = format!(
-        "{text}{}",
-        structured.map(|v| v.to_string()).unwrap_or_default()
-    );
+    let structured = structured.expect("terminal.read supplies structured status");
+    assert_eq!(structured["session_id"], "s-1");
+    assert_eq!(structured["source"], "screen");
+    assert_eq!(structured["empty"], false);
+    assert_eq!(structured["timed_out"], false);
+    assert_eq!(structured["connection_state"], "connected");
+    assert_eq!(structured["text"], text);
+    assert!(text.starts_with("$ echo "));
+    let all = format!("{text}{structured}");
     assert!(!all.contains("hunter2"), "已知机密经协议流出了：{all}");
     // 反向对照：不是整段被吞掉了——非机密部分要照常到达。
     assert!(all.contains("echo"), "脱敏把正文也吃掉了：{all}");
@@ -547,7 +559,11 @@ async fn an_approved_dangerous_call_executes_and_returns_over_the_wire() {
 
 #[tokio::test]
 async fn the_handshake_advertises_tools_and_the_server_identity() {
-    let peer = paired(&["sessions.list"], Some(true)).await;
+    let peer = paired(
+        &["sessions.list", "terminal.upload", "terminal.download"],
+        Some(true),
+    )
+    .await;
     let info = peer.peer_info().expect("握手后该有对端信息");
     assert!(
         info.capabilities.tools.is_some(),
@@ -566,8 +582,43 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
         "sessions.details",
         "all/scrollback",
         "不要自动重复执行",
+        "sh/bash/zsh 交互提示符",
+        "目标已有 /bin/sh 和 rz",
+        "固定 /bin/sh 子进程",
+        "无需手工切换 shell",
+        "下载需要目标已有 sz",
     ] {
         assert!(instructions.contains(expected), "缺少协议说明: {expected}");
+    }
+    let listed = peer
+        .list_all_tools()
+        .await
+        .expect("tools/list 应带当前 shell 前置");
+    for (name, required) in [
+        (
+            "terminal.upload",
+            vec![
+                "sh/bash/zsh 交互提示符",
+                "/bin/sh 和 rz",
+                "固定 /bin/sh 子进程",
+                "无需手工切换 shell",
+            ],
+        ),
+        (
+            "terminal.download",
+            vec!["sh/bash/zsh 交互提示符", "已安装 sz"],
+        ),
+    ] {
+        let tool = listed.iter().find(|tool| tool.name == name).unwrap();
+        let description = tool.description.as_deref().unwrap();
+        for expected in required {
+            assert!(description.contains(expected), "{name} 缺少 {expected}");
+        }
+        assert!(!description.contains("POSIX shell"));
+        assert_eq!(
+            tool.annotations.as_ref().unwrap().read_only_hint,
+            Some(false)
+        );
     }
 }
 

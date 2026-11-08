@@ -4,6 +4,17 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum ManagedTool {
+    #[serde(rename = "terminal.upload")]
+    TerminalUpload {
+        session_id: String,
+        local_path: String,
+        remote_dir: String,
+    },
+    #[serde(rename = "terminal.download")]
+    TerminalDownload {
+        session_id: String,
+        remote_path: String,
+    },
     #[serde(rename = "sftp.upload")]
     Upload {
         session_id: String,
@@ -67,6 +78,8 @@ pub enum ManagedTool {
 impl ManagedTool {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::TerminalUpload { .. } => "terminal.upload",
+            Self::TerminalDownload { .. } => "terminal.download",
             Self::Upload { .. } => "sftp.upload",
             Self::Download { .. } => "sftp.download",
             Self::Transfers { .. } => "transfer.list",
@@ -88,7 +101,9 @@ impl ManagedTool {
     pub fn session_id(&self) -> Option<&str> {
         match self {
             Self::Transfers { .. } | Self::Status { .. } | Self::Cancel { .. } => None,
-            Self::Upload { session_id, .. }
+            Self::TerminalUpload { session_id, .. }
+            | Self::TerminalDownload { session_id, .. }
+            | Self::Upload { session_id, .. }
             | Self::Download { session_id, .. }
             | Self::Stat { session_id, .. }
             | Self::Walk { session_id, .. }
@@ -145,6 +160,14 @@ impl ManagementError {
 pub(crate) fn examples() -> Vec<(&'static str, serde_json::Value)> {
     use serde_json::json;
     vec![
+        (
+            "terminal.upload",
+            json!({"session_id":"s1","local_path":"sample.bin","remote_dir":"/tmp"}),
+        ),
+        (
+            "terminal.download",
+            json!({"session_id":"s1","remote_path":"/tmp/sample.bin"}),
+        ),
         (
             "sftp.upload",
             json!({"session_id":"s1","local_path":"sample.bin","remote_path":"/tmp/sample.bin"}),

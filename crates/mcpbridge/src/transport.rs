@@ -103,7 +103,7 @@ impl ServerHandler for McpServer {
                 "FutureShell",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions("sessions.list 为空不代表没有可连接配置；调用 profiles.list 查找已允许的 SSH 配置，再用 sessions.open 的 profile_id 创建会话，无需预先手动打开服务器。同一配置每次成功打开都会产生独立 session_id，后续操作使用各自返回的 ID；结果不明时先查 sessions.list，不盲目重发。SSH exec 和 SFTP 使用原始连接端点；交互终端中经堡垒机或嵌套 SSH 进入的主机不会改变该端点。command.run 及旧 sftp.list/read 使用独立无 PTY exec 通道。需要操作交互目标时，先用 terminal.read 查看，再用 terminal.send 的 press_enter 提交；source=screen 是可见屏，all/scrollback 可读取最新尾部。单项操作失败时先用 sessions.details 核对连接状态和端点；结果不明时先检查状态，不要自动重复执行。工具授权与远端文件系统权限分别检查。")
+            .with_instructions("sessions.list 为空不代表没有可连接配置；调用 profiles.list 查找已允许的 SSH 配置，再用 sessions.open 的 profile_id 创建会话，无需预先手动打开服务器。同一配置每次成功打开都会产生独立 session_id，后续操作使用各自返回的 ID；结果不明时先查 sessions.list，不盲目重发。SSH exec 和 SFTP 使用原始连接端点；交互终端中经堡垒机或嵌套 SSH 进入的主机不会改变该端点。command.run 及旧 sftp.list/read 使用独立无 PTY exec 通道。需要操作交互目标时，先用 terminal.read 查看，再用 terminal.send 的 press_enter 提交；source=screen 是可见屏，all/scrollback 可读取最新尾部。单项操作失败时先用 sessions.details 核对连接状态和端点；结果不明时先检查状态，不要自动重复执行。工具授权与远端文件系统权限分别检查。terminal.upload/download 前先 terminal.read 核对当前交互目标与干净的 sh/bash/zsh 交互提示符。上传需要目标已有 /bin/sh 和 rz，通过固定 /bin/sh 子进程切换目录并执行 rz，无需手工切换 shell；下载需要目标已有 sz。不要猜主机、安装软件或用 SFTP/Base64 回退。")
     }
 
     /// `tools/list`：**从授权层过滤后的清单**生成，不另写一份。未授权工具在这里
@@ -118,7 +118,12 @@ impl ServerHandler for McpServer {
             let schema: JsonObject = serde_json::from_str(m.schema_json).map_err(|e| {
                 ErrorData::internal_error(format!("工具 {} 的 schema 非法：{e}", m.name), None)
             })?;
-            tools.push(Tool::new(m.name, m.description, schema));
+            let mut tool = Tool::new(m.name, m.description, schema);
+            if matches!(m.name, "terminal.upload" | "terminal.download") {
+                tool =
+                    tool.with_annotations(rmcp::model::ToolAnnotations::default().read_only(false));
+            }
+            tools.push(tool);
         }
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -127,7 +132,7 @@ impl ServerHandler for McpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // rmcp 的 arguments 是 Option<Map>；`server::call` 要 JSON 字符串。
         // 缺省按空对象处理（无参工具客户端常不发 arguments）。
@@ -151,20 +156,21 @@ impl ServerHandler for McpServer {
                 confirm: &*self.confirm,
                 audit: &*self.audit,
             };
-            crate::server::call(
+            crate::server::call_with_read_cancellation(
                 &request.name,
                 &args_json,
                 &ctx,
                 &self.authz,
                 &mut ledger,
                 &ports,
+                Some(&context),
             )
             .await
         };
         // 服务器在打开成功后即记账，即使后续 settled 审计失败也必须合并。
         // 若此处拿锁前请求被取消，可能丢失记账，下次只会多一次首次确认；不重开会话。
         self.ledger.lock().await.merge(ledger);
-        Ok(to_response(out))
+        Ok(to_response(out, request.name.as_ref() == "terminal.read"))
     }
 }
 
@@ -174,9 +180,14 @@ impl ServerHandler for McpServer {
 /// ——它把脱敏后的整个值同时放进 `content`（给模型读的 JSON 文本）与
 /// `structured_content`（给程序读的），exit_code/truncated/timed_out 一个不丢。
 /// 纯文本工具用 `success` 走显式脱敏文本。
-fn to_response(out: CallOutput) -> CallToolResponse {
+fn to_response(out: CallOutput, terminal_read: bool) -> CallToolResponse {
     match out {
         CallOutput::Ok { text, structured } => match structured {
+            Some(value) if terminal_read => {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                result.structured_content = Some(value);
+                result.into()
+            }
             Some(value) => CallToolResult::structured(value).into(),
             None => CallToolResult::success(vec![ContentBlock::text(text)]).into(),
         },
@@ -262,7 +273,7 @@ mod tests {
     #[test]
     fn a_rejection_becomes_a_tool_level_structured_error_not_a_protocol_error() {
         let e = ToolError::denied_by_gate(Tier::Dangerous, "只读档");
-        let resp = to_response(CallOutput::Err(e));
+        let resp = to_response(CallOutput::Err(e), false);
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(true), "拒绝必须 isError=true");
@@ -279,10 +290,13 @@ mod tests {
     #[test]
     fn a_structured_success_carries_the_value_in_both_channels() {
         let value = serde_json::json!({"stdout":"ok","stderr":"","exit_code":0,"truncated":false,"timed_out":false});
-        let resp = to_response(CallOutput::Ok {
-            text: "ok".into(),
-            structured: Some(value.clone()),
-        });
+        let resp = to_response(
+            CallOutput::Ok {
+                text: "ok".into(),
+                structured: Some(value.clone()),
+            },
+            false,
+        );
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(false));
@@ -297,10 +311,13 @@ mod tests {
     /// 成功无结构化（纯文本工具）⇒ 走显式文本。
     #[test]
     fn a_plain_success_uses_the_explicit_text() {
-        let resp = to_response(CallOutput::Ok {
-            text: "file body".into(),
-            structured: None,
-        });
+        let resp = to_response(
+            CallOutput::Ok {
+                text: "file body".into(),
+                structured: None,
+            },
+            false,
+        );
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(false));

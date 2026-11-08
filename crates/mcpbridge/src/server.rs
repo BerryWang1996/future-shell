@@ -32,6 +32,7 @@
 //! 纯逻辑层不认识端口，端口不认识闸门。两者只在这里相遇，于是「绕过闸门
 //! 直接调端口」这件事只可能发生在这一个文件里——而这一个文件有守卫。
 
+use crate::tool::ReadSource;
 use fs_policy::{AiMode, Decision};
 
 use crate::authz::{authorize_open, Authorization, OpenAuthz, OpenLedger};
@@ -150,6 +151,21 @@ pub async fn call(
     ledger: &mut OpenLedger,
     ports: &Ports<'_>,
 ) -> CallOutput {
+    call_with_read_cancellation(name, args_json, ctx, authz, ledger, ports, None).await
+}
+
+/// Only terminal.read consumes the request token; audit and writing tools must finish.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_with_read_cancellation(
+    name: &str,
+    args_json: &str,
+    ctx: &CallContext,
+    authz: &Authorization,
+    ledger: &mut OpenLedger,
+    ports: &Ports<'_>,
+    request: Option<&rmcp::service::RequestContext<rmcp::RoleServer>>,
+) -> CallOutput {
+    let read_request = request.filter(|_| name == "terminal.read");
     // ── ① 授权（**按线上名字，在解析之前**）─────────────────────────────
     //
     // 顺序曾经是「先解析后授权」，那是错的：解析失败的文案是「没有名为 X
@@ -241,7 +257,15 @@ pub async fn call(
     }
 
     dispatch_after_gate(
-        tool, gated, decision, open_authz, ctx, ledger, ports, binding,
+        tool,
+        gated,
+        decision,
+        open_authz,
+        ctx,
+        ledger,
+        ports,
+        binding,
+        read_request,
     )
     .await
 }
@@ -256,6 +280,7 @@ async fn dispatch_after_gate(
     ledger: &mut OpenLedger,
     ports: &Ports<'_>,
     binding: Option<u64>,
+    read_request: Option<&rmcp::service::RequestContext<rmcp::RoleServer>>,
 ) -> CallOutput {
     let raw_display = display_of(&tool);
 
@@ -323,31 +348,34 @@ async fn dispatch_after_gate(
     }
 
     // ── ⑦ 审计（Intent）：写不进去就不执行 ──────────────────────────────
-    let intent = McpCallRecord {
-        phase: RecordPhase::Intent,
-        tool_name: gated.tool_name,
-        caller: ctx.caller.clone(),
-        display: fs_ai::agent::record::RedactedAction::new(&raw_display, &ctx.known_secrets),
-        session_id: tool.session_id().map(|s| s.to_string()),
-        tier: gated.tier(),
-        verdict,
-        rules: rules_of(&gated),
-        exit_code: None,
-        output: None,
-    };
-    if let Err(why) = ports.audit.append(intent).await {
-        let message = fs_ai::agent::record::RedactedAction::new(
-            &format!("审计写入失败，本次调用未执行：{why}"),
-            &ctx.known_secrets,
-        );
-        return CallOutput::err(ToolError {
-            code: "FS_MCP_AUDIT_FAILED",
-            tier: Some(gated.tier().as_str()),
-            is_error: true,
-            confirmation_required: false,
-            message: message.as_str().to_string(),
-            details: Some(serde_json::json!({"stage":"intent","operation_attempted":false})),
-        });
+    let cancelled_before_intent = read_request.is_some_and(|r| r.ct.is_cancelled());
+    if !cancelled_before_intent {
+        let intent = McpCallRecord {
+            phase: RecordPhase::Intent,
+            tool_name: gated.tool_name,
+            caller: ctx.caller.clone(),
+            display: fs_ai::agent::record::RedactedAction::new(&raw_display, &ctx.known_secrets),
+            session_id: tool.session_id().map(|s| s.to_string()),
+            tier: gated.tier(),
+            verdict,
+            rules: rules_of(&gated),
+            exit_code: None,
+            output: None,
+        };
+        if let Err(why) = ports.audit.append(intent).await {
+            let message = fs_ai::agent::record::RedactedAction::new(
+                &format!("审计写入失败，本次调用未执行：{why}"),
+                &ctx.known_secrets,
+            );
+            return CallOutput::err(ToolError {
+                code: "FS_MCP_AUDIT_FAILED",
+                tier: Some(gated.tier().as_str()),
+                is_error: true,
+                confirmation_required: false,
+                message: message.as_str().to_string(),
+                details: Some(serde_json::json!({"stage":"intent","operation_attempted":false})),
+            });
+        }
     }
 
     // ── ⑧ 执行 ────────────────────────────────────────────────────────
@@ -357,6 +385,8 @@ async fn dispatch_after_gate(
         None
     };
     let mut operation_error = None;
+    let mut operation_attempted = true;
+    let mut cancellation_phase = None;
     let ran = match managed {
         Some(Ok(value)) => Ok(Executed {
             text: value.to_string(),
@@ -368,8 +398,45 @@ async fn dispatch_after_gate(
             operation_error = Some(e);
             Err(message)
         }
+        None if read_request.is_some() => {
+            let request = read_request.unwrap();
+            if request.ct.is_cancelled() {
+                operation_attempted = false;
+                cancellation_phase = Some(if cancelled_before_intent {
+                    "before_intent"
+                } else {
+                    "after_intent"
+                });
+                Err("terminal.read 请求已取消".into())
+            } else {
+                // Drop only this read-only future, never intent/settled audit or writes.
+                let result = tokio::select! {
+                    biased;
+                    _ = request.ct.cancelled() => None,
+                    result = execute(&tool, ports, binding) => Some(result),
+                };
+                // A cancellation already visible at completion wins over a ready result.
+                match result {
+                    Some(result) if !request.ct.is_cancelled() => result,
+                    _ => {
+                        cancellation_phase = Some("executing");
+                        Err("terminal.read 请求已取消".into())
+                    }
+                }
+            }
+        }
         None => execute(&tool, ports, binding).await,
     };
+
+    if let Some(phase) = cancellation_phase {
+        operation_error = Some(crate::managed::ManagementError {
+            code: "FS_MCP_CANCELLED",
+            message: "terminal.read 请求已取消".into(),
+            partial: Some(
+                serde_json::json!({"cancellation_phase":phase,"operation_attempted":operation_attempted}),
+            ),
+        });
+    }
 
     // 会话真的开起来了才记台账——在「用户批准」那一刻记，会让一次因为
     // 网络失败而没开成的尝试也算数，下次就不问了。
@@ -400,7 +467,9 @@ async fn dispatch_after_gate(
         display: fs_ai::agent::record::RedactedAction::new(&raw_display, &ctx.known_secrets),
         session_id: tool.session_id().map(|s| s.to_string()),
         tier: gated.tier(),
-        verdict: if ran
+        verdict: if cancellation_phase.is_some() && !operation_attempted {
+            McpVerdict::Abandoned
+        } else if ran
             .as_ref()
             .err()
             .is_some_and(|e| e == crate::ports::SESSION_FORBIDDEN)
@@ -415,7 +484,8 @@ async fn dispatch_after_gate(
     };
     if let Err(why) = ports.audit.append(settled).await {
         let refs: Vec<&str> = ctx.known_secrets.iter().map(String::as_str).collect();
-        let mut details = serde_json::json!({"stage":"settled","operation_attempted":true});
+        let mut details =
+            serde_json::json!({"stage":"settled","operation_attempted":operation_attempted});
         if let Ok(result) = &ran {
             let value = result
                 .structured
@@ -434,10 +504,12 @@ async fn dispatch_after_gate(
             details["operation_result_known"] = serde_json::json!(false);
             details["operation_error"] = serde_json::json!(text.as_str());
         }
-        let message = fs_ai::agent::record::RedactedAction::new(
-            &format!("操作已尝试，结果未能写入审计（{why}）。操作可能已生效，请先核对状态，不要直接重试。"),
-            &ctx.known_secrets,
-        );
+        let raw_message = if operation_attempted {
+            format!("操作已尝试，结果未能写入审计（{why}）。操作可能已生效，请先核对状态，不要直接重试。")
+        } else {
+            format!("操作未执行，取消结果未能写入审计（{why}）。")
+        };
+        let message = fs_ai::agent::record::RedactedAction::new(&raw_message, &ctx.known_secrets);
         return CallOutput::err(ToolError {
             code: "FS_MCP_AUDIT_FAILED",
             tier: Some(gated.tier().as_str()),
@@ -477,6 +549,20 @@ async fn dispatch_after_gate(
     if ran
         .as_ref()
         .err()
+        .is_some_and(|e| e == crate::ports::SESSION_BUSY)
+    {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: "FS_MCP_CONFLICT",
+            tier: Some(gated.tier().as_str()),
+            confirmation_required: false,
+            message: crate::ports::SESSION_BUSY.into(),
+            details: None,
+        });
+    }
+    if ran
+        .as_ref()
+        .err()
         .is_some_and(|e| e == crate::ports::SESSION_UNAVAILABLE)
     {
         return CallOutput::err(ToolError {
@@ -508,6 +594,26 @@ async fn dispatch_after_gate(
             tier: Some(gated.tier().as_str()),
             confirmation_required: false,
             message: text.as_str().to_string(),
+        });
+    }
+
+    // Settled audit must finish even if cancellation arrives while it is writing.
+    // The completed observation remains in audit; do not send a late success.
+    if read_request.is_some_and(|request| request.ct.is_cancelled()) {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: "FS_MCP_CANCELLED",
+            tier: Some(gated.tier().as_str()),
+            confirmation_required: false,
+            message: fs_ai::agent::record::RedactedAction::new(
+                "terminal.read 请求已取消；读取此前已完成，结果已写入审计",
+                &ctx.known_secrets,
+            )
+            .as_str()
+            .to_string(),
+            details: Some(
+                serde_json::json!({"cancellation_phase":"settled","operation_attempted":true,"operation_result_known":true}),
+            ),
         });
     }
 
@@ -606,11 +712,25 @@ async fn execute(
             session_id,
             source,
             max_lines,
-        } => ports
-            .terminal
-            .read_text(session_id, *source, *max_lines, binding)
-            .await
-            .map(plain),
+            wait_ms,
+        } => {
+            let snapshot = ports
+                .terminal
+                .read_text(session_id, *source, *max_lines, *wait_ms, binding)
+                .await?;
+            let source = match source {
+                ReadSource::Screen => "screen",
+                ReadSource::Scrollback => "scrollback",
+                ReadSource::All => "all",
+            };
+            let empty = snapshot.text.is_empty();
+            let structured = serde_json::json!({"session_id":session_id,"source":source,"text":snapshot.text,"empty":empty,"timed_out":snapshot.timed_out,"connection_state":snapshot.connection_state});
+            Ok(Executed {
+                text: snapshot.text,
+                structured: Some(structured),
+                exit_code: None,
+            })
+        }
         McpTool::TerminalSend {
             session_id,
             payload,
@@ -716,7 +836,6 @@ async fn settle(
 mod tests {
     use super::*;
     use crate::ports::{ConfirmReply, PortResult, ProfileSummary, SessionSummary};
-    use crate::tool::ReadSource;
     use fs_ai::exec::Observation;
     use std::future::Future;
     use std::pin::Pin;
@@ -903,7 +1022,10 @@ mod tests {
         calls: std::sync::Arc<Calls>,
         text: String,
         deny_at_execution: bool,
+        send_error: Option<String>,
         current_generation: Option<std::sync::Arc<AtomicUsize>>,
+        read_delay: Duration,
+        read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl TerminalPort for Term {
@@ -912,8 +1034,9 @@ mod tests {
             _s: &str,
             _src: ReadSource,
             _m: Option<usize>,
+            _wait_ms: u64,
             generation: Option<u64>,
-        ) -> F<'_, PortResult<String>> {
+        ) -> F<'_, PortResult<crate::ports::TerminalSnapshot>> {
             assert_eq!(
                 generation,
                 Some(1),
@@ -929,12 +1052,20 @@ mod tests {
                 self.calls.read_text.fetch_add(1, SeqCst);
             }
             Box::pin(async move {
+                tokio::time::sleep(self.read_delay).await;
+                if let Some(hook) = self.read_hook.lock().unwrap().take() {
+                    hook();
+                }
                 if changed {
                     Err(crate::ports::SESSION_UNAVAILABLE.into())
                 } else if denied {
                     Err(crate::ports::SESSION_FORBIDDEN.into())
                 } else {
-                    Ok(t)
+                    Ok(crate::ports::TerminalSnapshot {
+                        text: t,
+                        timed_out: false,
+                        connection_state: "connected".into(),
+                    })
                 }
             })
         }
@@ -945,7 +1076,8 @@ mod tests {
                 "original session generation must reach the port"
             );
             self.calls.send.fetch_add(1, SeqCst);
-            Box::pin(async move { Ok(()) })
+            let error = self.send_error.clone();
+            Box::pin(async move { error.map_or(Ok(()), Err) })
         }
     }
 
@@ -1094,6 +1226,7 @@ mod tests {
         fail_from: usize,
         change_generation_on_intent: Option<std::sync::Arc<AtomicUsize>>,
         fail_message: String,
+        pause: Option<RecordPhase>,
     }
 
     impl Audit {
@@ -1103,6 +1236,7 @@ mod tests {
                 fail_from: n,
                 change_generation_on_intent: None,
                 fail_message: format!("磁盘满 {SECRET}"),
+                pause: None,
             }
         }
         fn phases(&self) -> Vec<RecordPhase> {
@@ -1151,9 +1285,13 @@ mod tests {
                 output: rec.output.as_ref().map(|o| o.as_str().to_string()),
             });
             let fail = self.fail_from != 0 && nth >= self.fail_from;
+            let pause = self.pause == Some(rec.phase);
             let message = self.fail_message.clone();
             drop(rows);
             Box::pin(async move {
+                if pause {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 if fail {
                     Err(message)
                 } else {
@@ -1164,6 +1302,98 @@ mod tests {
     }
 
     /// 一整套假实现 + 装配。
+    #[tokio::test]
+    async fn terminal_transfers_are_dangerous_default_off_and_skip_does_not_bypass_deny() {
+        for (name, args) in crate::managed::examples()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("terminal."))
+        {
+            let args = args.to_string();
+            let mut default = Rig::new();
+            default.authz = Authorization::new(std::iter::empty::<&str>());
+            assert!(default.call(name, &args).await.is_err());
+            assert!(default.management.seen.lock().unwrap().is_empty());
+            let tool = parse_tool(name, &args).unwrap();
+            assert_eq!(
+                classify_for_mcp(&tool, "test").tier(),
+                fs_policy::Tier::Dangerous
+            );
+            let mut confirmed = Rig::new();
+            assert!(!confirmed.call(name, &args).await.is_err());
+            assert!(confirmed.conf.last_strong());
+            let mut direct = Rig::new();
+            direct.ctx.skip_confirmation = true;
+            direct.conf = Conf::forbidden();
+            assert!(!direct.call(name, &args).await.is_err());
+            assert_eq!(direct.management.seen.lock().unwrap().len(), 1);
+            for mode in [AiMode::Disabled, AiMode::ReadOnlyOnly] {
+                let mut denied = Rig::new();
+                denied.ctx.mode = mode;
+                denied.ctx.skip_confirmation = true;
+                denied.conf = Conf::forbidden();
+                assert!(denied.call(name, &args).await.is_err());
+                assert!(denied.management.seen.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    struct DiscoveryContext;
+    impl crate::transport::McpContextSource for DiscoveryContext {
+        fn current<'a>(&'a self) -> F<'a, CallContext> {
+            Box::pin(async { Rig::new().ctx })
+        }
+    }
+
+    #[tokio::test]
+    async fn real_rmcp_discovery_hides_default_tools_and_emits_explicit_write_annotations() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        for enabled in [false, true] {
+            let rig = Rig::new();
+            let names = if enabled {
+                vec!["terminal.upload", "terminal.download"]
+            } else {
+                vec![]
+            };
+            let server = crate::transport::McpServer::new(
+                Arc::new(DiscoveryContext),
+                Arc::new(rig.management),
+                Authorization::new(names),
+                Arc::new(rig.dir),
+                Arc::new(rig.term),
+                Arc::new(rig.cmd),
+                Arc::new(rig.sftp),
+                Arc::new(rig.conf),
+                Arc::new(rig.audit),
+            );
+            let (server_stream, client) = tokio::io::duplex(65536);
+            let task = tokio::spawn(crate::transport::serve_stream(server, server_stream));
+            let (rd, mut wr) = tokio::io::split(client);
+            let mut rd = tokio::io::BufReader::new(rd);
+            wr.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"discovery-test\",\"version\":\"1\"}}}\n").await.unwrap();
+            let mut line = String::new();
+            rd.read_line(&mut line).await.unwrap();
+            wr.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n").await.unwrap();
+            line.clear();
+            tokio::time::timeout(Duration::from_secs(2), rd.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), if enabled { 2 } else { 0 });
+            for tool in tools {
+                assert_eq!(tool["annotations"]["readOnlyHint"], false);
+                let manifest = crate::tool::manifest_of(tool["name"].as_str().unwrap()).unwrap();
+                let schema: serde_json::Value = serde_json::from_str(manifest.schema_json).unwrap();
+                assert_eq!(tool["inputSchema"], schema);
+                assert_eq!(schema["additionalProperties"], false);
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     struct Rig {
         management: Management,
         dir: Dir,
@@ -1195,7 +1425,10 @@ mod tests {
                     calls: calls.clone(),
                     text: "screen text".into(),
                     deny_at_execution: false,
+                    send_error: None,
                     current_generation: None,
+                    read_delay: Duration::ZERO,
+                    read_hook: Mutex::new(None),
                 },
                 cmd: Cmd {
                     calls: calls.clone(),
@@ -2097,6 +2330,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn terminal_read_preserves_whitespace_as_nonempty_text() {
+        for value in [" ", "\n", " \n "] {
+            let mut r = Rig::new();
+            r.term.text = value.into();
+            match r
+                .call(
+                    "terminal.read",
+                    r#"{"session_id":"s1","source":"screen","wait_ms":1000}"#,
+                )
+                .await
+            {
+                CallOutput::Ok {
+                    text,
+                    structured: Some(status),
+                } => {
+                    assert_eq!(text, value);
+                    assert_eq!(status["text"], value);
+                    assert_eq!(status["empty"], false);
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+    }
+
     // ══ ⑦ sessions.open 的两道门 ══════════════════════════════════════
 
     #[tokio::test]
@@ -2243,6 +2501,293 @@ mod tests {
                 assert_eq!(r.audit.outputs(), vec![text], "回包与审计行的文本必须同源");
             }
             _ => panic!("该成功"),
+        }
+    }
+    // Real rmcp request tokens are driven by JSON-RPC notifications/cancelled.
+    struct CancelHarness {
+        rig: std::sync::Arc<Rig>,
+        ledger: std::sync::Arc<tokio::sync::Mutex<OpenLedger>>,
+        outputs: std::sync::Arc<Mutex<Vec<CallOutput>>>,
+        entered: std::sync::Arc<AtomicUsize>,
+        before: bool,
+        race: bool,
+    }
+    impl rmcp::ServerHandler for CancelHarness {
+        fn get_info(&self) -> rmcp::model::InitializeResult {
+            rmcp::model::InitializeResult::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+        async fn call_tool(
+            &self,
+            req: rmcp::model::CallToolRequestParams,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            self.entered.fetch_add(1, SeqCst);
+            if self.before {
+                context.ct.cancelled().await;
+            }
+            if self.race {
+                let ct = context.ct.clone();
+                *self.rig.term.read_hook.lock().unwrap() = Some(Box::new(move || ct.cancel()));
+            }
+            let r = &self.rig;
+            let ports = Ports {
+                management: &r.management,
+                sessions: &r.dir,
+                terminal: &r.term,
+                command: &r.cmd,
+                sftp: &r.sftp,
+                confirm: &r.conf,
+                audit: &r.audit,
+            };
+            let mut ledger = self.ledger.lock().await;
+            let out = call_with_read_cancellation(
+                &req.name,
+                &serde_json::to_string(&req.arguments.unwrap()).unwrap(),
+                &r.ctx,
+                &r.authz,
+                &mut ledger,
+                &ports,
+                Some(&context),
+            )
+            .await;
+            self.outputs.lock().unwrap().push(out);
+            Ok(rmcp::model::CallToolResult::success(vec![]).into())
+        }
+    }
+
+    async fn protocol_cancel_case(
+        before: bool,
+        race: bool,
+        fail: usize,
+        write: bool,
+        pause: Option<RecordPhase>,
+    ) {
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut rig = Rig::new();
+        rig.ctx.skip_confirmation = true;
+        rig.term.text = format!("screen {SECRET}");
+        rig.dir.allowed.lock().unwrap().insert("p1".into(), true);
+        rig.term.read_delay = if before || race {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(10)
+        };
+        if fail > 0 {
+            rig.audit = Audit::failing_at(fail);
+        }
+        rig.audit.pause = pause;
+        if pause.is_some() {
+            rig.term.read_delay = Duration::ZERO;
+        }
+        let rig = std::sync::Arc::new(rig);
+        let ledger = std::sync::Arc::new(tokio::sync::Mutex::new(OpenLedger::new()));
+        let outputs = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let entered = std::sync::Arc::new(AtomicUsize::new(0));
+        let handler = CancelHarness {
+            rig: rig.clone(),
+            ledger: ledger.clone(),
+            outputs: outputs.clone(),
+            entered: entered.clone(),
+            before,
+            race,
+        };
+        let (server, client) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            handler
+                .serve(server)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut rd = tokio::io::BufReader::new(rd);
+        wr.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"cancel-test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let mut line = String::new();
+        rd.read_line(&mut line).await.unwrap();
+        wr.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let (name, args) = if write {
+            ("sessions.open", serde_json::json!({"profile_id":"p1"}))
+        } else {
+            (
+                "terminal.read",
+                serde_json::json!({"session_id":"s1","source":"screen","wait_ms":10000}),
+            )
+        };
+        let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}).to_string()+"\n";
+        wr.write_all(req.as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if if let Some(phase) = pause {
+                    rig.audit.phases().contains(&phase)
+                } else if before || race || fail == 1 {
+                    entered.load(SeqCst) > 0
+                } else {
+                    rig.calls.read_text.load(SeqCst) > 0
+                } {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        wr.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1,\"reason\":\"fixture\"}}\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while outputs.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled operation must settle promptly");
+        let out = outputs.lock().unwrap()[0].clone();
+        if write {
+            assert!(matches!(out, CallOutput::Ok { .. }));
+            assert_eq!(rig.calls.open.load(SeqCst), 1);
+            assert!(matches!(
+                authorize_open(Some(true), &rig.ctx.caller, "p1", &*ledger.lock().await),
+                OpenAuthz::Familiar
+            ));
+            assert_eq!(
+                rig.audit.phases(),
+                vec![RecordPhase::Intent, RecordPhase::Settled]
+            );
+        } else {
+            let CallOutput::Err(error) = out else {
+                panic!("cancel must not succeed")
+            };
+            assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+            if fail > 0 {
+                assert_eq!(error.code, "FS_MCP_AUDIT_FAILED");
+                assert_eq!(
+                    error.details.as_ref().unwrap()["stage"],
+                    if fail == 1 { "intent" } else { "settled" }
+                );
+                assert_eq!(
+                    error.details.as_ref().unwrap()["operation_attempted"],
+                    fail != 1
+                );
+                if fail == 2 && pause == Some(RecordPhase::Settled) {
+                    assert!(error.details.unwrap()["operation_result"].is_object());
+                } else if fail == 2 {
+                    assert_eq!(
+                        error.details.unwrap()["operation_error_code"],
+                        "FS_MCP_CANCELLED"
+                    );
+                }
+            } else {
+                assert_eq!(error.code, "FS_MCP_CANCELLED");
+                assert_eq!(
+                    error.details.unwrap()["operation_attempted"],
+                    !before && pause != Some(RecordPhase::Intent)
+                );
+                assert_eq!(
+                    rig.audit.phases(),
+                    if before {
+                        vec![RecordPhase::Settled]
+                    } else {
+                        vec![RecordPhase::Intent, RecordPhase::Settled]
+                    }
+                );
+                assert_eq!(
+                    rig.audit.verdicts().last().unwrap().executed(),
+                    !before && pause != Some(RecordPhase::Intent)
+                );
+            }
+            assert_eq!(
+                rig.calls.read_text.load(SeqCst),
+                if before || fail == 1 || pause == Some(RecordPhase::Intent) {
+                    0
+                } else {
+                    1
+                }
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rmcp_cancel_before_read_does_not_start_it() {
+        protocol_cancel_case(true, false, 0, false, None).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_during_wait_settles_as_attempted() {
+        protocol_cancel_case(false, false, 0, false, None).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_ready_at_completion_wins() {
+        protocol_cancel_case(false, true, 0, false, None).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_preserves_intent_audit_failure() {
+        protocol_cancel_case(false, false, 1, false, Some(RecordPhase::Intent)).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_preserves_settled_audit_failure() {
+        protocol_cancel_case(false, false, 2, false, None).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_does_not_drop_open_or_lose_ledger() {
+        protocol_cancel_case(true, false, 0, true, None).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_during_intent_finishes_audit_without_starting_read() {
+        protocol_cancel_case(false, false, 0, false, Some(RecordPhase::Intent)).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_during_settled_finishes_audit_without_late_success() {
+        protocol_cancel_case(false, false, 0, false, Some(RecordPhase::Settled)).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_during_open_intent_preserves_open_and_ledger() {
+        protocol_cancel_case(false, false, 0, true, Some(RecordPhase::Intent)).await;
+    }
+    #[tokio::test]
+    async fn rmcp_cancel_during_failed_settled_preserves_known_redacted_result() {
+        protocol_cancel_case(false, false, 2, false, Some(RecordPhase::Settled)).await;
+    }
+    #[tokio::test]
+    async fn terminal_busy_maps_conflict_while_reads_and_cancel_keep_dispatching() {
+        for (name, args) in [
+            (
+                "terminal.send",
+                r#"{"session_id":"s1","payload":"echo synthetic"}"#,
+            ),
+            (
+                "terminal.send_raw",
+                r#"{"session_id":"s1","payload":"\u0003"}"#,
+            ),
+        ] {
+            let mut rig = Rig::new();
+            rig.term.send_error = Some(crate::ports::SESSION_BUSY.into());
+            let result = rig.call(name, args).await;
+            assert_eq!(result.error_code(), Some("FS_MCP_CONFLICT"), "{name}");
+            assert!(rig
+                .call("terminal.read", r#"{"session_id":"s1","source":"screen"}"#)
+                .await
+                .error_code()
+                .is_none());
+            assert!(rig
+                .call("transfer.cancel", r#"{"transfer_id":"known-handle"}"#)
+                .await
+                .error_code()
+                .is_none());
+            assert_eq!(rig.calls.read_text.load(SeqCst), 1);
+            assert!(rig
+                .management
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(tool, _)| matches!(tool, crate::managed::ManagedTool::Cancel { .. })));
         }
     }
 }

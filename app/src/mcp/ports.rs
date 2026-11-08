@@ -41,12 +41,23 @@ async fn authorized_session(
     state: &AppState,
     session_id: &str,
     expected_generation: Option<u64>,
+    allow_busy: bool,
 ) -> PortResult<(Arc<LiveSession>, tokio::sync::OwnedMutexGuard<()>)> {
     let (generation, live) = state
         .registry
         .get_with_generation(session_id)
         .ok_or_else(|| fs_mcpbridge::ports::SESSION_UNAVAILABLE.to_string())?;
-    let guard = live.operation_gate.clone().lock_owned().await;
+    if expected_generation != Some(generation) {
+        return Err(fs_mcpbridge::ports::SESSION_UNAVAILABLE.into());
+    }
+    let guard = if allow_busy {
+        live.operation_gate.clone().lock_owned().await
+    } else {
+        crate::zmodem_bridge::idle_operation_gate(live.operation_gate.clone(), || {
+            crate::zmodem_bridge::mcp_terminal_busy(state, session_id)
+        })
+        .await?
+    };
     if expected_generation != Some(generation)
         || state.registry.generation_of(session_id) != Some(generation)
     {
@@ -209,19 +220,57 @@ impl TerminalPort for McpTerminal {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        wait_ms: u64,
         generation: Option<u64>,
-    ) -> Fut<'_, PortResult<String>> {
+    ) -> Fut<'_, PortResult<fs_mcpbridge::ports::TerminalSnapshot>> {
         let session_id = session_id.to_string();
         Box::pin(async move {
-            let (session, _guard) =
-                authorized_session(&self.state, &session_id, generation).await?;
-            // screen = 当前可见屏；scrollback/all = 回看+可见屏的末尾 N 行
-            //（网格侧没有「纯回看不含当前屏」的取法，见 fs_terminal::pipe 文档）。
-            Ok(match source {
+            let (session, guard) =
+                authorized_session(&self.state, &session_id, generation, true).await?;
+            let snapshot = || match source {
                 ReadSource::Screen => session.pipe.grid_text(),
                 ReadSource::Scrollback | ReadSource::All => {
                     session.pipe.scrollback_text(max_lines.unwrap_or(200))
                 }
+            };
+            let initially_empty = snapshot().is_empty();
+            drop(guard);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+            if initially_empty && wait_ms > 0 {
+                loop {
+                    if !snapshot().is_empty()
+                        || session.connection_state() == "disconnected"
+                        || self.state.registry.generation_of(&session_id) != generation
+                    {
+                        break;
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep_until(std::cmp::min(
+                        deadline,
+                        now + std::time::Duration::from_millis(50),
+                    ))
+                    .await;
+                }
+            }
+            let (current, _guard) =
+                authorized_session(&self.state, &session_id, generation, true).await?;
+            if !Arc::ptr_eq(&session, &current) {
+                return Err(fs_mcpbridge::ports::SESSION_UNAVAILABLE.into());
+            }
+            let text = snapshot();
+            let connection_state = session.connection_state().to_string();
+            let timed_out = initially_empty
+                && wait_ms > 0
+                && text.is_empty()
+                && connection_state != "disconnected"
+                && tokio::time::Instant::now() >= deadline;
+            Ok(fs_mcpbridge::ports::TerminalSnapshot {
+                text,
+                timed_out,
+                connection_state,
             })
         })
     }
@@ -236,7 +285,7 @@ impl TerminalPort for McpTerminal {
         let payload = payload.as_bytes().to_vec();
         Box::pin(async move {
             let (session, _guard) =
-                authorized_session(&self.state, &session_id, generation).await?;
+                authorized_session(&self.state, &session_id, generation, false).await?;
             // 与 term_input 同一条写半部（Mutex 串行化保字节顺序）。
             let w = session.write.lock().await;
             w.data_bytes(payload)
@@ -273,7 +322,8 @@ impl McpCommand {
         tool: Tool,
         generation: Option<u64>,
     ) -> PortResult<Observation> {
-        let (session, _guard) = authorized_session(&self.state, session_id, generation).await?;
+        let (session, _guard) =
+            authorized_session(&self.state, session_id, generation, false).await?;
         // 复用 Agent 的 RusshExecPort：同一条 `run_command` 契约、同一套
         // kill-before-close 与心跳读。ChannelRegistry 在这里只起「通道计数」的
         // 诊断作用，每次调用给一个新的即可。
@@ -359,7 +409,7 @@ impl SftpPort for McpSftp {
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
             let (session, _guard) =
-                authorized_session(&self.state, &session_id, generation).await?;
+                authorized_session(&self.state, &session_id, generation, false).await?;
             let port = self.exec_port(session);
             obs_to_text(port.list_remote_dir(&path).await)
         })
@@ -377,7 +427,7 @@ impl SftpPort for McpSftp {
         Box::pin(async move {
             use fs_ai::agent::ports::ExecPort;
             let (session, _guard) =
-                authorized_session(&self.state, &session_id, generation).await?;
+                authorized_session(&self.state, &session_id, generation, false).await?;
             let port = self.exec_port(session);
             let obs = port
                 .read_remote_file(
@@ -403,7 +453,7 @@ impl SftpPort for McpSftp {
             // 走 SFTP 子系统（与传输/文件面板同一条通道管理），不走 exec：
             // 内容经 `cat >` 管道要过一层远端 shell 转义，二进制内容会被破坏。
             let (_session, _guard) =
-                authorized_session(&self.state, &session_id, generation).await?;
+                authorized_session(&self.state, &session_id, generation, false).await?;
             let ops = self.state.sftp_ops_for(&session_id).await?;
             // write_at 带 CREATE 但**不截断**：先写到 0 偏移，再把文件截到内容长度，
             // 才是「替换」语义——否则新内容比旧文件短时，尾巴上会留着旧文件的残片。

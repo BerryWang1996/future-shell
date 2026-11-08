@@ -8,6 +8,7 @@
 /** 后端 `zmodem:progress` 的载荷（键集恒定，见 app/src/zmodem_bridge.rs 的 emit_progress）。 */
 export interface ZmodemProgress {
   sessionId: string;
+  decisionId?: string | null;
   /**
    * - `need-file`：远端在跑 `rz`，等我们选本地文件
    * - `receiving` / `sending`：传输中
@@ -19,6 +20,7 @@ export interface ZmodemProgress {
     | "receiving"
     | "sending"
     | "saved"
+    | "skipped"
     | "needs-decision"
     | "done"
     | "failed";
@@ -41,6 +43,8 @@ export interface ZmodemProgress {
 
 /** 一期待用户决策的下载（`needs-decision` 阶段的界面态）。 */
 export interface DownloadDecision {
+  decisionId: string;
+  sessionId: string;
   /** 对端声明的文件名（已清洗） */
   name: string;
   /** 建议目录 */
@@ -126,9 +130,14 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         decision: null,
       };
     }
+    case "skipped":
+      if (prev.decision && (ev.decisionId !== prev.decision.decisionId || ev.sessionId !== prev.decision.sessionId)) return prev;
+      return { ...prev, decision: null, path: null, message: "已跳过该文件", ok: true };
     case "saved":
+      if (prev.decision && (ev.decisionId !== prev.decision.decisionId || ev.sessionId !== prev.decision.sessionId)) return prev;
       return {
         ...prev,
+        decision: null,
         visible: true,
         needFile: false,
         name: ev.name || prev.name,
@@ -136,10 +145,25 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         total: ev.total ?? prev.total,
         ratio: 1,
         path: ev.path ?? prev.path,
+        message: prev.ok === true ? "文件已保存" : prev.message,
         fileIndex: ev.file_index ?? prev.fileIndex,
         fileCount: ev.file_count ?? prev.fileCount,
       };
-    case "needs-decision":
+    case "needs-decision": {
+      const decision: DownloadDecision = {
+        decisionId: ev.decisionId ?? "",
+        sessionId: ev.sessionId,
+        name: ev.name || prev.name,
+        suggestedDir: ev.suggestedDir ?? "",
+        conflict: ev.conflict ?? false,
+        reason: ev.message || (ev.conflict ? "conflict" : "first-run"),
+      };
+      // 后端原样重放同一决策时保留对象，避免重跑组件 effect 清空用户选择。
+      const old = prev.decision;
+      if (old && old.decisionId === decision.decisionId && old.sessionId === decision.sessionId
+        && old.name === decision.name && old.suggestedDir === decision.suggestedDir
+        && old.conflict === decision.conflict && old.reason === decision.reason
+        && prev.done === ev.done && prev.total === (ev.total ?? prev.total)) return prev;
       return {
         ...prev,
         visible: true,
@@ -147,13 +171,9 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         name: ev.name || prev.name,
         done: ev.done,
         total: ev.total ?? prev.total,
-        decision: {
-          name: ev.name || prev.name,
-          suggestedDir: ev.suggestedDir ?? "",
-          conflict: ev.conflict ?? false,
-          reason: ev.message || (ev.conflict ? "conflict" : "first-run"),
-        },
+        decision,
       };
+    }
     case "done":
     case "failed":
       return {

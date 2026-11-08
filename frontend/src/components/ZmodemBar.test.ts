@@ -8,7 +8,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import ZmodemBar from "./ZmodemBar.svelte";
-import { IDLE, type TransferView } from "../lib/zmodem";
+import { toast } from "../lib/toast";
+import { readFileSync } from "node:fs";
+import { IDLE, reduce, type ZmodemProgress, type TransferView } from "../lib/zmodem";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -99,6 +101,13 @@ describe("ZmodemBar", () => {
     expect(screen.getByTestId("zm-cancel")).toBeTruthy();
   });
 
+  it("取消等待上传的选文件对话框时请求远端取消", async () => {
+    render(ZmodemBar, { props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) } });
+    await screen.findByTestId("file-picker");
+    await fireEvent.click(await screen.findByTestId("fp-cancel"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("zmodem_cancel", { sessionId: "s3" }));
+  });
+
   it("need-file 的跳变自动打开选择器一次", async () => {
     render(ZmodemBar, { props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) } });
     await screen.findByTestId("file-picker");
@@ -118,18 +127,6 @@ describe("ZmodemBar", () => {
     rerender({ sessionId: "s3", view: view({ needFile: true, direction: "send" }) });
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByTestId("file-picker")).toBeNull();
-  });
-
-  it("关闭后点「选择本地文件…」能重开（想继续有入口）", async () => {
-    const { rerender } = render(ZmodemBar, {
-      props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) },
-    });
-    await screen.findByTestId("file-picker");
-    await fireEvent.click(await screen.findByTestId("fp-cancel"));
-    await waitFor(() => expect(screen.queryByTestId("file-picker")).toBeNull());
-    await fireEvent.click(screen.getByTestId("zm-pick"));
-    await screen.findByTestId("file-picker");
-    expect(rerender).toBeTruthy();
   });
 
   it("选中的文件以**数组**提交给 zmodem_send（多文件上传的入口）", async () => {
@@ -193,7 +190,7 @@ describe("下载决策（两段式第二段）", () => {
     view({
       visible: true,
       direction: "receive",
-      decision: {
+      decision: { decisionId: "test", sessionId: "s1",
         name: "a.bin",
         suggestedDir: "C:\Users\me\Downloads\FutureShell",
         conflict: false,
@@ -203,7 +200,7 @@ describe("下载决策（两段式第二段）", () => {
     });
 
   it("首次（first-run）显示引导：目录 + 记住偏好单选 + 保存", async () => {
-    render(ZmodemBar, { props: { sessionId: "d1", view: dec({}) } });
+    render(ZmodemBar, { props: { sessionId: "d1", view: dec({ sessionId: "d1",}) } });
     expect(screen.getByTestId("zm-decision").textContent).toContain("第一次收到文件");
     expect(screen.getByTestId("zm-dec-dir").textContent).toContain("FutureShell");
     // 未选「以后怎么办」时也可以保存——记住是可选的（不强制现在决定）
@@ -212,62 +209,62 @@ describe("下载决策（两段式第二段）", () => {
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d1",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: null,
       }),
     );
   });
 
   it("选了「记住这个目录」→ remember=true 随归置一起提交", async () => {
-    render(ZmodemBar, { props: { sessionId: "d2", view: dec({}) } });
+    render(ZmodemBar, { props: { sessionId: "d2", view: dec({ sessionId: "d2",}) } });
     await fireEvent.click(screen.getByText("记住这个目录，以后都存这里"));
     await fireEvent.click(screen.getByTestId("zm-dec-ok"));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d2",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: true,
       }),
     );
   });
 
   it("选了「以后每次都问我」→ remember=false", async () => {
-    render(ZmodemBar, { props: { sessionId: "d3", view: dec({}) } });
+    render(ZmodemBar, { props: { sessionId: "d3", view: dec({ sessionId: "d3",}) } });
     await fireEvent.click(screen.getByText("以后每次都问我"));
     await fireEvent.click(screen.getByTestId("zm-dec-ok"));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d3",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: false,
       }),
     );
   });
 
   it("「不选了」兜底归置到建议目录（keep-both），**绝不删已收数据**", async () => {
-    render(ZmodemBar, { props: { sessionId: "d4", view: dec({}) } });
+    render(ZmodemBar, { props: { sessionId: "d4", view: dec({ sessionId: "d4",}) } });
     await fireEvent.click(screen.getByTestId("zm-dec-later"));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d4",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: null,
       }),
     );
   });
 
   it("choose-dir 形态不显示「以后怎么办」（设置里改）", () => {
-    render(ZmodemBar, { props: { sessionId: "d5", view: dec({ reason: "choose-dir" }) } });
+    render(ZmodemBar, { props: { sessionId: "d5", view: dec({ sessionId: "d5", reason: "choose-dir" }) } });
     expect(screen.queryByText("以后怎么办")).toBeNull();
     expect(screen.getByTestId("zm-decision").textContent).toContain("文件保存到哪里");
   });
 
   it("冲突形态三按钮各提交对应策略", async () => {
     render(ZmodemBar, {
-      props: { sessionId: "d6", view: dec({ conflict: true, reason: "conflict" }) },
+      props: { sessionId: "d6", view: dec({ sessionId: "d6", conflict: true, reason: "conflict" }) },
     });
     expect(screen.getByTestId("zm-decision").textContent).toContain("已存在");
     await fireEvent.click(screen.getByTestId("zm-ow"));
@@ -275,7 +272,7 @@ describe("下载决策（两段式第二段）", () => {
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d6",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "overwrite",
+        expectedDecisionId: "test", onConflict: "overwrite",
         remember: null,
       }),
     );
@@ -284,7 +281,7 @@ describe("下载决策（两段式第二段）", () => {
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d6",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "skip",
+        expectedDecisionId: "test", onConflict: "skip",
         remember: null,
       }),
     );
@@ -292,7 +289,7 @@ describe("下载决策（两段式第二段）", () => {
 
   it("**勾了「其余同此处理」后，下一个冲突不再弹框而是直接办**", async () => {
     const { rerender } = render(ZmodemBar, {
-      props: { sessionId: "d7", view: dec({ conflict: true, reason: "conflict" }) },
+      props: { sessionId: "d7", view: dec({ sessionId: "d7", conflict: true, reason: "conflict" }) },
     });
     // 勾选 + 点「保留两者」
     await fireEvent.click(screen.getByTestId("zm-apply-rest"));
@@ -301,20 +298,82 @@ describe("下载决策（两段式第二段）", () => {
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d7",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: null,
       }),
     );
     // 第二个冲突到来（sz 多文件）：不渲染决策框，直接按记下的策略 finalize
-    rerender({ sessionId: "d7", view: dec({ conflict: true, reason: "conflict" }) });
+    rerender({ sessionId: "d7", view: dec({ sessionId: "d7", conflict: true, reason: "conflict" }) });
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith("zmodem_finalize", {
         sessionId: "d7",
         dir: "C:\Users\me\Downloads\FutureShell",
-        onConflict: "keep-both",
+        expectedDecisionId: "test", onConflict: "keep-both",
         remember: null,
       });
     });
     expect(screen.queryByTestId("zm-decision")).toBeNull();
   });
+});
+
+describe("download decision asynchronous ownership", () => {
+  it.each(["save", "skip", "failure", "stale", "session"])("late A %s does not affect B", async (outcome) => {
+    let resolve!: (result: boolean) => void;
+    let reject!: (reason: string) => void;
+    const pending = new Promise<boolean>((ok, fail) => { resolve = ok; reject = fail; });
+    invoke.mockImplementation((cmd: string) => cmd === "zmodem_finalize" ? pending : Promise.resolve({ active: false, sandbox: null, auto: true }));
+    const info = vi.spyOn(toast, "info");
+    const error = vi.spyOn(toast, "error");
+    const decision = (id: string) => view({ visible: true, decision: {
+      decisionId: id, sessionId: outcome === "session" && id === "B" ? "s2" : "s1", name: id, suggestedDir: "/tmp/downloads",
+      conflict: outcome === "skip", reason: "choose-dir",
+    }});
+    const { rerender } = render(ZmodemBar, { props: { sessionId: "s1", view: decision("A") } });
+    await fireEvent.click(screen.getByTestId(outcome === "skip" ? "zm-skip" : "zm-dec-later"));
+    expect(invoke).toHaveBeenCalledWith("zmodem_finalize", expect.objectContaining({sessionId: "s1", expectedDecisionId: "A"}));
+    await rerender({ sessionId: outcome === "session" ? "s2" : "s1", view: decision("B") });
+    if (outcome === "failure") reject("late A failure"); else resolve(outcome !== "stale");
+    await pending.catch(() => {});
+    await waitFor(() => expect(screen.getByTestId("zm-decision").textContent).toContain("B"));
+    expect(info).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    info.mockRestore(); error.mockRestore();
+  });
+});
+
+// 此文件来自 Rust 的生产 pending_presentation 路径，显式环境变量使跨语言测试可复跑。
+const presentationFixture = process.env.FS111_PRESENTATION_FIXTURE;
+it.skipIf(!presentationFixture)("backend stale refresh preserves B conflict actions and the active directory choice", async () => {
+  const payload = JSON.parse(readFileSync(presentationFixture!, "utf8")) as Record<string, ZmodemProgress>;
+  const before = reduce(IDLE, payload.original);
+  const replayed = reduce(before, payload.replay);
+  expect(replayed).toBe(before); // 相同载荷不触发组件 effect，保留本地选择状态。
+  expect(replayed.decision).toEqual({ decisionId: "B-id", sessionId: "s1", name: "B",
+    suggestedDir: payload.original.suggestedDir, conflict: true, reason: "conflict" });
+  const { rerender } = render(ZmodemBar, { props: { sessionId: "s1", view: before } });
+  await rerender({ sessionId: "s1", view: replayed });
+  for (const action of ["zm-ow", "zm-keep", "zm-skip"]) expect(screen.getByTestId(action)).toBeTruthy();
+  const first = reduce(IDLE, payload.firstRun);
+  expect(first.decision?.reason).toBe("first-run");
+  await rerender({ sessionId: "s1", view: first });
+  await fireEvent.click(screen.getByText("记住这个目录，以后都存这里"));
+  await fireEvent.click(screen.getByTestId("zm-dec-change"));
+  await fireEvent.click(await screen.findByTestId("fp-dir"));
+  await waitFor(() => expect(screen.getByTestId("fp-crumbs").textContent).toContain("docs"));
+  const repeated = reduce(first, payload.firstRun);
+  expect(repeated).toBe(first);
+  await rerender({ sessionId: "s1", view: repeated });
+  expect((screen.getByText("记住这个目录，以后都存这里").querySelector("input") as HTMLInputElement)?.checked).toBe(true);
+  expect(screen.getByTestId("file-picker")).toBeTruthy();
+  expect(screen.getByTestId("fp-crumbs").textContent).toContain("docs");
+  await fireEvent.click(screen.getByTestId("fp-confirm"));
+  expect(screen.getByTestId("zm-dec-dir").textContent).toBe("docs");
+  await rerender({ sessionId: "s1", view: reduce(repeated, payload.firstRun) });
+  expect(screen.getByTestId("zm-dec-dir").textContent).toBe("docs");
+  await rerender({ sessionId: "s1", view: reduce(repeated, { ...payload.firstRun, decisionId: "new-id" }) });
+  expect((screen.getByText("记住这个目录，以后都存这里").querySelector("input") as HTMLInputElement)?.checked).toBe(false);
+  const initial = reduce(IDLE, payload.initial);
+  expect(initial.decision?.reason).toBe("choose-dir");
+  expect(initial.decision?.decisionId).toBe("B-id");
+  expect(initial.decision?.conflict).toBe(false);
 });

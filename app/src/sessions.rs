@@ -6,6 +6,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 pub struct LiveSession {
+    /// Whether this session was created without a GUI renderer.
+    pub headless: bool,
     /// 串行化提交与关闭，避免关闭通过检查后又出现新传输。
     pub operation_gate: Arc<tokio::sync::Mutex<()>>,
     pub pipe: Arc<SessionPipe>,

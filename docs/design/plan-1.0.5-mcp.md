@@ -1,6 +1,8 @@
 # FutureShell 1.0.5 开发计划
 
-更新于 2026-11-07。代码基线为 `v1.0.4`（`e0a69bf`）。本文供范围确认、开发、复审和验收使用。当前 `release/1.0.5` 已进入实现与验证阶段，本地结果见第八节，三平台 CI 与正式制品待核对。1.0.5 增加外部 MCP 的文件上传下载、传输管理、远端文件管理和 SSH 会话管理。所有新入口都会出现在「设置 → AI → 对外 MCP 服务」的工具授权清单中。
+本文沿用 1.0.5 计划作为开发与审计记录，后续版本按时间续记；下文“当前”“未实施”等历史表述只适用于其所在阶段。原始基线为 `v1.0.4`（`e0a69bf`），1.0.5 已发布。
+
+**最新状态（2026-11-08）：1.1.1 本地开发中，未发布或安装。** 集成分支为 `codex/1.1.1-mcp-endpoints`。终端读取、rz/sz 取消与保存、MCP 双向终端文件传输均已实现并经过分卡独立复审；最终真实验收仍有停止线，不能据单元测试通过判定完成。`a4a2cd7` 已关闭真实 zsh 上传目录误落反例，空文件与 96 KiB 双向哈希通过；4 MiB 下载触发的效果队列数量上限已通过接收背压修复并独审；统一候选所列真实验收及独立终审已完成，本地开发成果可交付，隔离测试现场已清理。原生 GNU 0.13 的大文件及 GUI 双向取消、GNU 0.12 innerPTY 的 MCP 双向活动取消均取得真实证据；工具本地取消终态仍不保证任意对端已经退出。仅使用隔离 loopback SSH、便携测试应用和合成文件；本机安装版与真实服务器未改动。
 
 ## 一、现状与交付目标
 
@@ -305,4 +307,201 @@ S3 5e32465 独审/D2 原文：放行本地整合，未复跑。Intent 失败返�
 
 
 1.1.0 发布准备 04729ae 已独审放行推送候选与创建 PR，tag/publish 等待流水线；版本自检 2 正/23 反、模拟 tag 一致、两套 locked/offline metadata 通过，第三方依赖集合未变。
-1.1.0 完整前端测试：117 文件、1699 项通过（含 settings-wiring）；依赖复用只忽略预期的根版本差异，临时链接已清理。当前新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行，仍待核。
+1.1.0 完整前端测试：117 文件、1699 项通过（含 settings-wiring）；依赖复用只忽略预期的根版本差异，临时链接已清理。发布准备时新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行；最终结果见下节。
+
+### 1.1.0 正式发布验收（2026-11-07）
+
+PR [#20](https://github.com/BerryWang1996/future-shell/pull/20) 的十项必需检查通过后合并；main 为 `73ed9eff24321e8f28e2efac8d4ced516462eeb4`，与已审候选 `593f3d9` 的源码树一致。注解 tag `v1.1.0` 对象为 `1f788f3a2e7b90ae04f2b91c92e9db2c79b2d804`，指向该 main 提交，远端指针再次核实一致。
+
+[正式 Release 流水线 42382968295](https://github.com/BerryWang1996/future-shell/actions/runs/42382968295) 用时 48 分 55 秒，15 项任务全部成功，覆盖版本、原生三平台门禁、前端、文档、许可、SBOM、三平台 bundle/smoke 和 release。smoke 按脚本范围：MSI、macOS 和 deb 有同版重装；NSIS 为安装/启动/卸载，AppImage 为运行/删除，不声称每种安装器都验证了重装。
+
+发布前 D2 原文：放行按用户已授权发布 v1.1.0，前提草稿正文保留实际签名 notice 和经核实的验证边界。独立核原始 jobs：15/15 completed success，全部 run_id=42382968295、head_sha=73ed9ef，release 的 provenance 与 draft 两步 success。独立计算实际下载 SHA256SUMS 文件哈希并比对 22 行与 23 个 UI 资产记录（含自身）一致；五安装包、14 SBOM、三 notices 齐全。实际下载 DMG 哈希匹配，挂载内 app Info 1.1.0/标识正确、主程序和 helper 均双架构、codesign deep strict 通过。边界：Windows 未商业签名、macOS ad-hoc 且未公证；来源证明生成步骤成功，但未独立执行 gh attestation verify；真实历史报错根因、SFTP 同权限并发替换与取消后可能额外强确认仍保留。按脚本真实范围描述安装 smoke（NSIS/AppImage 未做同版重装），勿声称全覆盖。
+
+经理处置：保留原签名说明，并加入实际验证范围和上述已知边界后发布；未更改签名策略或本机已安装应用。macOS DMG SHA-256 为 `5e0fdafcc4c2a1653f1a084a704e778d8e7cdfa7a3e969049a29c51c94facfcd`；只读挂载核实版本 1.1.0、标识 io.futureshell.app、主程序和 helper 均 x86_64/arm64，严格签名完整性检查通过，实为 ad-hoc；挂载已卸载。
+
+[FutureShell 1.1.0](https://github.com/BerryWang1996/future-shell/releases/tag/v1.1.0) 于 2026-11-07 15:39:03 UTC 公开发布。匿名公共 API 确认 latest=v1.1.0、draft=false、prerelease=false；23 个附件名称和 digest 与发布前逐项一致，校验清单覆盖其余 22 件。公开下载 14 份 CycloneDX SBOM、3 份许可和校验清单，18 件逐一哈希通过，全部 SBOM 的根组件版本为 1.1.0。
+
+原始发布证据保留在当前检出的 `.cache/release-1.1.0-jobs.json`、`.cache/release-1.1.0-verification.json` 和 `.cache/release-1.1.0-public/`；它们是本次合成开发与公开发布材料，没有保存用户凭据。本节是发布后的本地验收记录，版本 tag 不包含本节后补记录。
+
+发布增量 D3 原文：补正文档时间口径后放行本地提交记录；无发版制品阻断。独立核公共 release-api.json：v1.1.0、非草稿/非预发布、发布时间与记录一致、23资产 digest 全部等于发布前；实际公开下载18个文件逐一算 SHA256 通过，14 SBOM 根版本1.1.0，22条实际校验清单匹配。公开正文保留 Windows/Apple 签名 notice，并明确历史根因、同权限路径竞态、取消后可能额外强确认及未另跑 gh attestation verify。tag 本地解引用为73ed9ef，当前工作树唯一未提交为计划记录；本次未重跑流水线。需改一处正文：新增正式验收前第306–309行仍写“当前新版本的三平台 CI、安装包、smoke 与附件来源证明尚未执行，仍待核”，与后续正式成功矛盾，改为“发布准备时尚未执行，最终结果见下节”。latest=v1.1.0 在 result.json 的采集结果中，release-api.json 本身为按 tag 的原始响应；如称‘原始 latest API 响应’需另有该原始证据，不应把派生结果冒充原始文件。无需改既有 tag/重跑发布。
+
+经理处置：已修正旧句的历史时间口径。采集请求实际为 `/repos/BerryWang1996/future-shell/releases/latest`；响应内的资源地址使用 tag，无法仅凭资源地址反推请求入口。latest 结论引用 `result.json` 和公开页面 Latest 标识，不将资源地址冒充请求入口证明。发布后记录仅本地提交，不改变已公开 tag 或重启发布。
+
+## 1.1.1 开发批次（2026-11-08）
+
+基线为公开 1.1.0 / main `73ed9eff24321e8f28e2efac8d4ced516462eeb4`；远端已核，原工作区干净，发布后的本地记录另保留为 `c25d3cb`。本批集成分支 `codex/1.1.1-mcp-endpoints`。用户要求继续完善读屏空及堡垒机终端传文件，已明确双向上传/下载一起做，并追加 rz 取消后卡住、sz 同类问题需核。截图中其他项目的提交/部署是故障背景，不是本项目远端写入授权。
+
+| 卡 | 范围与顺序 | 验收及状态 |
+| --- | --- | --- |
+| A / L3 | 终端管道、SSH装配/重连、MCP terminal.read 契约及回归；与B0不同文件集时并行 | 全部本地合入1685499并独立D2放行，具体真实SSH及等价边界见下方READ条目。MCP headless不等GUI ACK；wait_ms是空快照输出等待预算，max_lines须正数；保留旧text并补结构化状态，返回前复核授权/代次。 |
+| B0 / L3 | 既有ZMODEM桥接、rz/sz取消与前端传输面板；先于新传输工具 | 取消、IO/归属、保存身份/目录/展示及协议收尾分轮回修已本地整合且分别独审；当前08205fa统一源码真实GUI及驱动负测在途，未放行总体完成。不将关闭弹框等同远端已取消。 |
+| B1/B2 / L3 | 复用ZMODEM增补显式MCP上传、下载、状态/取消及逐项授权；共享MCP文件在A整合后再接线 | 双向设计及分卡D1已核，等待B0统一补验后实施。源使用授权根和稳定句柄，下载确定沙箱不覆盖；绑定代次、区分协议确认/取消/未知，不猜PTY主机身份或自动切SFTP/base64。具体执行卡见末节。 |
+| V / L1 | 实现和独审后准备1.1.1版本、说明及统一开发候选验证 | 复用现有版本校验脚本；范围覆盖真实隔离SSH、双方协议和原生界面。本批当前是开发授权，正式发布/安装另按用户当时要求核。 |
+
+前提：MCP sessions.open 已建立后台网格，不依赖GUI标签；首次输出异步到达。代码还允许max_lines=0，并存在无GUI ACK的渲染背压机制；截图实际命中哪项未确证。PTY/shell请求拒绝是待实测反例，不直接改want_reply假装修复。本机现有MCP工具连接返回Transport closed，未据此推断远端故障，也未重试生产连接。既有标准SSH跳板可复用，但堡垒机交互菜单不保证提供direct-tcpip或目标凭据。ZMODEM远端需rz/sz，实际截图已显示rz握手；sz能力仍待隔离和获授权现场核实。
+
+[自检] A做机制回归和隔离SSH验收：有L3管道/生命周期/授权影响，既有1.1.0绿测不足；不重复未改变的全仓构建。B0先复现再修，B1/B2复用原有协议，避免并行改同一MCP契约文件。反方与架构建议已由非实现上下文读取固定基线，结论分已证代码机制/待复现，不将可能性写为用户历史根因。当前本机原会话不作写入测试。
+
+A D1/军师有条件放行：transport 当前 structured(value) 会改写 content 文本，须保留 terminal.read 旧非空文本并独立附结构化字段，真rmcp两处脱敏验证；等待期间关闭/换代/撤权/DB错、同peer写/取消、GUI背压与重连模式不可跳过。max_lines=0 改为坏参数需明确说明。headless仅省渲染，tap/decoder/转录/录屏/EOF不变。
+B0 D1 放行 B0a→B0b 串行：先修等待选择时取消及下载目录同锁重入，再修完成动作队列/传输归属。用户已明确取消应终止远端等待，本地选择框取消按此调整；原‘关闭可重选’测试不再作为保留旧错误行为的依据。须真实隔离rz/sz双向字节校验及取消后shell回显、下一次传输，不能把取消受理等于远端退出，不能提前清cur导致排队数据丢失。
+[偏离] 四槽内由独立审计代理合并反方/D1/军师建议，但实现者不自审；保留原始代码和跨代理复核。创建额外B工作区的宿主调用长时间未返回，停止等待后查附件及git worktree确认无新增，不重放创建；改复用现有两个独立工作区，A独占fix-sftp-unknown-size，B独占fix-mcp-revocation，主会话不改两者业务源码；B与A的共享MCP/session文件后续串行整合。无用户改动被覆盖。
+
+A截至452f65b：pipe 19、MCP 126单测+21协议通过；实际隔离OpenSSH验证零文本超时、延迟输出、持门锁后的输出等待口径、等待读期间撤权/DB失效、同peer发送/关闭、自动重连后3MB末尾标记。精确开发候选重签后exe SHA256 `d74fb088c9665621498b1f5f0d9a174e5ac8dd69bc7420567cc4c2559242dc8c`；原始日志在A工作区 `.cache/1.1.1-terminal-read-ssh.log`。独审明确这些不能证明双方向手动GUI/MCP重连、等待读精确换代或协议取消；另派独立验收补证，暂未整合/最终放行。empty按零文本判断，合法空格/换行不被trim，不能声称所有人眼空白现象均已根治。
+
+B0a独审中项已采纳：同轮重复取消必须幂等且不重复CAN，不能第二次弹取消失败；并入B0b回修。B0b机制经独立D1复核可继续：每轮Effect带序号、排队数据/完成动作排空前不提前清cur；旧tap以operation_gate+原代次+当前tap身份复核，不向新连接写；初次注册可有界等待而失效旧tap不能等待后重绑；写失败/断线/startup超时不能被迟到Done覆盖为成功。对端真正退出、尾部shell字节透传与下一轮传输须真实验证。
+
+### 1.1.1 第二轮实现与验收现场
+
+A独立补验发现452f65b忽略rmcp context.ct，真实取消后读取仍10.023秒才Settled；换代等待返回TARGET_UNAVAILABLE，无旧文本。已换新实现上下文回修7186995，仅server/transport：token只取消read执行，不drop Intent/Settled或写工具；完成竞争取消优先，Settled中才取消保留实际审计结果，再给取消响应；审计失败优先。136项模块测试及10个真实rmcp取消交错用例通过，真实SSH及时单次Settled、超过原预算无迟到成功/第二Settled，raw/structured兼容和换代通过。新候选exe SHA256 `6e657f22a3c5eb48c513c8f1985ad15f63fe30d0fc8cb7b9998ed5a430358694`。注意日志0.235秒从读取请求开始计时，不是精确的取消后耗时。
+A D2独立放行本地整合：取消作用域、审计真值与统一脱敏已核；GUI/MCP重连来源接受固定同core代码链+真实headless自动重连为有限等价，不能写GUI实测。A四提交已顺序整合为6afbc02/030bc64/18f4a6b/1685499。原GUI/MCP交叉重连无双向GUI实测、非macOS平台留最终验证。
+
+B0b阶段WIP2358923在生产变更超400行后主动停交；独审核出三组必修：IO失败会跳过CAN，取消后FileSent可能推进下一文件并迟到成功；归置错误丢pending/Done盖成功；gate和SSH写无界会堵取消及关闭。新上下文B0c dad49c9修显式Cancel/CancelDone、取消粘滞/终态推进轮次、归置失败保留pending、gate/write/data五秒预算，桥接21项及旧行为mutation4红后恢复全绿。静态主防线已核，但独审仍阻断最终完成：已有待决A时B已收妥，A兜底归置失败会令B失去可恢复原名/大小归属；另有存量EOF重复ZRINIT可重复FileSent跳过批量文件。再换新上下文限定两根因回修，未放行B0最终完成/发布。
+不可采用的误修已记录：首次未绑定tap在正常装配窗口可能看到旧tap；session装配先启动pipe、再清旧、插registry、登记新tap，不能遇不同tap就立即拒绝。保留有界首次等待及每效果执行前原gen/当前Arc复核。
+
+B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和terminal.download(session_id,remote_path)，两项默认关闭、沿用原授权与档位；local_path是上传根相对普通文件，上传目录与旧sftp.upload的目标文件remote_path语义不同。先被动预约而不发协议字节，再发固定严格POSIX引用rz/sz命令，匹配方向握手才激活；不得把现begin_send直接当arm。明确当前PTY干净POSIX提示符前提和主机身份未验证，不猜prompt/不切SFTP目标/不自动安装或base64回退。上传basename拒绝会被trim改变的名字；下载单文件、实际字节与队列有界、未收完整文件不成功，profile沙箱create_new不覆盖。GUI/MCP普通输入在任务占用时拒绝但取消可达，已开源句柄不重开，IO错误/取消/超时粘滞；协议确认不冒充远端SHA/path/身份核验。复用transfer.list/status/cancel窄backend，不造第二任务框架。enabled=false拒绝，auto=false仅明确MCP预约临时捕获，结束还原；B2须等B0真协议及A整合，未提前派实现。GNU rz-p保护及sz参数/末握手仍待实证，参考[Debian rz](https://manpages.debian.org/trixie/lrzsz/rz.1.en.html)、[Debian sz](https://manpages.debian.org/trixie/lrzsz/sz.1.en.html)，help存在不等于冲突已验。
+
+完整Docker lrzsz+sshd依赖构建因OOMKilled137失败，已核状态并删除仅本任务失败容器，不重放或更改Docker/业务容器资源。复用下载的Debian包构建低内存futureshell-zmodem-tools:1.1.1（cb544d536581，仅GNU0.12.21rc工具，无sshd）；Homebrew官方core GNU0.13.1安装完成，供本机独立sshd真PTY。基础外部PTY探测确认两版本rz收到8CAN+8BS后退出128（2/24毫秒），仅证明对端支持，不证明FutureShell发送链。
+独立GUI/PTY验收工程已冻结16854993593a23ded46348561c20a1a6af90d1be，源exe SHA `faf7f619b671a088977132792e6ea8dcd9cb1124b29f0cc7e5636ce96c3b330b`；唯一合成bundle重签后exe `a9ca896b016eeef76cf8cf773f772e7b6d37d3598e94d3101a61a74061159845`。只在独立/tmp便携DB/agent/strict hostkey及home唯一合成payload目录测试；GUI先开可见profile，再用独立bridge定位会话，不能MCP headless open后假定有标签。当前包版本仍1.1.0，这是1.1.1功能开发候选，最终V才统一版本。原生UI测试尚在进行，新回修SHA需按影响补验；未更改安装版或生产服务器。
+
+### 已发现条目分轮对账与当前恢复入口
+
+本批复杂回修已加载 audit-fix-rounds，沿本记录对账，不另设平行台账；以下编号用于后续续接，早先阶段文字按其当时版本理解。
+
+| 编号/来源 | 分诊及交付版本 | 已核范围/剩余条件 |
+| --- | --- | --- |
+| READ-1、READ-CANCEL-1 / 代码机制与独立真SSH | A全部本地合入1685499；7186995取消回修已独立D2放行 | 保留text/structured与脱敏、headless/重连、只读ct取消和审计真值。GUI/MCP重连来源部分为同core等价，不写双向GUI实测。 |
+| ZM-CANCEL-1、ZM-IO-1 / 原取消与驱动独审 | dad49c9主要代码防线已核，后续归属缺口另列下行 | 168原生GUI两次等待取消实际exit128、后续PTY/下一传输通过；完整驱动故障交错仍有静态/局部证据，不能统称全真测。 |
+| SAVE-RECOVERY-1、EOF-1 / A/B归属及重复ZRINIT | 0a5a8c0关闭原‘保A丢B’与双FileSent跳文件反例 | 最多2项FIFO、EOF确认去重/有效重传；旧决策身份缺口另列，不拿锁串行冒充身份绑定。 |
+| SAVE-ID-1 / 存量旧A操作可能误B | 军师在两轮后裁定换opaque decision_id；7478789代码层关闭 | 后端UUID/必填expected ID/锁内匹配/无默认front，迟到回包与事件按session+ID，stale不动B不写remember。过期A精确原生GUI调度未实测，Rust真实文件操作+前端归约是限定等价证据。 |
+| SAVE-PATH-1 / 独立168 GUI错落cwd | 7478789单一HOME目录helper，所有写入/固定读取接通，已独审 | 747真GUI HOME所选saved实际落点/hash正确、cwd无误落、关框、fixed后续空/4MiB自动下载和PTY返回通过。新helper拒HOME不可确定/逃逸/悬空等，显式绝对兼容。 |
+| SAVE-PRESENT-1 / 747新stale刷新P2 | 原P1身份/路径已闭；军师另裁单点展示修，ef3216c独立D2放行 | 完整presentation同一构造/缓存/重放；同对象/radio/目录选择保留，Rust26、前端及契约61、check0错误2旧警告。真实AppState settings库未测；纯helper不触settings+stale早返为代码等价，ef真GUI仍待后续统一候选。 |
+| ZM-END-1 / 747真GUI protect skip卡远端 | 33297ef独立D2放行本地整合为08205fa，真实GUI及驱动补验在途 | 原始哨兵实际28B，未覆盖；ZSKIP先CAN再失败，发送等ZFIN后OO，接收增量消费OO并保留shell尾部，静默closing有期限。GNU0.13.1真PTY双向/批量hash、protect原进程exit128和marker通过；不能据此断言普通上传首复合输入丢失已定因。 |
+| ZM-INPUT-OBS / 同原生fixture观察 | 仅观察、未定因，不计已修 | 普通上传后首条复合输入两次无回显，稍后短哨兵可用；未用换触发器冒充原复合场景通过。 |
+| SAVE-STATUS-1 / a1a8e04真GUI | b3fccdc一生产行修复，独审在途 | saved仅在原ok=true更新当前文件已保存文案，null不提前宣称协议完成、false保留失败，ID/session防线不变。定向19通过，先红2项；真实新界面待最终候选。 |
+| ZM-LINUX-OO-OBS / GNU0.12.21rc容器PTY | 独立军师D1已裁GNU兼容接收策略，另卡在途 | send全矩阵、recv空文件/protect及同TTY下一传输通过；纯管道+容器内部真PTY96KiB见OO且hash/DONE正确，但4MiB仍hash正确、peer exit0而未见OO。不能全归旧双PTY或宣称完整兼容，TCIOFLUSH丢OO仅假设。接收完整文件/ZFIN应答成功与OO有限尾清理分离；发送确认不放宽。 |
+
+第三轮军师保护目标：用户对A的保存/覆盖/跳过只作用A，每个已收文件有稳定恢复身份，目录对应HOME。原互斥锁不足，改为UUID决策和统一目录链；没有缩双向范围或新增用户逐次授权。747第三轮原P1/PATH停止线已满足，新增展示P2单独分诊，不以其否定已关闭安全反例，也不带已知新P2发布。默认范围偏离已明确批准：P2多纳组件1文件以保持同ID本地radio，生产151行较150多1行，不删注释凑数；以固定diff和独立完整复审替代机械压行，保护不降级。
+
+747独立真GUI补验使用源exe `f07e22fa57905aa2dbda47e6942db127ab95e9012766493446d8f2ef5c885972`，每SHA唯一bundleID后重签exe `5e6b44c9548650d8cd5ad89da7607b608dd71bd7e4f3224be0028f9c42b22480`；复用bundleID曾白屏，新唯一ID恢复（未核具体缓存机制，不判源码缺陷）。已实测空/96KiB/4MiB双向与批量hash和同PTY退出/哨兵，活动取消仍未验；protect skip暴露上表阻断。原始无秘密记录为 `/tmp/fs111-zmodem-public-1685499.json`、`/tmp/fs111-zmodem-public-7478789.json`；fixture app/原rz/sshd/agent/控制服务/secret DB/home合成文件均已正常精确回收，用户应用未动。
+
+当前集成工作区fix-mcp-revocation源码为08205fa；协议独立工作区fix-sftp-unknown-size的codex/1.1.1-zmodem-end固定33297ef，继续补验而不改生产源码。B1/B2尚未实施，须底座协议/总体GUI闭合后再接；两新终端工具已裁Dangerous/readOnlyHint=false，沿既有免确认但不绕过Deny，不冒充SFTP原端点语义。
+
+协议收尾D2独立结论：固定ef3216c..33297ef两文件，未发现阻断本地整合的高/中问题；取消幂等、迟到帧不重开、失败不被成功覆盖、timer弱Arc及锁生命周期和保存决策身份链保持。核原始日志terminal248、bridge27，以及GNU0.13.1双向0/96KiB/4MiB/批量hash和protect哨兵/真实退出；初版夹具重复ZRINIT失败已保留并归因夹具，未当产品缺陷。放行仅本地整合/构建，未放行总体验收/发布安装。10秒是协议收尾截止，100ms是驱动空闲检查周期；共享驱动中既有锁/写预算及接收文件操作可能延迟终态，不能称10.1秒端到端硬上限。真实GUI活动取消、同TTY下一传输、实际bridge静默timer及末写失败注入、GNU0.12.21兼容分别补验，不将纯状态机测试冒充整条桥接。
+
+### B1/B2 执行卡（08205fa只读D1）
+
+首卡须等B0当前真实GUI/驱动补验放行；现在只做分解。军师核实现状：begin_send立即hello、效果通道无界、接收仅检查声明大小、Task直接绑定SFTP；下列待建能力不能冒称已有。
+
+| 卡 | 实施边界 | 验收/依赖 |
+| --- | --- | --- |
+| B1a 接收/队列预算 | zsession与bridge两个生产文件，默认≤400生产行。Write前checked实际累计≤4GiB，未知/虚报同样限制；未完成协议缓存、效果数量/字节硬限。同步filter不等队列，不持cur递归cancel；溢出所属轮次粘滞失败，取消/终结独立可达。常量给理由，不新增配置系统。 | 受控状态测实际边界而不分配4GiB；不完整包超限；暂停消费者压满队列；迟到Done/旧轮不得成功；正常空/分块/CRC/GUI批量和定向真GNU帧不误伤。无新工具/任务/远端命令。 |
+| B1b 被动预约/owner/IO | reserve_mcp接稳定FD或固定沙箱，预约零协议输出且回显透传，方向匹配才激活；session/gen/handle归属，MCP单文件（辨合法ZFILE重传）与完整性，create_new归置，独立GUI保存策略。实现窄busy guard及握手/空闲期限。 | 在gate内原子预约，guard在拿gate前后复核。忙期拒普通GUI输入/广播、MCP send、command.run、长持gate文件操作/新任务及MCP close/reconnect；snapshot/status/cancel仍可达。GUI正常拆除允许，并终结任务未知；不为此造全局框架。 |
+| B1c 复用任务backend | tasks窄SFTP/ZMODEM enum、原SFTP注册点及management取消；按handle/gen更新，流结束不能误结其他backend。 | 保留SFTP输出/撤权隐藏；旧owner取消不影响新任务；teardown/IO失联终结未知，取消受理不声称远端退出。暂不暴露工具。 |
+| B2 两工具及真链路 | managed/tool/gate/server、management和授权UI接两项默认off Dangerous/readOnlyHint=false工具。固定POSIX命令与路径引用；原免确认规则保留Deny。 | 双向真实PTY及嵌套目标、任务查询/取消、无GUI手工会话、引用/中文/冲突/超时/断线/撤权及旧SFTP回归，最终统一候选集中验收。 |
+
+B1b—B2由同一新应用/MCP实现上下文串行接续，避免共享文件并行覆盖；实现者不自审。单文件MCP完整性需明确检查ZDATA/ZEOF位置与预期大小，不能只看ZFIN就成功；协议确认仍不是远端SHA/主机/路径认证。各卡独立可编译、按新风险验证，若真实耦合超默认范围先给证据调整，不删取消出口凑行数。
+
+在途依赖调整（独立军师复核）：a1a8e04（源码同08205fa）真实GUI protect保持本轮30B sentinel hash、rz退出128、同TTY下一复合命令及上传；活动128MiB上传/下载分别在可见1.6/18.7MiB时取消，原TTY rz/sz均退出128并恢复命令，后续sz96KiB保存HOME/hash/关框通过。基于这些新证据允许B1a仅资源边界并行独立开发，不提前接B1b/B2、不免除timer/失败门禁。随后同app实际drive静默负测已得CAN（10.015秒）、失败未知提示及原TTY marker；是假peer合法空文件/ZFIN后不发OO，与GNU正测分开，不是手调expire。GNU0.12.21rc recv缺OO新观察独立定位，B1a不改收尾逻辑；若发现与预算相交问题先停该部分定根因，最终整合/交付门禁仍保留。
+
+上述a1a8e04真实GUI证据已冻结为`/tmp/fs111-zmodem-public-a1a8e04.json`，源exe SHA256 `04fe1185f9c1015e18e5e4d5c979d51bbb291ee43337a27166bcd9da5dfa418c`，唯一bundle重签后`a659daf104ba365eb53fefeffb8ecd8b0cd617842adcc25176ff2a7250198200`；QA逐项核owned进程、DB/秘密、socket及合成文件清理完成。新候选所测首条复合命令未复现旧观察，但不由此倒推旧根因。空/4MiB GUI矩阵沿用747和协议PTY原证据，不声称每版全重跑。
+
+GNU源码依据：[lrz.c ackbibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lrz.c/#L2289)最多三次等OO、超时自然返回且调用方返回ZCOMPL；[lsz.c saybibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lsz.c/#L2398)收到ZFIN发送OO，超时/ZCAN也直接返回。它们是实现事实，不冒充通用标准。原始GNU/innerPTY日志和无秘密脚本保存在协议工作区`.cache/1.1.1-protocol-end/`，容器及数据fixture均已清理，无额外依赖或业务环境改动。
+
+B1a197f8d（生产249行）独审发现新P2：CAN提控制槽优先后未统一置cancelling，可能再发送积压普通帧。9650300单点回修（生产66行）已独立D2关闭：同queue锁核轮次、置取消及代次reset，配对失败走控制终态；真实状态机ZSKIP/超限/期限动作经生产映射的暂停消费者回归先红后绿，bridge33通过。原预算terminal252通过；1MiB未解析、1024效果/8MiB及控制原因4KiB是局部准入预算，不能称整个进程内存上限。基线primitive红仅证明原无界通道不拒超量，不是真drive溢出；新SHA真实GNU大文件/GUI留最终候选。
+
+SAVE-STATUS-1 b3fccdc已独立D2放行一行文案修复，19项原日志核过；共享CAN/ZFIN/OO writer故障链获“静态同路由＋局部单测”限定等价本地放行，不称真russh逐点Err/五秒timeout注入。实际断线可补证但不为覆盖率另造生产泛型接口。
+
+B1c-0依赖顺序调整为先窄backend基础，ec93fc2生产93行/三文件已独立D2放行；不碰在途协议文件，不暴露工具。SFTP事件/核验/结束限定SFTP，ZMODEM取消用原handle/gen/watch channel，失联落failed/unverified/settled，不回查当前tap。23绿/两次红为实现者原工具结果转述，无落盘原日志复核；经理将亲跑核心补证。重复watch通知只保证状态/目标幂等，driver必须自闩一次CAN，并在registry/await前释放watch借用。单个term_input忙检查不足：GUI输入还须与预约共享原子边界，后续占用卡按gate协调。另B2-path仅纯引用/命名契约与真实sh参数oracle并行，不提前创建新入口。
+
+OO兼容卡允许第三生产文件pipe.rs的窄tap通知/排空（必要偏离“两文件”估算，默认400生产行仍保留），避免单O/partial tail静默或EOF后永久不进用户网格。只有原pipe读取任务消费，与filter串行并走decoder/录屏/grid/ring/render，原始log不重记；发布尾与释放cur排序，旧尾先于新read，不建任意注入API。完整批次且ZFIN应答/IO成功时缺OO有限结束，精确披露未见OO而不因此CAN；零文件/缺EOF/写错/取消/断线不提升成功。旧完整file缺OO假peer测试验证了当时严格策略的timer可达性，修后预期须改为一次有界成功无CAN，并另保sender缺ZFIN/incompletefile失败，不能把旧预期直接作新契约验收。
+
+### 当前整合及并行卡交接（本地开发，未发版）
+
+OO兼容4808a56已独立D2放行并整合87d9e86，生产395行含原fanout移位，未删保护凑数。terminal全跑256、随后EOF负测1项、bridge33及实际SessionPipe四种尾部/GBK/录屏证据已核；GNU0.12本轮4MiB**确实见OO**，不冒充缺OO新策略的动态验证；新actual app quiet预期待最终统一候选。EOF保守unknown，发送确认及writer限定等价不变。
+
+B2-path166c59e复用shell_quote，真实sh验证中文/引用/字面特殊字符、command cd屏函数及相对目录./屏CDPATH，生产89行。独审指出一个Windows测试P2（本地反斜杠是分隔符，不能沿远端POSIX断言拒绝），aaec69c仅修测试8+/2-；经理作为非实现者固定差异及原4绿日志复审关闭，Windows仅静态分支未原生跑。B1c-0核心另由经理亲跑11/11，日志`/tmp/fs111-b1c0-root-tasks-green.log`，不等同原23/两红。
+
+06bde4b版本卡只改八文件，统一自有包1.1.1，CHANGELOG标开发中；未接工具不写已交付。原一致性selftest2正23反、模拟tag及双metadata为实现者验证，经理另亲验当前版本脚本和结构化锁比较：主12/helper2自有版本、frontend两个根字段改变，第三方依赖集合不变，应用标识/DB派生保持。未打tag/推送/发布/安装，本机已安装版未被替换。
+
+严格单逻辑文件a1e7aa7已独立D2放行（生产112行/一文件）。raw UTF8/名称保真、未知及非法声明区别、位置/CRC重传/同payload重发与重复EOF/第二文件拒绝仅对显式single构造生效，GUI默认不变。三项运行时先红后绿、45 zsession及12 zmodem原日志已核；4GiB边界为受控状态，未真实写4GiB，也未称未来app owner已接好。
+
+稳定IO另卡cc1390a（生产244行/两文件）已提交待独审，仅固定FD/有界源读、沙箱spool与不覆盖commit/错误粘滞/partial保留；8项本地FS绿不等于协议/真实服务器通过。该新模块与strict卡文件集分离并行，后续owner使用其真实接口，不建立第二任务表或执行器。
+
+当前owner卡限定bridge/tasks/sftp快照构造三个文件，先内部闭环后才开放两tool。MCP预约在未尝试固定命令前取消不向干净shell发CAN；最终提交器应在同gate及write锁下最后核owner/cancel、标attempted紧接实际写。握手15s/活动空闲30s暂定内部预算，非端到端硬限；OO10s仍独立。取消请求不等于已执行取消，已采纳取消不得晚成功，但同步commit已知成功不能因稍后请求伪造成unknown或再对shell发CAN。最终QA脚本已准备且contract approved=false，字段/版本/SHA未固定前不运行；此前自建fixture已清理，无生产会话写入。
+
+owner卡现已固定1500daff，独审在途，尚无新tool可调用。IO cc1390a已独立D2放行；8绿为实现者工具结果转述（无落盘原日志），最终经理统一测试补证；flush错误只静态、真实注入为write/sync，硬链成功后unlink失败保持明确部分结果及sticky error，不冒充Ok Receipt。同权限R1 TOCTOU仍保留。
+
+owner范围偏离由经理按证据批准：默认400行，预计闭环520；实际driver异常退出/只存Rx在tap会永久running，须Weak槽DropGuard+closed；被动头at实际为结束偏移，修整包还不足以处理split半头泄露，须共用bounded pending-prefix；新增partial路径也必须同步接撤权hide_paths，故最终四文件655生产行、458测试行。没有新执行器/工具/权限规则或通用框架；用有限文件/固定diff完整独审守住范围，未删注释或省保护凑数字，不要求用户为内部默认预算批准。初版不安全代码不作阶段放行。
+
+1500daff定向bridge41/41、tasks15/15，较早MCP31/31原日志在`/tmp/fs111-owner-{bridge,tasks,mcp}-green.log`；offset oracle先红单列passive-red，不冒称所有split先红。覆盖生产共用probe所有头分块/ordinary echo/wrongdir、真实spool+post-watch commit竞争、guard drop/poison/旧slot/initialpartial，GUI begin_send在cur锁拒pending，GUI取消复用owner且未attempt不CAN。closed driver最前透传stale cur为固定代码+局部guard限定等价，未原生强制abort/全GUI/真PTY；后busy卡及两tool原子接线仍未做，最终QA contract维持false。
+
+1500daff独审未放行，发现两个新增P2并列为当前停止线：完整首ZRQINIT既start又feed产生双ZRINIT；尚未输出的潜在头前缀（普通末尾单*等）在取消/超时Done清sniff、无cur EOF及driver退出时可能丢失。当前只回修此二者：生产共用Start以完整首帧产生唯一响应，pending前缀归owner并经原tail/notify精确一次交回；旧尾先于fresh、发布/closed与owner槽同边界，Drop不拿cur/无await/无强环/poison恢复。bridge单文件自然≤200生产行目标，不为初150预估省顺序保护。须真实共用Start双向及所有split、一Begin/Finish、零握手前Send，以及literal*/partial在cancel/timeout/EOF/driverdrop下红绿；不拿probe全split绿代替Start副作用验证，不把既有41/15当新分支证据。
+
+后续两卡只读方案已核，未实施：busy约7文件220–300生产行，补GUI输入共享gate、各长操作/新提交/MCP关闭重连前后检查及单一BUSY→CONFLICT，read/status/cancel及GUI拆除保留；最后双tool约9文件280–380行，一次接线schema/managed/tier/引导/适配器/27项授权UI，五秒写预算内最后核owner/cancel/授权/root、mark_attempted紧接实际CR写，未知保原handle供查。全部待本轮owner回修独审后推进，未提前暴露半成品入口。
+
+后续实绩：fc60633单文件161生产行关闭owner两P2并独立D2放行；bridge45全跑及tail-poison追加1项，受控实际pipe证据不冒充native。busy76881fd七文件146生产行已D2放行，保留保守Busy可能先于旧gen Unavailable的非阻断优先级，仍无旧写。双tool b9ac065九文件284生产行两路独审，schema/权限/发现/UI放行；adapter发现预约拒绝遗留未登记空partial，c219817单文件20行已D2关闭：明确accepted/command_attempted=false并返回真实安全恢复相对路径，无假taskid，不删除已受理恢复文件。
+
+8dc4f33为c219代码加操作guide/索引/CHANGELOG，root亲验core426、app bridge50/mcp36/io8、前端全量1713通过+条件跳过的跨语言1项定向补齐，fmt/版本/文档与嵌入资源native构建通过。该候选exe SHA256为50416134ae09818e702af196cd2c8dd220f02d4f6659a4da12e236f94a60a22b。最终QA首个headless空文件上传即阻断：zsh-f执行command cd不会切当前目录，protocol_confirmed但文件误落B cwd而非所给qa-files。只读同TTY对照确证，不以“非POSIX”排除常见现场，不把协议确认冒充路径验证；其余矩阵未验，私有fixture已精确回收，证据`/tmp/fs111-final-public-8dc4f3364d36.json`。
+
+79363f7针对该实际落点root回修三生产文件14行，新增/调整测试另计；固定/bin/sh -c脚本与目录位置参数，argv0占位/$1精确、内层cd失败不rz、外层cwd保持，上传依赖/bin/sh+rz而下载sz，不要求人工exec sh。独立D2核真实sh/bash/zsh-f先红后绿36项及两rmcp断言各1，准重建后重新QA；stub oracle不是修后真实SSH，旧8dc反例仍保留。当前功能源码已冻结，正式发布/安装未执行。
+
+
+### 最终验收新反例：接收效果背压（a4a2cd7）
+
+a4a2cd7 代码同 79363f7，原生嵌入资源候选 exe SHA-256 为 `78613d1174ce18b8da5035ad18e2798c42a338bedf51492c87fb63f7ceadcd71`。独立真实 headless MCP 通过同机两个不同 hostkey/端口/CWD 的 loopback SSH，嵌套进入 B：空文件与 96 KiB 双向哈希及 4 MiB 上传落点正确，旧 zsh cd 误落反例关闭。4 MiB 下载在 bytes_done=1,956,864 时失败，spool=904,192，差值约 1028 个 1 KiB Write，符合 1024 项效果上限而非 8 MiB 字节上限。证据 `/tmp/fs111-final-public-a4a2cd7cc972.json`；此候选停止后未重放，全部自建进程、秘密/DB、socket 与合成文件已回收。两端同一物理机，不称跨机验证；原有 SFTP 仍针对原连接端点。
+
+军师独立 D1 裁定：同步 filter 继续不等待，原 pipe 单读取任务在效果队列高低水位处暂停 source.read，把背压传回容量 16 的 ChannelReader。限定 bridge.rs/pipe.rs，512 项或 4 MiB 暂停，项数 ≤256 且字节 ≤2 MiB 恢复；保留 1024/8 MiB 硬拒绝，独立 CAN/Done、FIFO、原代次/owner/gate、headless 无 render ACK 均不改变。stop、尾部、取消、reset、驱动退出必须可达且无丢失唤醒；不得把 driver 与 pipe 的 Notify 混为两个竞争消费者。默认 ≤400 生产变更行，独立固定差异 D2 后才重建 QA。仅提高预算、合并 Write 或添加 sz 参数不足以修复持续积压。
+
+拒绝只广告 ZRINIT Rxbuflen 的备选：GNU 0.12.21rc lsz.c 的 Rxbuflen→ZCRCW 停等分支在 `#if 0` 内，非字符输入还可能覆写 Rxbuflen；不能据旗标存在声称通用兼容。验收须涵盖 high→pause→low→resume、两预算及 FIFO，暂停期间 stop/tail/取消/换代、异常单批超限控制出口；真 GNU 0.12/0.13 PTY 的 4 MiB、至少一路 128 MiB 正常下载及活动取消，覆盖 GUI 手动 sz 与 MCP、最终 hash/落点和同 PTY 哨兵。新候选仍须补 optional OO 的实际静默 timer 预期和最新保存文案；旧严格 OO 失败证据不冒充新策略成功。
+
+
+91548ba 已实现上述背压卡，仅两源码文件、90 生产变更行，4 项新测试。独立 D2 固定 a4a2cd7..91548ba，无新增高中发现，放行仅本地候选/真实 QA；软水位允许一个读块超调，不保证任意异常输入不触发硬限。原始 terminal267/bridge53 日志及旧 pipe 暂停仍读的红例已复核；受控真实 SessionPipe+EffectQueue 的 4/128 MiB 连续流不是 GNU/AppState 验收。经理另亲跑 core427 通过、0 ignored，fmt/diffcheck/文档链接通过，custom-protocol 原生构建成功，exe SHA-256 `7808ba6f864b4a8c91010bca8d642fa148480dd7acef19e5bb6eb3a6dfed808b`，dist index `0ed746aac0e014014ddae86b80f6b0b7ef7597034c5af24c07ab15c7bce812fc`。日志 `/tmp/fs111-b1flow-root-core.log`、`/tmp/fs111-b1flow-native-build.log`；开始绑定新候选实际 QA，尚未解除最终停止线。
+
+
+### b9af4e0 统一候选在途结果与 D3 文案修正
+
+候选 b9af4e0 代码同 91548ba，源 exe `7808ba6f864b4a8c91010bca8d642fa148480dd7acef19e5bb6eb3a6dfed808b`，独立 fixture 重签 exe `42b8d0c66804493c3f19960dda58c799208d0366f71fe3560b09ef497f5e4c8e`；公开证据 `/tmp/fs111-final-public-b9af4e06dff4.json`。经理另亲跑 app bridge53，日志 `/tmp/fs111-b1flow-root-bridge.log`。以下仅记录已实际观察，最终清理和 Linux 取消定位尚在途。
+
+- macOS 原生 GNU 0.13：嵌套 SSH 的 headless MCP 下载 4 MiB/128 MiB 实际字节、SHA 一致，128 MiB 约16秒；活动下载取消后原 TTY exit128、哨兵和下一空文件任务完成。五类名称/大小（空、96 KiB、4 MiB、引号中文、前导横线）双向 hash 通过；已存在目标不覆盖。
+- 新候选 GUI：手动 sz 4 MiB hash/HOME 落点/关框和“文件已保存”正确。rz 等待选择取消 exit128；活动 rz128 MiB 在1.6 MiB取消、活动 sz128 MiB 在24.2 MiB取消，预置复合命令输出exit128，证明协议进程退出、原shell继续执行；活动上传后的首次新GUI输入未证，原时序观察保留。这些是 GNU0.13 的真实 GUI 结果，不冒充 Linux0.12。
+- optional OO：实际 app 静默完成尾清理约10.084733秒，一次成功披露“未观察到 OO”，peer静默12.05秒未收到CAN、exit0；两个时间分别属于 app 与 peer，不混作硬耗时承诺。
+- 真实 MCP 边界：忙期同sid新任务 CONFLICT，读屏/状态与另sid可用；撤权后已知任务仍可查公开进度但隐藏全部路径/partial和error，新上传FORBIDDEN，恢复自建clone许可后原任务完成。旧句柄取消不影响新任务/4 MiB hash；上传../越界PATH_DENIED；旧 SFTP96 KiB双向sha256_match且无terminal metadata。autoReceive=false显式MCP96 KiB下载通过；globalenabled=false明确UNSUPPORTED，自建设置已恢复。GUI27项勾选计数、intentional超时和重连代次未在本次原生穷举，仍以已有受控/同core证据限定。
+- Linux GNU0.12：正常4 MiB真实传输/hash及peer同形CAN基线分别通过。旧 docker-it 多PTY取消只得本地cancelled、残流和首printf无回显；新 nonTTY hexplain+innerPTY 产品适配确认一次CAN完整write-all，无短写，但20秒未见独立sz退出文件。两反例保留，不能推断自然退出，也不能凭未见退出就把wrapper/termios/排水差异认定为产品根因；仅追加一张定量观测卡，不无证重刷参数。
+- 原生 MCP 上传活动取消的首printf同样在本地终态后即注入，见rz removed及新prompt但无该printf，不能据此判卡死或证明退出码；GUI预置退出标记另列，不作为首次新GUI输入通过的证据。取消状态仍明确unverified/对端未知，没有把本地busy释放伪称远端就绪。
+
+D3预审未发现需回退源码的契约矛盾，要求三处必要文案修正已纳入工作树：顶部状态同步背压已实现；guide明确错误若仍含transfer_id/observe_with必须先查原任务不得重交；local_relative_path未完成时只是计划落点，不能据字段存在宣称文件已交付。最终独立复核待固定文案与新观测结果。未push/发布/安装，安装版及真实服务器未改。
+
+
+### GNU0.12 取消最终补证与探针纠正
+
+经理对同一 image 只读核实：`python3` 为 `/usr/local/bin/python3`，`/usr/bin/python3` 不存在。此前退出 wrapper 使用后者，且从未生成start记录；“20秒无exit文件”是退出oracle未建立，不能作为peer仍存活/卡tcdrain的证据。TTY观测已核CAN时noncanonical、无ISIG，relay排空且输出停止增长，也不足以反推独立退出；原-it链具体影响仍未复原，不据此宣称旧夹具已通过或产品缺陷已证。未因该误判修改应用源码。
+
+仅修自管测试wrapper为已证路径，fresh同 b9af/同源exe，随机fixture BID `dd2b8bf74c`、重签exe `b471ef09a7a81779654cc6f330a0667afb93f659600583b2b1d8dbff427a068c`；新汇总 `/tmp/fs111-peerexit-public-b9af4e06dff4-dd2b8bf74c.json`，原b9公共记录未覆盖。每向先经wrapper --version生成start/exit0，再确认真实GNU PID活着且为原TTY前台进程组，唯一CAN写入后独立wait记录exit128，之后才发同TTY命令。
+
+| GNU0.12 产品链场景 | 取消前进度 / 134217728字节 | 已核结果 |
+| --- | --- | --- |
+| MCP terminal.download / sz | 189440字节 | cancelled/unverified；16B CAN完整write-all无短写，独立自然exit128，随后同TTY marker；inner shell自然exit0。 |
+| MCP terminal.upload / rz | 146432字节 | cancelled/unverified；16B CAN完整write-all无短写，独立自然exit128，随后同TTY marker；inner shell自然exit0。 |
+
+经理亲读两个原始JSON核 source/fixture hash、preflight/live/cancel/peer/marker/cleanup，不仅转述passed字段。报告位于协议工作区 `.cache/1.1.1-protocol-end/cancel-probe/product-oracle-fixed-sz-f10fa32452.json` 和 `product-oracle-fixed-rz-e64142ddf4.json`。两任务仍诚实返回本地取消/对端未知；测试借独立peer观测取得退出证据，未把该特定结果推广为协议普遍保证。范围为真实loopback SSH→raw relay→nonTTY Docker→GNU0.12 innerPTY，不冒充真实137服务器或原-it故障链复现。自管sid/container/目录均已核回收，全局fixture清理由独立QA最终核对；总体D3尚待固定本文与完整汇总。
+
+
+### 本轮本地交付收口
+
+独立D3固定4657cad亲读指南、记录、原始测试日志、两份公共QA及GNU0.12原始报告并复核报告hash，未发现需回退源码的阻断；要求两处GUI证据措辞收窄已逐字纳入：活动rz的预置退出标记不冒充首次新GUI输入通过，旧首输入时序观察保留。最终仅文档变化，功能代码仍同91548ba、实测源码b9af。GUI首次新输入/全选反选持久化、故意握手超时及活动重连代次的未原生穷举边界继续明确，不为指标重启现场。
+
+两轮独立QA及D3只读核实owned目录/bundle/上传下载根已不存在，app、两sshd、agent、容器、自管会话、private key/DB/token与socket精确回收；源测试及公开证据保留，用户安装版和真实服务器不变。本轮完成1.1.1本地开发、所列验收及独立复审；不包含push/tag/正式发布/安装授权。后续发布须另核对应平台与制品门禁，不将macOS开发候选当跨平台安装包验证。
+
+
+### 1.1.1 发布阶段续接（2026-11-08）
+
+用户在本地交付后明确要求“要发布的”，此前仅本地开发的授权限制由本次新请求扩展为push/PR合main/tag/正式Release；本机安装替换未纳入此请求。复用现有release/版本门禁/三平台完整CI和安装smoke，不降低原门禁。当前release/1.1.1从7efebe9准备，源码不变，更新CHANGELOG日期、工具指南及既有发版/人工记录；远端main核为73ed9eff，尚无v1.1.1。正式构建、附件、SHA及来源证明以对应远端实际结果为准。
+
+
+### 发布门禁回修（PR #21）
+
+release/1.1.1 的be4cfa0已推送，PR #21完整CI（42477824216；push同源42477719523）实际停在Clippy，不能将后续跳过项记通过。c8767ef将read取消结果的先is_none后unwrap改显式match，保None/取消优先与原Intent/Settled事实，独立D2关闭；原取消11和MCP139+21通过。f21e141只清理发送closing测试的单元素循环，所有deadline/CAN/unknown/重复expire/cancel断言保持，terminal267与独立D2通过，生产0变化。
+
+完整Clippy继续检出app三处8/7参数签名。经D1，d136c36限定三个文件、112生产变更行：SessionSetup归组rows/cols/headless，TerminalUpdate归组进度/结果/路径，SaveChoice归组dir/name_override/policy；expected_generation、handle/generation与expected_decision_id均保独立显式参数。独立D2亲核22调用原值与求值顺序，函数体/锁/await/身份早返不变，测试不减弱，放行纯参数映射限定等价；不加allow、不降全局阈值。旧GUI/真传输证据按影响引用，不能把旧exe7808当新源码产物。
+
+作者454及appClippy命令未加locked，仅计非锁定本地结果。经理在固定d136c36亲跑：全workspace all-targets Clippy --locked --offline -D warnings通过（13.43s），helper同强度通过（26.31s），app --lib --locked --offline 454通过/0ignored（5.09s）。fmt/版本v1.1.1/文档96目标链接与diffcheck通过；新custom-protocol锁定离线构建通过（15.03s），源exe SHA256 `697909324106312540a94376d918413f2010e2a701226ef43a471fc252dcf8f0`。原始日志 `/tmp/fs111-release-{clippy-final,helper-clippy,app-locked,native-build}.log`。这不是三平台CI或最终安装包结果；后续将重推候选完整CI，并对tag构建DMG做隔离校验/最小映射烟测。

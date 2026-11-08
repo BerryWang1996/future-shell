@@ -18,6 +18,8 @@ pub struct ZmodemStatus {
     pub sandbox: Option<String>,
     /// 自动检测是否开启
     pub auto: bool,
+    /// 最近一次驱动失败；结果可能未知。
+    pub error: Option<String>,
 }
 
 #[tauri::command]
@@ -38,11 +40,13 @@ pub async fn zmodem_status(
             active: false,
             sandbox: None,
             auto: false,
+            error: None,
         },
         Some(t) => ZmodemStatus {
             active: t.active(),
             sandbox: Some(t.sandbox_display()),
             auto: t.auto_enabled(),
+            error: t.failure_message(),
         },
     })
 }
@@ -102,7 +106,7 @@ pub async fn zmodem_reveal(
 ///
 /// 对端 `sz` 的协议超时是几十秒级，不能等用户选完目录再应答——所以协议侧先收进
 /// spool（`.incoming/recv-*.part`），收完发 `needs-decision` 事件，由前端弹框，
-/// 用户的选择经本命令落定。
+/// 用户的选择经本命令落定。返回 true 表示已应用，false 表示身份已过期（无副作用）。
 ///
 /// - `on_conflict`：overwrite（覆盖）/ keep-both（保留两者，同名改 `(n)`）/ skip
 ///   （不要了，删 spool）。
@@ -111,55 +115,53 @@ pub async fn zmodem_reveal(
 #[tauri::command]
 pub async fn zmodem_finalize(
     session_id: String,
+    expected_decision_id: String,
     dir: String,
     name: Option<String>,
     on_conflict: String,
     remember: Option<bool>,
     state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let app = state.app.clone();
-    let tap = state
+    let Some(tap) = state
         .zmodem
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&session_id)
         .cloned()
-        .ok_or("该会话未启用终端内传输")?;
-    match tap.finalize_from_ipc(&dir, name.as_deref(), &on_conflict)? {
-        Some((fname, path, bytes)) if on_conflict != "skip" => {
-            if let Some(fixed) = remember {
-                write_download_mode(&state, fixed.then_some(dir.clone())).await?;
-            }
-            use tauri::Emitter as _;
-            let _ = app.emit(
-                "zmodem:progress",
-                serde_json::json!({
-                    "sessionId": session_id,
-                    "phase": "saved",
-                    "name": fname,
-                    "path": path.display().to_string(),
-                    "done": bytes,
-                    "total": Some(bytes),
-                    "message": "",
-                    "file_index": null,
-                    "file_count": null,
-                    "suggestedDir": null,
-                    "spoolPath": null,
-                    "conflict": null,
-                }),
-            );
-            Ok(())
-        }
-        // skip：spool 已删、没有落地文件——不再发 saved（前端自己收尾提示）。
-        Some(_) => {
-            if let Some(fixed) = remember {
-                write_download_mode(&state, fixed.then_some(dir.clone())).await?;
-            }
-            Ok(())
-        }
-        // 没有待归置的下载（前端重复确认）：幂等成功，不是错误。
-        None => Ok(()),
-    }
+    else {
+        return Ok(false);
+    };
+    let Some((fname, path, bytes)) =
+        tap.finalize_from_ipc(&expected_decision_id, &dir, name.as_deref(), &on_conflict)?
+    else {
+        tap.present_pending_download();
+        return Ok(false); // stale：不写设置、不操作其它待决项。
+    };
+    let remembered = if let Some(fixed) = remember {
+        write_download_mode(
+            &state,
+            fixed.then(|| path.parent().unwrap().to_string_lossy().into_owned()),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    use tauri::Emitter as _;
+    let _ = app.emit(
+        "zmodem:progress",
+        serde_json::json!({
+            "sessionId": session_id, "decisionId": expected_decision_id,
+            "phase": if on_conflict == "skip" { "skipped" } else { "saved" },
+            "name": fname, "path": (on_conflict != "skip").then(|| crate::zmodem_bridge::display_path(&path)),
+            "done": bytes, "total": Some(bytes), "message": "",
+            "file_index": null, "file_count": null, "suggestedDir": null,
+            "spoolPath": null, "conflict": null,
+        }),
+    );
+    tap.present_pending_download();
+    remembered?;
+    Ok(true)
 }
 
 /// 写 `term.zmodem.download`。`Some(dir)` = fixed 模式，`None` = ask 模式。

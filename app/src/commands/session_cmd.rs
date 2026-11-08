@@ -161,8 +161,11 @@ pub(crate) async fn open_session_core(
                 session_id_c.clone(),
                 &profile,
                 handle,
-                24,
-                80,
+                SessionSetup {
+                    rows: 24,
+                    cols: 80,
+                    headless: require_mcp_permission,
+                },
                 None,
             )
             .await
@@ -195,6 +198,13 @@ fn is_valid_env_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// 会话装配时使用的终端尺寸与展示模式。
+pub struct SessionSetup {
+    pub rows: u32,
+    pub cols: u32,
+    pub headless: bool,
+}
+
 /// session_open 与 session_reconnect（Task 22）共用的会话装配。
 /// rows/cols 统一 u32（russh request_pty/window_change 收 u32；F5）。
 /// `state` 提供 app/registry/db/vault/pending 及子系统关停入口，供末尾的断线 watchdog
@@ -205,10 +215,14 @@ pub async fn establish_session(
     session_id: String,
     profile: &Profile,
     handle: russh::client::Handle<fs_sshengine::connect::Connector>,
-    rows: u32,
-    cols: u32,
+    setup: SessionSetup,
     expected_generation: Option<u64>,
 ) -> Result<(), String> {
+    let SessionSetup {
+        rows,
+        cols,
+        headless,
+    } = setup;
     let app = state.app.clone();
     let registry = state.registry.clone();
     // S291：先装配新通道（channel/pty/shell 均可失败），**成功后**才收尾旧条目并替换注册表。
@@ -282,33 +296,35 @@ pub async fn establish_session(
             fs_terminal::decode::StreamDecoder::default()
         }
     };
-    let mut pipe = fs_terminal::SessionPipe::spawn(
-        reader,
-        fs_terminal::PipeOpts {
-            grid_rows: rows as u16,
-            grid_cols: cols as u16,
-            // 审计2 #35：滚动回看行数取自连接配置（档案校验已拦 >MAX；0/None 按默认）。
-            // 旧实现恒用固定默认值——用户在档案里改的 scrollback 从不生效。
-            scrollback_lines: profile
-                .term
-                .scrollback_lines
-                .map(|v| v as usize)
-                .unwrap_or(fs_terminal::grid::DEFAULT_SCROLLBACK_LINES),
-            flow: Default::default(),
-            ring_bytes: fs_terminal::ring::DEFAULT_RING_BYTES,
-            // M4a 会话纯文本日志：settings 键 session.log 决定开关/目录/模板/追加。
-            // 未开启时为 None（零开销）；建不出来（目录不可写）亦为 None，不阻断连接。
-            session_log: state
-                .build_session_log(&session_id, &profile.host, &profile.username)
-                .await,
-            // 未启用（沙箱不可用）时为 None：整条 fan-out 零开销，不是「装一个恒透传的」
-            tap: zmodem_tap
-                .clone()
-                .map(|t| t as std::sync::Arc<dyn fs_terminal::pipe::ByteTap>),
-            record: Some(recorder),
-            decoder,
-        },
-    );
+    let pipe_opts = fs_terminal::PipeOpts {
+        grid_rows: rows as u16,
+        grid_cols: cols as u16,
+        // 审计2 #35：滚动回看行数取自连接配置（档案校验已拦 >MAX；0/None 按默认）。
+        // 旧实现恒用固定默认值——用户在档案里改的 scrollback 从不生效。
+        scrollback_lines: profile
+            .term
+            .scrollback_lines
+            .map(|v| v as usize)
+            .unwrap_or(fs_terminal::grid::DEFAULT_SCROLLBACK_LINES),
+        flow: Default::default(),
+        ring_bytes: fs_terminal::ring::DEFAULT_RING_BYTES,
+        // M4a 会话纯文本日志：settings 键 session.log 决定开关/目录/模板/追加。
+        // 未开启时为 None（零开销）；建不出来（目录不可写）亦为 None，不阻断连接。
+        session_log: state
+            .build_session_log(&session_id, &profile.host, &profile.username)
+            .await,
+        // 未启用（沙箱不可用）时为 None：整条 fan-out 零开销，不是「装一个恒透传的」
+        tap: zmodem_tap
+            .clone()
+            .map(|t| t as std::sync::Arc<dyn fs_terminal::pipe::ByteTap>),
+        record: Some(recorder),
+        decoder,
+    };
+    let mut pipe = if headless {
+        fs_terminal::SessionPipe::spawn_headless(reader, pipe_opts)
+    } else {
+        fs_terminal::SessionPipe::spawn(reader, pipe_opts)
+    };
     let rx = pipe.render_rx(); // take 语义：rx 交给泵任务，pipe 本体进注册表
                                // 审计 P0-4/P0-5（重连的另一半）：旧连接的 SFTP 通道与传输管理器必须在此关停。
                                // 只换注册表条目而不动这两张表，旧代次的 worker 会带着一条已死的 russh Handle
@@ -359,6 +375,7 @@ pub async fn establish_session(
     let generation = registry.insert(
         session_id.clone(),
         Arc::new(crate::sessions::LiveSession {
+            headless,
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             pipe: Arc::new(pipe),
             write: tokio::sync::Mutex::new(write_half),
@@ -426,11 +443,27 @@ pub async fn term_input(
             return sp.link.write(bytes).await;
         }
     }
-    let session = state.registry.get(&session_id).ok_or("no session")?;
+    let (generation, session) = state
+        .registry
+        .get_with_generation(&session_id)
+        .ok_or("no session")?;
+    // operation_gate 与写锁共用原 3 秒锁预算；预约和普通输入不能交错插入字节。
+    let lock_deadline = tokio::time::Instant::now() + WRITE_LOCK_TIMEOUT;
+    let _operation = tokio::time::timeout_at(
+        lock_deadline,
+        crate::zmodem_bridge::idle_operation_gate(session.operation_gate.clone(), || {
+            crate::zmodem_bridge::mcp_terminal_busy(&state, &session_id)
+        }),
+    )
+    .await
+    .map_err(|_| "会话操作锁等待超时".to_string())??;
+    if state.registry.generation_of(&session_id) != Some(generation) {
+        return Err("会话已变化，未发送输入".into());
+    }
     // 写半部 Mutex 串行化保证输入字节顺序；data_bytes 收 impl Into<Bytes>（Vec<u8> 可入；F5）
     // S289：guard 具名绑定——链式临时量在块尾与 session 的 drop 次序冲突（E0597）
     // 审计2 #39：锁与写入各带等待预算（见常量注释），超时如实报错。
-    let guard = tokio::time::timeout(WRITE_LOCK_TIMEOUT, session.write.lock())
+    let guard = tokio::time::timeout_at(lock_deadline, session.write.lock())
         .await
         .map_err(|_| format!("写锁等待超时（{} 秒）", WRITE_LOCK_TIMEOUT.as_secs()))?;
     tokio::time::timeout(DATA_BYTES_TIMEOUT, guard.data_bytes(bytes))
@@ -587,7 +620,14 @@ pub(crate) async fn close_core(
         .as_ref()
         .map(|(_, session)| session.operation_gate.clone());
     let _guard = match &lock {
-        Some(lock) => Some(lock.lock().await),
+        Some(lock) if reject_busy => Some(
+            crate::zmodem_bridge::idle_operation_gate(lock.clone(), || {
+                crate::zmodem_bridge::mcp_terminal_busy(state, session_id)
+            })
+            .await
+            .map_err(|_| SessionControlError::Busy)?,
+        ),
+        Some(lock) => Some(lock.clone().lock_owned().await),
         None => None,
     };
     if bound.as_ref().is_some_and(|(generation, _)| {
@@ -678,7 +718,15 @@ pub(crate) async fn reconnect_core(
         .get_with_generation(session_id)
         .ok_or(SessionControlError::Unavailable)?;
     let gate = session.operation_gate.clone();
-    let _guard = gate.lock().await;
+    let _guard = if mcp {
+        crate::zmodem_bridge::idle_operation_gate(gate, || {
+            crate::zmodem_bridge::mcp_terminal_busy(state, session_id)
+        })
+        .await
+        .map_err(|_| SessionControlError::Busy)?
+    } else {
+        gate.lock_owned().await
+    };
     if expected.is_some_and(|g| g != generation)
         || state.registry.generation_of(session_id) != Some(generation)
     {
@@ -1122,8 +1170,11 @@ pub async fn reconnect_loop(
                     session_id.clone(),
                     &profile,
                     handle,
-                    rows,
-                    cols,
+                    SessionSetup {
+                        rows,
+                        cols,
+                        headless: session.headless,
+                    },
                     Some(generation),
                 )
                 .await
@@ -1419,8 +1470,13 @@ mod tests {
         // 两处写锁等待：term_input 一处、term_resize 一处（同一缺陷类别的同源修复）
         assert_eq!(
             line_eq("let guard = tokio::time::timeout(WRITE_LOCK_TIMEOUT, session.write.lock())"),
-            2,
-            "term_input 与 term_resize 都必须带写锁等待预算"
+            1,
+            "term_resize 保留写锁等待预算"
+        );
+        assert_eq!(
+            line_eq("let guard = tokio::time::timeout_at(lock_deadline, session.write.lock())"),
+            1,
+            "term_input 的操作门锁与写锁共用同一锁截止时间"
         );
     }
 

@@ -546,3 +546,29 @@ fn drop_after_runtime_gone_does_not_panic() {
     // Drop 不得 panic（内部不得有运行时依赖操作）。
     drop(pipe);
 }
+
+#[tokio::test]
+async fn headless_reads_past_render_backpressure_without_ack() {
+    let (mut writer, reader) = duplex(64 * 1024);
+    let mut pipe = SessionPipe::spawn_headless(reader, opts());
+    let mut rx = pipe.render_rx();
+    let payload = vec![b'x'; 3 * 1024 * 1024];
+    tokio::time::timeout(Duration::from_secs(3), writer.write_all(&payload))
+        .await
+        .expect("headless reader stalled on GUI backpressure")
+        .unwrap();
+    writer.write_all(b"\r\nHEADLESS_END\r\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pipe.grid_text().contains("HEADLESS_END") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("last bytes must reach grid");
+    assert!(pipe.ring_snapshot_text().contains("HEADLESS_END"));
+    drop(writer);
+    assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .is_none());
+}
