@@ -104,6 +104,8 @@ pub struct ZmodemSession {
     /// offset 仍是 0，旧判据会把对端「收妥」的 ZRINIT 误认成**初始** ZRINIT，
     /// 于是把同一个文件再发一遍——多文件队列里 0 字节文件会变成原地重发。
     eof_sent: bool,
+    /// 当前文件已上报 FileSent；重复确认或迟到重传不能再次完成它。
+    file_sent: bool,
     /// 当前文件的 ZFILE 已发出。
     ///
     /// 对端（真 rz）在会话起步时会把 ZRINIT **连发两遍**：一遍是它自己的启动
@@ -130,6 +132,7 @@ impl ZmodemSession {
             out_size: 0,
             frame_open: false,
             eof_sent: false,
+            file_sent: false,
             zfile_sent: false,
             crc32_mode: true,
         }
@@ -153,6 +156,7 @@ impl ZmodemSession {
             out_size: size,
             frame_open: false,
             eof_sent: false,
+            file_sent: false,
             zfile_sent: false,
             crc32_mode: true,
         }
@@ -291,6 +295,7 @@ impl ZmodemSession {
         self.out_size = size;
         self.offset = 0;
         self.eof_sent = false;
+        self.file_sent = false;
         self.zfile_sent = true; // 下一个 ZFILE 由本方法自己发出
         self.frame_open = false;
         self.phase = Phase::Handshake; // 等 ZRPOS
@@ -401,10 +406,13 @@ impl ZmodemSession {
 
             // ── 发送侧 ──
             (Direction::Send, FrameKind::ZRINIT) => {
-                if self.eof_sent {
+                if self.file_sent {
+                    // 驱动尚未消费 FileSent 时，同块/跨块重复确认都忽略。
+                } else if self.eof_sent {
                     // ZEOF 之后对端回 ZRINIT = 当前文件收妥。**不直接收尾**：
                     // 队列里可能还有下一个文件，那是 app 层才知道的事
                     // （状态机不碰文件系统）。交给它决定：next_file 或 finish。
+                    self.file_sent = true;
                     out.push(Action::FileSent);
                 } else if self.zfile_sent {
                     // 当前文件的 ZFILE 已经发过了——这是对端重复的 ZRINIT
@@ -415,6 +423,11 @@ impl ZmodemSession {
                 }
             }
             (Direction::Send, FrameKind::ZRPOS) => {
+                if self.file_sent {
+                    return; // 已确认文件不能再被迟到请求重开。
+                }
+                // 有效重传重新等待本次 ZEOF 的确认。
+                self.eof_sent = false;
                 // ZRPOS 是「从这个偏移开始发」，**不是**一个可选的续传特性开关：
                 // 它既是首次开传（位置 0），也是 ZMODEM 唯一的重传机制——对端一旦
                 // 校验出错就发 ZRPOS(已收字节数) 要求回退重发。早先这里把非零位置
@@ -660,6 +673,46 @@ mod tests {
             stream = rest;
         }
         out
+    }
+
+    #[test]
+    fn duplicate_eof_ack_does_not_skip_middle_file() {
+        let mut s = ZmodemSession::new_send("a.bin", 1);
+        s.feed(&hdr(FrameKind::ZRINIT, 0));
+        for (index, name) in ["a.bin", "b.bin", "c.bin"].iter().enumerate() {
+            s.feed(&hdr(FrameKind::ZRPOS, 0));
+            s.feed_file_chunk(&[index as u8]);
+            // EOF 发过仍可有效回退重传，随后才确认完成。
+            let retry = s.feed(&hdr(FrameKind::ZRPOS, 0));
+            assert!(retry
+                .iter()
+                .any(|a| matches!(a, Action::NeedChunk { offset: 0 })));
+            s.feed_file_chunk(&[index as u8]);
+            let mut ack = hdr(FrameKind::ZRINIT, 0);
+            ack.extend(hdr(FrameKind::ZRINIT, 0));
+            let actions = s.feed(&ack);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::FileSent))
+                    .count(),
+                1,
+                "{name} can complete only once"
+            );
+            assert!(s.feed(&hdr(FrameKind::ZRINIT, 0)).is_empty());
+            assert!(
+                s.feed(&hdr(FrameKind::ZRPOS, 0)).is_empty(),
+                "completed file cannot restart"
+            );
+            if index < 2 {
+                let next = ["b.bin", "c.bin"][index];
+                assert_eq!(zfile_names(&s.next_file(next, 1)), vec![next.to_string()]);
+            }
+        }
+        assert!(s
+            .finish()
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: true, .. })));
     }
 
     /// **多文件发送：两文件队列走完整帧序，第二个 ZFILE 真的发出去了。**

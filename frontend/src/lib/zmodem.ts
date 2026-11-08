@@ -129,6 +129,7 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
     case "saved":
       return {
         ...prev,
+        decision: null,
         visible: true,
         needFile: false,
         name: ev.name || prev.name,

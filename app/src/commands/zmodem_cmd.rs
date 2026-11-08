@@ -129,7 +129,7 @@ pub async fn zmodem_finalize(
         .get(&session_id)
         .cloned()
         .ok_or("该会话未启用终端内传输")?;
-    match tap.finalize_from_ipc(&dir, name.as_deref(), &on_conflict)? {
+    let result = match tap.finalize_from_ipc(&dir, name.as_deref(), &on_conflict)? {
         Some((fname, path, bytes)) if on_conflict != "skip" => {
             if let Some(fixed) = remember {
                 write_download_mode(&state, fixed.then_some(dir.clone())).await?;
@@ -163,7 +163,10 @@ pub async fn zmodem_finalize(
         }
         // 没有待归置的下载（前端重复确认）：幂等成功，不是错误。
         None => Ok(()),
-    }
+    };
+    // saved(A) 必须先于 needs-decision(B)，否则旧事件会盖掉下一项。
+    tap.present_pending_download();
+    result
 }
 
 /// 写 `term.zmodem.download`。`Some(dir)` = fixed 模式，`None` = ask 模式。

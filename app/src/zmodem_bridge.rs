@@ -194,8 +194,9 @@ pub struct ZmodemTap {
     /// 收完待归置的下载（spool 路径 + 对端声明的原名）。
     ///
     /// `Effect::Finish` 收完一个文件时填入；`zmodem_finalize` 命令消费它。
-    /// 任何时刻至多一个（协议上 Finish 之后才有下一个 Begin）。
-    pending_finalize: Mutex<Option<PendingFinalize>>,
+    /// 最多两个：队首未决时下一个已收完，先登记后归置队首；失败立即取消。
+    /// 空闲时拒绝新传输，恢复记录不跨传输累积。
+    pending_finalize: Mutex<std::collections::VecDeque<PendingFinalize>>,
     /// 本会话真正落地的最终路径集合（reveal 的白名单，见 [`Self::resolve_received`]）。
     finalized: Mutex<std::collections::HashSet<PathBuf>>,
     tx: mpsc::UnboundedSender<QueuedEffect>,
@@ -262,7 +263,7 @@ impl ZmodemTap {
             connection_generation: AtomicU64::new(0),
             failure: Mutex::new(None),
             session_download_dir: Mutex::new(None),
-            pending_finalize: Mutex::new(None),
+            pending_finalize: Mutex::new(Default::default()),
             finalized: Mutex::new(Default::default()),
             tx,
         });
@@ -301,6 +302,9 @@ impl ZmodemTap {
         let mut cur = self.cur.lock().unwrap();
         if cur.is_some() || self.cancelling.load(Ordering::SeqCst) {
             return Err("该会话已有传输在进行或正在取消".into());
+        }
+        if !self.pending_finalize.lock().unwrap().is_empty() {
+            return Err("请先保存已接收的文件，再开始新传输".into());
         }
         let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
         *self.failure.lock().unwrap() = None;
@@ -448,6 +452,35 @@ impl ZmodemTap {
             return Err("目标目录为空".into());
         }
         finalize_download(self, &self.session_id, Path::new(dir), name, on_conflict)
+    }
+
+    /// 仅展示恢复队首；调用方须先发前一项 saved，再发下一项提示。
+    pub fn present_pending_download(&self) {
+        let Some(pending) = self.pending_finalize.lock().unwrap().front().cloned() else {
+            return;
+        };
+        let dir = self
+            .session_download_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| default_download_dir(&self.sandbox));
+        let name = fs_sshengine::sandbox::escape_local_component(&pending.orig_name);
+        emit_progress_full(
+            &self.app,
+            &self.session_id,
+            "needs-decision",
+            &name,
+            None,
+            pending.bytes,
+            Some(pending.bytes),
+            "choose-dir",
+            None,
+            None,
+            Some(&display_path(&dir)),
+            Some(&display_path(&pending.spool)),
+            None,
+        );
     }
 
     /// 把状态机动作翻译成副作用并投递。
@@ -619,6 +652,12 @@ impl ByteTap for ZmodemTap {
             } else {
                 Cow::Owned(tail)
             };
+        }
+
+        if !self.pending_finalize.lock().unwrap().is_empty() {
+            // 已收数据先交用户保存，不接纳另一轮以免恢复队列累积。
+            self.sniff.lock().unwrap().clear();
+            return Cow::Borrowed(chunk);
         }
 
         // 空闲：嗅探帧起始。滑窗与本块拼一起再找，否则被读块切开的帧头认不出来。
@@ -916,41 +955,44 @@ async fn drive(
                         continue;
                     }
                 };
-                // 上一个文件的决策还没被消费（用户没答、下一个文件已收完）：
-                // 按兜底策略先归置它——建议目录 + keep-both。**不能直接覆盖**，
-                // 覆盖会让它的 spool 成为 .incoming 里再没人引用的孤儿，
-                // 而用户那边看起来是「少了一个文件」。
-                if tap.pending_finalize.lock().unwrap().is_some() {
-                    let dir = tap
-                        .session_download_dir
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_else(|| default_download_dir(&tap.sandbox));
-                    match finalize_download(&tap, &session_id, &dir, None, "keep-both") {
-                        Ok(Some((name, path, bytes))) => emit_progress(
-                            &app,
-                            &session_id,
-                            "saved",
-                            &name,
-                            Some(&path),
-                            bytes,
-                            Some(bytes),
-                            "",
-                        ),
-                        Ok(None) => {}
-                        Err(error) => {
-                            emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
-                            let _ = tap.cancel();
-                            continue;
-                        }
+                let dir = tap
+                    .session_download_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| default_download_dir(&tap.sandbox));
+                // 登记与归置持同一把锁，IPC 不会抢先消费 A 导致 fallback 误保存 B。
+                let result = retain_received(
+                    &mut tap.pending_finalize.lock().unwrap(),
+                    &tap.session_download_dir,
+                    &tap.finalized,
+                    &session_id,
+                    PendingFinalize {
+                        spool,
+                        orig_name,
+                        bytes,
+                    },
+                    &dir,
+                );
+                match result {
+                    Ok(Some((name, path, bytes))) => emit_progress(
+                        &app,
+                        &session_id,
+                        "saved",
+                        &name,
+                        Some(&path),
+                        bytes,
+                        Some(bytes),
+                        "",
+                    ),
+                    Ok(None) => {}
+                    Err(error) => {
+                        *tap.failure.lock().unwrap() = Some(error.clone());
+                        emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                        let _ = tap.cancel();
+                        continue;
                     }
                 }
-                *tap.pending_finalize.lock().unwrap() = Some(PendingFinalize {
-                    spool: spool.clone(),
-                    orig_name: orig_name.clone(),
-                    bytes,
-                });
                 // 归置决策。设置读取要查库（async），这里正好在驱动任务里。
                 decide_and_maybe_finalize(&app, &state, &tap, &session_id).await;
             }
@@ -1075,7 +1117,7 @@ async fn drive(
                 let failure = tap.failure_message();
                 let ok = ok && failure.is_none();
                 let message = failure.unwrap_or_else(|| {
-                    if ok && tap.pending_finalize.lock().unwrap().is_some() {
+                    if ok && !tap.pending_finalize.lock().unwrap().is_empty() {
                         "协议传输完成，文件等待保存".into()
                     } else {
                         message
@@ -1093,6 +1135,9 @@ async fn drive(
                     &message,
                 );
                 drop(cur);
+                if !ok {
+                    tap.present_pending_download();
+                }
             }
         }
     }
@@ -1272,11 +1317,11 @@ mod tests {
         std::fs::write(&spool, b"received").unwrap();
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
-        let mut slot = Some(PendingFinalize {
+        let mut slot = std::collections::VecDeque::from([PendingFinalize {
             spool: spool.clone(),
             orig_name: "payload".into(),
             bytes: 8,
-        });
+        }]);
         let selected = Mutex::new(None);
         let finalized = Mutex::new(Default::default());
         assert!(finalize_pending(
@@ -1289,7 +1334,7 @@ mod tests {
             "keep-both"
         )
         .is_err());
-        assert_eq!(slot.as_ref().unwrap().spool, spool);
+        assert_eq!(slot.front().unwrap().spool, spool);
         assert_eq!(std::fs::read(&spool).unwrap(), b"received");
         assert!(finalized.lock().unwrap().is_empty());
         let destination = dir.path().join("out");
@@ -1304,8 +1349,82 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(slot.is_none());
+        assert!(slot.is_empty());
         assert_eq!(std::fs::read(saved.1).unwrap(), b"received");
+    }
+
+    #[test]
+    fn failed_previous_finalize_preserves_both_received_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let mut pending = std::collections::VecDeque::new();
+        let selected = Mutex::new(None);
+        let finalized = Mutex::new(Default::default());
+        for (name, data) in [
+            ("a.bin", b"first".as_slice()),
+            ("b.bin", b"second".as_slice()),
+        ] {
+            let spool = dir.path().join(format!("{name}.part"));
+            std::fs::write(&spool, data).unwrap();
+            let result = retain_received(
+                &mut pending,
+                &selected,
+                &finalized,
+                "s",
+                PendingFinalize {
+                    spool,
+                    orig_name: name.into(),
+                    bytes: data.len() as u64,
+                },
+                &blocked,
+            );
+            if name == "a.bin" {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        // B 完成后，A 的 fallback 失败；终结传输也不能删除任一恢复归属。
+        assert!(finalize_pending(
+            &mut pending,
+            &selected,
+            &finalized,
+            "s",
+            &blocked,
+            None,
+            "keep-both"
+        )
+        .is_err());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|p| (p.orig_name.as_str(), p.bytes))
+                .collect::<Vec<_>>(),
+            vec![("a.bin", 5), ("b.bin", 6)]
+        );
+        for (name, data) in [
+            ("a.bin", b"first".as_slice()),
+            ("b.bin", b"second".as_slice()),
+        ] {
+            let (saved_name, path, bytes) = finalize_pending(
+                &mut pending,
+                &selected,
+                &finalized,
+                "s",
+                &dir.path().join("out"),
+                None,
+                "keep-both",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(saved_name, name);
+            assert_eq!(bytes, data.len() as u64);
+            assert_eq!(std::fs::read(path).unwrap(), data);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(finalized.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1701,7 +1820,7 @@ async fn decide_and_maybe_finalize(
     });
     let dir = choose_download_dir(&tap.session_download_dir, from_setting);
 
-    let Some(pending) = tap.pending_finalize.lock().unwrap().clone() else {
+    let Some(pending) = tap.pending_finalize.lock().unwrap().front().cloned() else {
         return;
     };
     // 展示名沿用旧避让逻辑的清洗（不改变盘上事实，只让文案里不出现裸控制字符）
@@ -1831,8 +1950,34 @@ fn finalize_download(
     .inspect_err(|error| *tap.failure.lock().unwrap() = Some(error.clone()))
 }
 
+/// 驱动串行调用；第二项归置失败即取消，后续 Finish 不再准入，最多两项。
+fn retain_received(
+    slot: &mut std::collections::VecDeque<PendingFinalize>,
+    session_dir: &Mutex<Option<PathBuf>>,
+    finalized: &Mutex<std::collections::HashSet<PathBuf>>,
+    session_id: &str,
+    received: PendingFinalize,
+    fallback_dir: &Path,
+) -> Result<Option<(String, PathBuf, u64)>, String> {
+    let previous = !slot.is_empty();
+    slot.push_back(received);
+    if previous {
+        finalize_pending(
+            slot,
+            session_dir,
+            finalized,
+            session_id,
+            fallback_dir,
+            None,
+            "keep-both",
+        )
+    } else {
+        Ok(None)
+    }
+}
+
 fn finalize_pending(
-    slot: &mut Option<PendingFinalize>,
+    slot: &mut std::collections::VecDeque<PendingFinalize>,
     session_dir: &Mutex<Option<PathBuf>>,
     finalized: &Mutex<std::collections::HashSet<PathBuf>>,
     session_id: &str,
@@ -1840,7 +1985,7 @@ fn finalize_pending(
     name_override: Option<&str>,
     policy: &str,
 ) -> Result<Option<(String, PathBuf, u64)>, String> {
-    let Some(pending) = slot.as_ref() else {
+    let Some(pending) = slot.front() else {
         return Ok(None);
     };
     let result = run_finalize(
@@ -1852,7 +1997,7 @@ fn finalize_pending(
         name_override,
         policy,
     )?;
-    *slot = None;
+    slot.pop_front();
     Ok(result)
 }
 

@@ -19,6 +19,19 @@ const ev = (p: Partial<ZmodemProgress>): ZmodemProgress => ({
 });
 
 describe("zmodem 前端归约", () => {
+  it("failed A/B recovery saves A then presents B and closes the final decision", () => {
+    let v = reduce(IDLE, ev({ phase: "failed", message: "destination unavailable" }));
+    v = reduce(v, ev({ phase: "needs-decision", name: "a.bin", done: 5, total: 5 }));
+    v = reduce(v, ev({ phase: "saved", name: "a.bin", path: "/out/a.bin", done: 5, total: 5 }));
+    expect(v.decision).toBeNull();
+    v = reduce(v, ev({ phase: "needs-decision", name: "b.bin", done: 6, total: 6 }));
+    expect(v.decision?.name).toBe("b.bin");
+    expect(v.total).toBe(6);
+    v = reduce(v, ev({ phase: "saved", name: "b.bin", path: "/out/b.bin", done: 6, total: 6 }));
+    expect(v.decision).toBeNull();
+    expect(v.path).toBe("/out/b.bin");
+  });
+
   it("need-file 只请求选文件，不显示进度条", () => {
     const v = reduce(IDLE, ev({ phase: "need-file" }));
     expect(v.needFile).toBe(true);
