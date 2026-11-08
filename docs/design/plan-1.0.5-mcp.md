@@ -412,3 +412,17 @@ SAVE-STATUS-1 b3fccdc已独立D2放行一行文案修复，19项原日志核过�
 B1c-0依赖顺序调整为先窄backend基础，ec93fc2生产93行/三文件已独立D2放行；不碰在途协议文件，不暴露工具。SFTP事件/核验/结束限定SFTP，ZMODEM取消用原handle/gen/watch channel，失联落failed/unverified/settled，不回查当前tap。23绿/两次红为实现者原工具结果转述，无落盘原日志复核；经理将亲跑核心补证。重复watch通知只保证状态/目标幂等，driver必须自闩一次CAN，并在registry/await前释放watch借用。单个term_input忙检查不足：GUI输入还须与预约共享原子边界，后续占用卡按gate协调。另B2-path仅纯引用/命名契约与真实sh参数oracle并行，不提前创建新入口。
 
 OO兼容卡允许第三生产文件pipe.rs的窄tap通知/排空（必要偏离“两文件”估算，默认400生产行仍保留），避免单O/partial tail静默或EOF后永久不进用户网格。只有原pipe读取任务消费，与filter串行并走decoder/录屏/grid/ring/render，原始log不重记；发布尾与释放cur排序，旧尾先于新read，不建任意注入API。完整批次且ZFIN应答/IO成功时缺OO有限结束，精确披露未见OO而不因此CAN；零文件/缺EOF/写错/取消/断线不提升成功。旧完整file缺OO假peer测试验证了当时严格策略的timer可达性，修后预期须改为一次有界成功无CAN，并另保sender缺ZFIN/incompletefile失败，不能把旧预期直接作新契约验收。
+
+### 当前整合及并行卡交接（本地开发，未发版）
+
+OO兼容4808a56已独立D2放行并整合87d9e86，生产395行含原fanout移位，未删保护凑数。terminal全跑256、随后EOF负测1项、bridge33及实际SessionPipe四种尾部/GBK/录屏证据已核；GNU0.12本轮4MiB**确实见OO**，不冒充缺OO新策略的动态验证；新actual app quiet预期待最终统一候选。EOF保守unknown，发送确认及writer限定等价不变。
+
+B2-path166c59e复用shell_quote，真实sh验证中文/引用/字面特殊字符、command cd屏函数及相对目录./屏CDPATH，生产89行。独审指出一个Windows测试P2（本地反斜杠是分隔符，不能沿远端POSIX断言拒绝），aaec69c仅修测试8+/2-；经理作为非实现者固定差异及原4绿日志复审关闭，Windows仅静态分支未原生跑。B1c-0核心另由经理亲跑11/11，日志`/tmp/fs111-b1c0-root-tasks-green.log`，不等同原23/两红。
+
+06bde4b版本卡只改八文件，统一自有包1.1.1，CHANGELOG标开发中；未接工具不写已交付。原一致性selftest2正23反、模拟tag及双metadata为实现者验证，经理另亲验当前版本脚本和结构化锁比较：主12/helper2自有版本、frontend两个根字段改变，第三方依赖集合不变，应用标识/DB派生保持。未打tag/推送/发布/安装，本机已安装版未被替换。
+
+严格单逻辑文件a1e7aa7已独立D2放行（生产112行/一文件）。raw UTF8/名称保真、未知及非法声明区别、位置/CRC重传/同payload重发与重复EOF/第二文件拒绝仅对显式single构造生效，GUI默认不变。三项运行时先红后绿、45 zsession及12 zmodem原日志已核；4GiB边界为受控状态，未真实写4GiB，也未称未来app owner已接好。
+
+稳定IO另卡cc1390a（生产244行/两文件）已提交待独审，仅固定FD/有界源读、沙箱spool与不覆盖commit/错误粘滞/partial保留；8项本地FS绿不等于协议/真实服务器通过。该新模块与strict卡文件集分离并行，后续owner使用其真实接口，不建立第二任务表或执行器。
+
+当前owner卡限定bridge/tasks/sftp快照构造三个文件，先内部闭环后才开放两tool。MCP预约在未尝试固定命令前取消不向干净shell发CAN；最终提交器应在同gate及write锁下最后核owner/cancel、标attempted紧接实际写。握手15s/活动空闲30s暂定内部预算，非端到端硬限；OO10s仍独立。取消请求不等于已执行取消，已采纳取消不得晚成功，但同步commit已知成功不能因稍后请求伪造成unknown或再对shell发CAN。最终QA脚本已准备且contract approved=false，字段/版本/SHA未固定前不运行；此前自建fixture已清理，无生产会话写入。
