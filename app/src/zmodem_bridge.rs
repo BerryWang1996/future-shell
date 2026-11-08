@@ -27,7 +27,9 @@
 //! - 不自动决定覆盖：目标同名时改名为 `name (1).ext` 而不是覆盖或询问——传输
 //!   是异步发生的，弹窗询问期间对端在等，超时会让整条传输失败得莫名其妙。
 
-use crate::mcp::tasks::{Snapshot, Task, TaskBackend, TerminalMetadata, TerminalOutcome};
+use crate::mcp::tasks::{
+    Snapshot, Task, TaskBackend, TerminalMetadata, TerminalOutcome, TerminalUpdate,
+};
 use crate::zmodem_mcp_io::{DownloadSink, UploadSource};
 use fs_terminal::pipe::ByteTap;
 use fs_terminal::zmodem::detect_start;
@@ -973,11 +975,13 @@ impl ZmodemTap {
             state.mcp_tasks.terminal_update(
                 &owner.request.handle,
                 owner.request.generation,
-                owner.done,
-                owner.total,
-                Some(outcome),
-                local,
-                partial,
+                TerminalUpdate {
+                    bytes_done: owner.done,
+                    bytes_total: owner.total,
+                    outcome: Some(outcome),
+                    local_relative_path: local,
+                    partial_relative_path: partial,
+                },
             );
         }
         // settle-before-drop：读查询遇 closed receiver 时不会把已知成功覆盖成未知。
@@ -1741,11 +1745,13 @@ async fn drive(
                 state.mcp_tasks.terminal_update(
                     &owner.request.handle,
                     owner.request.generation,
-                    owner.done,
-                    owner.total,
-                    None,
-                    None,
-                    None,
+                    TerminalUpdate {
+                        bytes_done: owner.done,
+                        bytes_total: owner.total,
+                        outcome: None,
+                        local_relative_path: None,
+                        partial_relative_path: None,
+                    },
                 );
                 match (&mut owner.request.io, &queued.effect) {
                     (McpTransferIo::Download { .. }, Effect::Begin { size, .. }) => {
@@ -2896,9 +2902,11 @@ mod tests {
                 &finalized,
                 "s",
                 &id,
-                Path::new(raw),
-                None,
-                "keep-both",
+                SaveChoice {
+                    dir: Path::new(raw),
+                    name_override: None,
+                    policy: "keep-both",
+                },
             )
             .unwrap()
             .unwrap();
@@ -2944,9 +2952,11 @@ mod tests {
             &finalized,
             "s1",
             "stale-A-id",
-            &forbidden,
-            None,
-            "skip"
+            SaveChoice {
+                dir: &forbidden,
+                name_override: None,
+                policy: "skip"
+            }
         )
         .unwrap()
         .is_none());
@@ -3012,9 +3022,11 @@ mod tests {
                     &finalized,
                     "s",
                     &a_id,
-                    &out,
-                    None,
-                    "keep-both",
+                    SaveChoice {
+                        dir: &out,
+                        name_override: None,
+                        policy: "keep-both",
+                    },
                 )
                 .unwrap()
                 .unwrap();
@@ -3028,7 +3040,16 @@ mod tests {
                 for policy in ["skip", "overwrite", "keep-both"] {
                     let forbidden = root.path().join("must-not-create");
                     assert!(finalize_pending(
-                        &mut slot, &selected, &finalized, "s", stale, &forbidden, None, policy
+                        &mut slot,
+                        &selected,
+                        &finalized,
+                        "s",
+                        stale,
+                        SaveChoice {
+                            dir: &forbidden,
+                            name_override: None,
+                            policy
+                        }
                     )
                     .unwrap()
                     .is_none());
@@ -3045,16 +3066,27 @@ mod tests {
                 &finalized,
                 "s",
                 &b_id,
-                &out,
-                None,
-                "keep-both",
+                SaveChoice {
+                    dir: &out,
+                    name_override: None,
+                    policy: "keep-both",
+                },
             )
             .unwrap()
             .unwrap();
             assert_eq!(std::fs::read(saved.1).unwrap(), b"B");
             assert!(slot.is_empty());
             assert!(finalize_pending(
-                &mut slot, &selected, &finalized, "s", &b_id, &out, None, "skip"
+                &mut slot,
+                &selected,
+                &finalized,
+                "s",
+                &b_id,
+                SaveChoice {
+                    dir: &out,
+                    name_override: None,
+                    policy: "skip"
+                }
             )
             .unwrap()
             .is_none());
@@ -3084,9 +3116,11 @@ mod tests {
             &finalized,
             "s",
             &id,
-            &blocked,
-            None,
-            "keep-both"
+            SaveChoice {
+                dir: &blocked,
+                name_override: None,
+                policy: "keep-both"
+            }
         )
         .is_err());
         assert_eq!(slot.front().unwrap().spool, spool);
@@ -3099,9 +3133,11 @@ mod tests {
             &finalized,
             "s",
             &id,
-            &destination,
-            None,
-            "keep-both",
+            SaveChoice {
+                dir: &destination,
+                name_override: None,
+                policy: "keep-both",
+            },
         )
         .unwrap()
         .unwrap();
@@ -3151,9 +3187,11 @@ mod tests {
             &finalized,
             "s",
             &id,
-            &blocked,
-            None,
-            "keep-both"
+            SaveChoice {
+                dir: &blocked,
+                name_override: None,
+                policy: "keep-both"
+            }
         )
         .is_err());
         assert_eq!(pending.len(), 2);
@@ -3175,9 +3213,11 @@ mod tests {
                 &finalized,
                 "s",
                 &id,
-                &dir.path().join("out"),
-                None,
-                "keep-both",
+                SaveChoice {
+                    dir: &dir.path().join("out"),
+                    name_override: None,
+                    policy: "keep-both",
+                },
             )
             .unwrap()
             .unwrap();
@@ -4507,9 +4547,11 @@ fn finalize_download(
         &tap.finalized,
         session_id,
         expected_decision_id,
-        dir,
-        name_override,
-        policy,
+        SaveChoice {
+            dir,
+            name_override,
+            policy,
+        },
     )
     .inspect_err(|error| *tap.failure.lock().unwrap() = Some(error.clone()))
 }
@@ -4532,14 +4574,22 @@ fn retain_received(
             finalized,
             session_id,
             &id,
-            fallback_dir,
-            None,
-            "keep-both",
+            SaveChoice {
+                dir: fallback_dir,
+                name_override: None,
+                policy: "keep-both",
+            },
         )
         .map(|result| result.map(|(n, p, b)| (n, p, b, id)))
     } else {
         Ok(None)
     }
+}
+
+struct SaveChoice<'a> {
+    dir: &'a Path,
+    name_override: Option<&'a str>,
+    policy: &'a str,
 }
 
 fn finalize_pending(
@@ -4548,10 +4598,13 @@ fn finalize_pending(
     finalized: &Mutex<std::collections::HashSet<PathBuf>>,
     session_id: &str,
     expected_decision_id: &str,
-    dir: &Path,
-    name_override: Option<&str>,
-    policy: &str,
+    decision: SaveChoice<'_>,
 ) -> Result<Option<(String, PathBuf, u64)>, String> {
+    let SaveChoice {
+        dir,
+        name_override,
+        policy,
+    } = decision;
     let Some(pending) = slot.front() else {
         return Ok(None);
     };

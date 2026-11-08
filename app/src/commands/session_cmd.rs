@@ -161,9 +161,11 @@ pub(crate) async fn open_session_core(
                 session_id_c.clone(),
                 &profile,
                 handle,
-                24,
-                80,
-                require_mcp_permission,
+                SessionSetup {
+                    rows: 24,
+                    cols: 80,
+                    headless: require_mcp_permission,
+                },
                 None,
             )
             .await
@@ -196,6 +198,13 @@ fn is_valid_env_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// 会话装配时使用的终端尺寸与展示模式。
+pub struct SessionSetup {
+    pub rows: u32,
+    pub cols: u32,
+    pub headless: bool,
+}
+
 /// session_open 与 session_reconnect（Task 22）共用的会话装配。
 /// rows/cols 统一 u32（russh request_pty/window_change 收 u32；F5）。
 /// `state` 提供 app/registry/db/vault/pending 及子系统关停入口，供末尾的断线 watchdog
@@ -206,11 +215,14 @@ pub async fn establish_session(
     session_id: String,
     profile: &Profile,
     handle: russh::client::Handle<fs_sshengine::connect::Connector>,
-    rows: u32,
-    cols: u32,
-    headless: bool,
+    setup: SessionSetup,
     expected_generation: Option<u64>,
 ) -> Result<(), String> {
+    let SessionSetup {
+        rows,
+        cols,
+        headless,
+    } = setup;
     let app = state.app.clone();
     let registry = state.registry.clone();
     // S291：先装配新通道（channel/pty/shell 均可失败），**成功后**才收尾旧条目并替换注册表。
@@ -1158,9 +1170,11 @@ pub async fn reconnect_loop(
                     session_id.clone(),
                     &profile,
                     handle,
-                    rows,
-                    cols,
-                    session.headless,
+                    SessionSetup {
+                        rows,
+                        cols,
+                        headless: session.headless,
+                    },
                     Some(generation),
                 )
                 .await

@@ -53,6 +53,14 @@ impl TerminalMetadata {
     }
 }
 
+pub struct TerminalUpdate {
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub outcome: Option<TerminalOutcome>,
+    pub local_relative_path: Option<String>,
+    pub partial_relative_path: Option<String>,
+}
+
 pub enum TerminalOutcome {
     Completed,
     Cancelled(String),
@@ -157,12 +165,15 @@ impl TaskRegistry {
         &self,
         handle: &str,
         generation: u64,
-        done: u64,
-        total: Option<u64>,
-        outcome: Option<TerminalOutcome>,
-        local: Option<String>,
-        partial: Option<String>,
+        update: TerminalUpdate,
     ) -> Option<Snapshot> {
+        let TerminalUpdate {
+            bytes_done: done,
+            bytes_total: total,
+            outcome,
+            local_relative_path: local,
+            partial_relative_path: partial,
+        } = update;
         let mut tasks = self.tasks.lock().unwrap();
         let task = tasks.get_mut(handle)?;
         if task.generation != generation
@@ -631,22 +642,44 @@ mod tests {
         )));
         registry.register(task);
         assert!(registry
-            .terminal_update("terminal", 6, 0, None, None, None, None)
+            .terminal_update(
+                "terminal",
+                6,
+                TerminalUpdate {
+                    bytes_done: 0,
+                    bytes_total: None,
+                    outcome: None,
+                    local_relative_path: None,
+                    partial_relative_path: None
+                }
+            )
             .is_none());
         registry.register(super::tests::task(1, 7));
         assert!(registry
-            .terminal_update("1", 7, 0, None, None, None, None)
+            .terminal_update(
+                "1",
+                7,
+                TerminalUpdate {
+                    bytes_done: 0,
+                    bytes_total: None,
+                    outcome: None,
+                    local_relative_path: None,
+                    partial_relative_path: None
+                }
+            )
             .is_none());
         registry.request_cancel("terminal"); // request 可以晚于最后一次取消检查，但早于 durable Receipt 登记。
         let completed = registry
             .terminal_update(
                 "terminal",
                 7,
-                4,
-                Some(4),
-                Some(TerminalOutcome::Completed),
-                Some("file".into()),
-                None,
+                TerminalUpdate {
+                    bytes_done: 4,
+                    bytes_total: Some(4),
+                    outcome: Some(TerminalOutcome::Completed),
+                    local_relative_path: Some("file".into()),
+                    partial_relative_path: None,
+                },
             )
             .unwrap();
         let wire = serde_json::to_value(completed).unwrap();
@@ -664,11 +697,13 @@ mod tests {
             .terminal_update(
                 "terminal",
                 7,
-                0,
-                None,
-                Some(TerminalOutcome::Failed("late".into())),
-                None,
-                None
+                TerminalUpdate {
+                    bytes_done: 0,
+                    bytes_total: None,
+                    outcome: Some(TerminalOutcome::Failed("late".into())),
+                    local_relative_path: None,
+                    partial_relative_path: None
+                }
             )
             .is_none());
         assert_eq!(
@@ -689,13 +724,15 @@ mod tests {
             .terminal_update(
                 "terminal",
                 1,
-                3,
-                None,
-                Some(TerminalOutcome::Failed(
-                    "cleanup failed; target may exist".into(),
-                )),
-                Some("file".into()),
-                Some(".incoming/test.part".into()),
+                TerminalUpdate {
+                    bytes_done: 3,
+                    bytes_total: None,
+                    outcome: Some(TerminalOutcome::Failed(
+                        "cleanup failed; target may exist".into(),
+                    )),
+                    local_relative_path: Some("file".into()),
+                    partial_relative_path: Some(".incoming/test.part".into()),
+                },
             )
             .unwrap();
         let wire = serde_json::to_value(result).unwrap();
@@ -705,11 +742,13 @@ mod tests {
             .terminal_update(
                 "terminal",
                 1,
-                3,
-                Some(3),
-                Some(TerminalOutcome::Completed),
-                None,
-                None
+                TerminalUpdate {
+                    bytes_done: 3,
+                    bytes_total: Some(3),
+                    outcome: Some(TerminalOutcome::Completed),
+                    local_relative_path: None,
+                    partial_relative_path: None
+                }
             )
             .is_none());
     }
