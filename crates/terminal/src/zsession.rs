@@ -1502,29 +1502,19 @@ mod tests {
 
     #[test]
     fn closing_deadline_fails_once_without_peer_input() {
-        for receive in [false] {
-            let mut s = if receive {
-                ZmodemSession::new_receive()
-            } else {
-                ZmodemSession::new_send("x", 0)
-            };
-            if receive {
-                s.feed(&hdr(FrameKind::ZFIN, 0));
-            } else {
-                s.finish();
-            }
-            let deadline = s.close_deadline.unwrap();
-            assert!(s
-                .expire_close(deadline - std::time::Duration::from_millis(1))
-                .is_empty());
-            let actions = s.expire_close(deadline);
-            assert!(
-                matches!(&actions[..], [Action::Send(b), Action::Done { ok: false, message }]
-                if *b == cancel_sequence() && message.contains("未知"))
-            );
-            assert!(s.expire_close(deadline).is_empty());
-            assert!(s.cancel().is_empty());
-        }
+        let mut s = ZmodemSession::new_send("x", 0);
+        s.finish();
+        let deadline = s.close_deadline.unwrap();
+        assert!(s
+            .expire_close(deadline - std::time::Duration::from_millis(1))
+            .is_empty());
+        let actions = s.expire_close(deadline);
+        assert!(
+            matches!(&actions[..], [Action::Send(b), Action::Done { ok: false, message }]
+            if *b == cancel_sequence() && message.contains("未知"))
+        );
+        assert!(s.expire_close(deadline).is_empty());
+        assert!(s.cancel().is_empty());
     }
 
     #[test]
