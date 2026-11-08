@@ -158,6 +158,20 @@ fn check_upload_root(expected: &str, current: Option<&str>) -> Result<(), Manage
     }
 }
 
+fn terminal_reservation_error(message: String, partial: Option<PathBuf>) -> ManagementError {
+    let mut details = json!({"accepted":false,"command_attempted":false});
+    if let Some(name) = partial.as_ref().and_then(|path| path.file_name()) {
+        // DownloadSink creates this exact name under the fixed sandbox's .incoming.
+        details["partial_relative_path"] =
+            json!(Path::new(".incoming").join(name).to_string_lossy());
+    }
+    ManagementError {
+        code: "FS_MCP_CONFLICT",
+        message,
+        partial: Some(details),
+    }
+}
+
 async fn terminal_submit_budget(
     handle: &str,
     write: impl std::future::Future<Output = Result<(), ManagementError>>,
@@ -329,6 +343,10 @@ impl McpManagement {
             _ => unreachable!(),
         };
         let handle = uuid::Uuid::new_v4().to_string();
+        let partial = match &io {
+            McpTransferIo::Download { sink, .. } => Some(sink.partial_path().to_path_buf()),
+            _ => None,
+        };
         let _gate = tap
             .reserve_mcp(
                 &self.state,
@@ -341,7 +359,7 @@ impl McpManagement {
                 },
             )
             .await
-            .map_err(|e| ManagementError::new("FS_MCP_CONFLICT", e))?;
+            .map_err(|e| terminal_reservation_error(e, partial))?;
         // Accepted reservations survive caller cancellation. Every failure preserves its handle.
         let result = async {
             if self.state.registry.generation_of(sid) != Some(generation)
@@ -628,6 +646,57 @@ impl ManagementPort for McpManagement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_terminal_reservation_discloses_real_retained_download_partial_without_task() {
+        use crate::zmodem_mcp_io::DownloadSink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sink = DownloadSink::new(&root, "file", "file").unwrap();
+        let partial = sink.partial_path().to_path_buf();
+        assert!(partial.is_file());
+        drop(sink); // reserve_mcp rejects and drops its request before returning Err.
+        let error =
+            terminal_reservation_error("终端已有传输或待保存文件".into(), Some(partial.clone()));
+        assert_eq!(error.code, "FS_MCP_CONFLICT");
+        let details = error
+            .partial
+            .expect("rejected download must disclose its retained partial");
+        assert_eq!(details["accepted"], false);
+        assert_eq!(details["command_attempted"], false);
+        assert!(details.get("transfer_id").is_none());
+        assert!(details.get("observe_with").is_none());
+        let relative = Path::new(details["partial_relative_path"].as_str().unwrap());
+        assert!(!relative.is_absolute());
+        assert_eq!(root.join(relative), partial);
+        assert_eq!(std::fs::metadata(root.join(relative)).unwrap().len(), 0);
+        let upload = terminal_reservation_error("busy".into(), None);
+        assert!(upload
+            .partial
+            .unwrap()
+            .get("partial_relative_path")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_submission_failure_keeps_written_download_partial_and_handle() {
+        use crate::zmodem_mcp_io::DownloadSink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut sink = DownloadSink::new(&root, "file", "file").unwrap();
+        sink.write_chunk(b"retained data").unwrap();
+        let partial = sink.partial_path().to_path_buf();
+        let error =
+            terminal_submit_budget("registered-handle", async { Err(failed("channel closed")) })
+                .await
+                .unwrap_err();
+        drop(sink);
+        assert_eq!(std::fs::read(partial).unwrap(), b"retained data");
+        let details = error.partial.unwrap();
+        assert_eq!(details["transfer_id"], "registered-handle");
+        assert_eq!(details["observe_with"], "transfer.status");
+        assert!(details.get("accepted").is_none());
+    }
 
     #[tokio::test]
     async fn terminal_submission_budget_preserves_original_handle_and_never_replays() {
