@@ -84,6 +84,46 @@ enum Phase {
     Finished,
 }
 
+/// MCP 单逻辑文件身份；重传不产生第二个 BeginRecv。
+struct SingleReceive {
+    expected_basename: String,
+    first_info_payload: Option<Vec<u8>>,
+}
+
+impl SingleReceive {
+    /// true 是相同逻辑文件的重发。缓存受现有未解析包 1 MiB 上限约束。
+    fn accept_info(&mut self, payload: &[u8], info: &mut FileInfo) -> Result<bool, &'static str> {
+        let raw = std::str::from_utf8(payload).map_err(|_| "文件信息不是 UTF-8")?;
+        let (name, metadata) = raw.split_once('\0').ok_or("文件信息缺少名称终止符")?;
+        if name != self.expected_basename || name != info.name {
+            return Err("对端文件名与预期不一致或被基名化改变");
+        }
+        // 可省略大小，末尾 NUL 是信息子包的合法填充，不把非法值降成未知。
+        info.size = match metadata.trim_end_matches('\0').split_whitespace().next() {
+            None => None,
+            Some(token) => {
+                if !token.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("声明文件大小不合法");
+                }
+                let size = token.parse::<u64>().map_err(|_| "声明文件大小不合法")?;
+                if size > MAX_RECV_BYTES {
+                    return Err("声明文件大小超过上限");
+                }
+                Some(size)
+            }
+        };
+        if let Some(first) = &self.first_info_payload {
+            return if first == payload {
+                Ok(true)
+            } else {
+                Err("仅允许一个逻辑文件")
+            };
+        }
+        self.first_info_payload = Some(payload.to_vec());
+        Ok(false)
+    }
+}
+
 /// ZMODEM 会话。
 pub struct ZmodemSession {
     dir: Direction,
@@ -126,6 +166,7 @@ pub struct ZmodemSession {
     cancel_sent: bool,
     recv_open: bool,
     recv_complete: bool,
+    single_receive: Option<SingleReceive>,
 }
 
 impl ZmodemSession {
@@ -148,7 +189,26 @@ impl ZmodemSession {
             cancel_sent: false,
             recv_open: false,
             recv_complete: false,
+            single_receive: None,
         }
+    }
+
+    /// 显式 MCP 下载：仅接收请求的一个逻辑文件；默认 GUI 构造不变。
+    pub fn new_receive_single(expected_basename: &str) -> Result<Self, &'static str> {
+        if expected_basename.is_empty()
+            || matches!(expected_basename, "." | "..")
+            || expected_basename.contains(['/', '\\'])
+            || expected_basename.trim() != expected_basename
+            || expected_basename.chars().any(char::is_control)
+        {
+            return Err("预期文件名无法原样通过 ZMODEM");
+        }
+        let mut session = Self::new_receive();
+        session.single_receive = Some(SingleReceive {
+            expected_basename: expected_basename.into(),
+            first_info_payload: None,
+        });
+        Ok(session)
     }
 
     /// 新建发送会话（远端 `rz`）：`name` 会被基名化后发给对端。
@@ -176,6 +236,7 @@ impl ZmodemSession {
             cancel_sent: false,
             recv_open: false,
             recv_complete: false,
+            single_receive: None,
         }
     }
 
@@ -442,7 +503,11 @@ impl ZmodemSession {
                 Parsed::Incomplete => (),
                 Parsed::Header(h, used) => {
                     self.buf.drain(..skip + used);
-                    if matches!(
+                    if self.single_receive.is_some()
+                        && matches!(h.kind, FrameKind::ZFILE | FrameKind::ZDATA)
+                    {
+                        self.fail_budget("ZFIN 后不能开始新的文件或数据帧", out);
+                    } else if matches!(
                         h.kind,
                         FrameKind::ZCAN | FrameKind::ZABORT | FrameKind::ZFERR | FrameKind::ZSKIP
                     ) {
@@ -535,7 +600,7 @@ impl ZmodemSession {
             (Direction::Receive, FrameKind::ZRQINIT) => out.push(Action::Send(zrinit())),
             // 文件信息在紧随其后的子包里，可能还没到齐 → 切到显式等待态
             (Direction::Receive, FrameKind::ZFILE) => {
-                if self.recv_open {
+                if self.recv_open && self.single_receive.is_none() {
                     out.extend(self.cancel());
                     return;
                 }
@@ -543,9 +608,23 @@ impl ZmodemSession {
                 self.step_file_info(out);
             }
             (Direction::Receive, FrameKind::ZDATA) => {
+                if self.single_receive.is_some()
+                    && (!self.recv_open || h.position() as u64 != self.offset)
+                {
+                    self.fail_budget("数据帧位置与当前文件不一致", out);
+                    return;
+                }
                 self.phase = Phase::Receiving;
             }
             (Direction::Receive, FrameKind::ZEOF) => {
+                if self.single_receive.is_some()
+                    && self.recv_complete
+                    && !self.recv_open
+                    && h.position() as u64 == self.offset
+                {
+                    out.push(Action::Send(zrinit())); // 相同文件重复 EOF 不再 Finish。
+                    return;
+                }
                 if !self.recv_open
                     || h.position() as u64 != self.offset
                     || self.declared.is_some_and(|size| size != self.offset)
@@ -673,7 +752,26 @@ impl ZmodemSession {
             Parsed2::Subpacket(payload, _, used) => {
                 self.buf.drain(..used);
                 self.phase = Phase::Handshake;
-                let info = parse_file_info(&payload);
+                let mut info = parse_file_info(&payload);
+                if let Some(single) = self.single_receive.as_mut() {
+                    match single.accept_info(&payload, &mut info) {
+                        Err(reason) => {
+                            self.fail_budget(reason, out);
+                            return;
+                        }
+                        Ok(true) => {
+                            out.push(Action::Send(
+                                FrameHeader {
+                                    kind: FrameKind::ZRPOS,
+                                    flags: (self.offset as u32).to_le_bytes(),
+                                }
+                                .to_hex(),
+                            ));
+                            return;
+                        }
+                        Ok(false) => (),
+                    }
+                }
                 if info.name.is_empty() {
                     // 名字不可用（纯 `..`／空）→ 取消，一个字节都不落盘
                     self.phase = Phase::Finished;
@@ -719,6 +817,10 @@ impl ZmodemSession {
             Parsed2::Incomplete => {}
             Parsed2::Bad(used) => {
                 self.buf.drain(..used.min(self.buf.len()));
+                // 严格接收等待带当前位置的 ZDATA 头；坏包后不把帧头当成子包。
+                if self.single_receive.is_some() {
+                    self.phase = Phase::Handshake;
+                }
                 // 数据坏了要让对端重发本帧：ZRPOS 回当前偏移
                 out.push(Action::Send(
                     FrameHeader {
@@ -738,6 +840,10 @@ impl ZmodemSession {
                     self.fail_budget("实际接收文件大小超过上限", out);
                     return;
                 };
+                if self.single_receive.is_some() && self.declared.is_some_and(|size| next > size) {
+                    self.fail_budget("实际接收超过声明文件大小", out);
+                    return;
+                }
                 self.offset = next;
                 if !data.is_empty() {
                     out.push(Action::Write(data));
@@ -1927,5 +2033,252 @@ mod tests {
     fn test_helpers_use_same_crc() {
         assert_eq!(crc32(b"abc"), crate::zmodem::crc32(b"abc"));
         assert_eq!(ZPAD, b'*');
+    }
+    fn strict_file(name: &[u8], size: &[u8]) -> Vec<u8> {
+        let mut payload = name.to_vec();
+        payload.push(0);
+        payload.extend_from_slice(size);
+        let mut bytes = FrameHeader {
+            kind: FrameKind::ZFILE,
+            flags: [0, 0, 0, 1],
+        }
+        .to_bin32();
+        bytes.extend(encode_subpacket(&payload, SubpacketEnd::AckEnd, true));
+        bytes
+    }
+
+    fn strict_data(position: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = FrameHeader {
+            kind: FrameKind::ZDATA,
+            flags: position.to_le_bytes(),
+        }
+        .to_bin32();
+        bytes.extend(encode_subpacket(payload, SubpacketEnd::EndFrame, true));
+        bytes
+    }
+
+    #[test]
+    fn strict_rejects_wrong_data_position_before_write() {
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"1"));
+        let actions = s.feed(&strict_data(7, b"x"));
+        assert!(writes(&actions).is_empty());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+    }
+
+    #[test]
+    fn strict_rejects_second_file_after_completed_first() {
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"0"));
+        s.feed(&hdr(FrameKind::ZEOF, 0));
+        let actions = s.feed(&strict_file(b"other", b"0"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::BeginRecv(_))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+    }
+
+    #[test]
+    fn strict_crc_error_retries_at_current_position_without_bad_writes() {
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"2"));
+        assert_eq!(writes(&s.feed(&strict_data(0, b"a"))), b"a");
+        let mut bad = strict_data(1, b"b");
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        let actions = s.feed(&bad);
+        assert!(writes(&actions).is_empty());
+        assert!(sends(&actions)
+            .windows(hdr(FrameKind::ZRPOS, 1).len())
+            .any(|w| w == hdr(FrameKind::ZRPOS, 1)));
+        assert_eq!(writes(&s.feed(&strict_data(1, b"b"))), b"b");
+    }
+    #[test]
+    fn strict_same_zfile_retries_preserve_offset_and_finish_once() {
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        let file = strict_file(b"file", b"4 0 100644");
+        assert_eq!(
+            s.feed(&file)
+                .iter()
+                .filter(|a| matches!(a, Action::BeginRecv(_)))
+                .count(),
+            1
+        );
+        for offset in [0, 2, 4] {
+            if offset == 2 {
+                assert_eq!(writes(&s.feed(&strict_data(0, b"ab"))), b"ab");
+            }
+            if offset == 4 {
+                assert_eq!(writes(&s.feed(&strict_data(2, b"cd"))), b"cd");
+                assert_eq!(
+                    s.feed(&hdr(FrameKind::ZEOF, 4))
+                        .iter()
+                        .filter(|a| matches!(a, Action::FinishRecv { bytes: 4 }))
+                        .count(),
+                    1
+                );
+            }
+            let actions = s.feed(&file);
+            assert!(!actions.iter().any(|a| matches!(
+                a,
+                Action::BeginRecv(_) | Action::FinishRecv { .. } | Action::Done { .. }
+            )));
+            assert_eq!(sends(&actions), hdr(FrameKind::ZRPOS, offset));
+            assert_eq!(s.transferred(), offset as u64);
+        }
+        let duplicate_eof = s.feed(&hdr(FrameKind::ZEOF, 4));
+        assert!(!duplicate_eof
+            .iter()
+            .any(|a| matches!(a, Action::FinishRecv { .. })));
+        assert_eq!(sends(&duplicate_eof), zrinit());
+        s.feed(&hdr(FrameKind::ZFIN, 0));
+        assert!(s
+            .feed(b"OO")
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: true, .. })));
+    }
+
+    #[test]
+    fn strict_rejects_changed_identity_invalid_expected_and_lossy_names() {
+        for name in [
+            "", ".", "..", "a/b", "a\\b", " file", "file ", "file\n", "a\0b",
+        ] {
+            assert!(ZmodemSession::new_receive_single(name).is_err(), "{name:?}");
+        }
+        for raw in [
+            &b"other"[..],
+            &b" file"[..],
+            &b"file "[..],
+            &b"dir/file"[..],
+            &b"fi\xffle"[..],
+        ] {
+            let mut s = ZmodemSession::new_receive_single("file").unwrap();
+            let actions = s.feed(&strict_file(raw, b"0"));
+            assert!(!actions.iter().any(|a| matches!(a, Action::BeginRecv(_))));
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        }
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"0 0 100644"));
+        let actions = s.feed(&strict_file(b"file", b"0 0 100600"));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        assert!(!actions.iter().any(|a| matches!(a, Action::BeginRecv(_))));
+    }
+
+    #[test]
+    fn strict_size_malformed_values_cannot_become_unknown_and_false_sizes_fail() {
+        for size in [
+            &b"-1"[..],
+            &b"+1"[..],
+            &b"oops"[..],
+            &b"18446744073709551616"[..],
+            &b"4294967297"[..],
+            &b"1\xff"[..],
+        ] {
+            let mut s = ZmodemSession::new_receive_single("file").unwrap();
+            let actions = s.feed(&strict_file(b"file", size));
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::BeginRecv(_))),
+                "{size:?}"
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Done { ok: false, .. })),
+                "{size:?}"
+            );
+        }
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"1"));
+        let oversize = s.feed(&strict_data(0, b"ab"));
+        assert!(writes(&oversize).is_empty());
+        assert!(oversize
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"2"));
+        s.feed(&strict_data(0, b"a"));
+        assert!(s
+            .feed(&hdr(FrameKind::ZEOF, 1))
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+    }
+
+    #[test]
+    fn strict_unknown_size_and_empty_files_follow_gnu_style_protocol_frames() {
+        // 纯状态机帧测试：未调用外部 GNU 工具或真实 app/PTY。
+        for (metadata, body) in [
+            (&b""[..], &b"abc"[..]),
+            (&b"\0"[..], &b"abc"[..]),
+            (&b"3\0"[..], &b"abc"[..]),
+            (&b"0 0 100644"[..], &b""[..]),
+        ] {
+            let mut s = ZmodemSession::new_receive_single("file").unwrap();
+            s.feed(&strict_file(b"file", metadata));
+            if !body.is_empty() {
+                assert_eq!(writes(&s.feed(&strict_data(0, body))), body);
+            }
+            let actions = s.feed(&hdr(FrameKind::ZEOF, body.len() as u32));
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::FinishRecv {bytes} if *bytes==body.len() as u64)));
+            s.feed(&hdr(FrameKind::ZFIN, 0));
+            assert!(s
+                .expire_close(std::time::Instant::now() + std::time::Duration::from_secs(11))
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: true, .. })));
+        }
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        assert!(s
+            .feed(&hdr(FrameKind::ZFIN, 0))
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        assert!(writes(&s.feed(&strict_data(0, b"x"))).is_empty());
+        assert!(s.is_finished());
+    }
+
+    #[test]
+    fn strict_unknown_size_actual_cap_and_after_eof_data_are_rejected() {
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b""));
+        s.phase = Phase::Receiving;
+        s.offset = MAX_RECV_BYTES; // 边界注入，不分配/写入 4 GiB。
+        let actions = s.feed(&encode_subpacket(b"x", SubpacketEnd::EndFrame, true));
+        assert!(writes(&actions).is_empty());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        let mut s = ZmodemSession::new_receive_single("file").unwrap();
+        s.feed(&strict_file(b"file", b"0"));
+        s.feed(&hdr(FrameKind::ZEOF, 0));
+        let actions = s.feed(&strict_data(0, b"x"));
+        assert!(writes(&actions).is_empty());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+    }
+    #[test]
+    fn strict_new_file_or_data_after_zfin_is_not_silent_success() {
+        for late in [strict_file(b"file", b"0"), strict_data(0, b"x")] {
+            let mut s = ZmodemSession::new_receive_single("file").unwrap();
+            s.feed(&strict_file(b"file", b"0"));
+            s.feed(&hdr(FrameKind::ZEOF, 0));
+            s.feed(&hdr(FrameKind::ZFIN, 0));
+            let actions = s.feed(&late);
+            assert!(writes(&actions).is_empty());
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: false, .. })));
+            assert!(!s
+                .feed(b"OO")
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: true, .. })));
+        }
     }
 }
