@@ -426,3 +426,9 @@ B2-path166c59e复用shell_quote，真实sh验证中文/引用/字面特殊字符
 稳定IO另卡cc1390a（生产244行/两文件）已提交待独审，仅固定FD/有界源读、沙箱spool与不覆盖commit/错误粘滞/partial保留；8项本地FS绿不等于协议/真实服务器通过。该新模块与strict卡文件集分离并行，后续owner使用其真实接口，不建立第二任务表或执行器。
 
 当前owner卡限定bridge/tasks/sftp快照构造三个文件，先内部闭环后才开放两tool。MCP预约在未尝试固定命令前取消不向干净shell发CAN；最终提交器应在同gate及write锁下最后核owner/cancel、标attempted紧接实际写。握手15s/活动空闲30s暂定内部预算，非端到端硬限；OO10s仍独立。取消请求不等于已执行取消，已采纳取消不得晚成功，但同步commit已知成功不能因稍后请求伪造成unknown或再对shell发CAN。最终QA脚本已准备且contract approved=false，字段/版本/SHA未固定前不运行；此前自建fixture已清理，无生产会话写入。
+
+owner卡现已固定1500daff，独审在途，尚无新tool可调用。IO cc1390a已独立D2放行；8绿为实现者工具结果转述（无落盘原日志），最终经理统一测试补证；flush错误只静态、真实注入为write/sync，硬链成功后unlink失败保持明确部分结果及sticky error，不冒充Ok Receipt。同权限R1 TOCTOU仍保留。
+
+owner范围偏离由经理按证据批准：默认400行，预计闭环520；实际driver异常退出/只存Rx在tap会永久running，须Weak槽DropGuard+closed；被动头at实际为结束偏移，修整包还不足以处理split半头泄露，须共用bounded pending-prefix；新增partial路径也必须同步接撤权hide_paths，故最终四文件655生产行、458测试行。没有新执行器/工具/权限规则或通用框架；用有限文件/固定diff完整独审守住范围，未删注释或省保护凑数字，不要求用户为内部默认预算批准。初版不安全代码不作阶段放行。
+
+1500daff定向bridge41/41、tasks15/15，较早MCP31/31原日志在`/tmp/fs111-owner-{bridge,tasks,mcp}-green.log`；offset oracle先红单列passive-red，不冒称所有split先红。覆盖生产共用probe所有头分块/ordinary echo/wrongdir、真实spool+post-watch commit竞争、guard drop/poison/旧slot/initialpartial，GUI begin_send在cur锁拒pending，GUI取消复用owner且未attempt不CAN。closed driver最前透传stale cur为固定代码+局部guard限定等价，未原生强制abort/全GUI/真PTY；后busy卡及两tool原子接线仍未做，最终QA contract维持false。
