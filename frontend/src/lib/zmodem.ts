@@ -8,6 +8,7 @@
 /** 后端 `zmodem:progress` 的载荷（键集恒定，见 app/src/zmodem_bridge.rs 的 emit_progress）。 */
 export interface ZmodemProgress {
   sessionId: string;
+  decisionId?: string | null;
   /**
    * - `need-file`：远端在跑 `rz`，等我们选本地文件
    * - `receiving` / `sending`：传输中
@@ -19,6 +20,7 @@ export interface ZmodemProgress {
     | "receiving"
     | "sending"
     | "saved"
+    | "skipped"
     | "needs-decision"
     | "done"
     | "failed";
@@ -41,6 +43,8 @@ export interface ZmodemProgress {
 
 /** 一期待用户决策的下载（`needs-decision` 阶段的界面态）。 */
 export interface DownloadDecision {
+  decisionId: string;
+  sessionId: string;
   /** 对端声明的文件名（已清洗） */
   name: string;
   /** 建议目录 */
@@ -126,7 +130,11 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         decision: null,
       };
     }
+    case "skipped":
+      if (prev.decision && (ev.decisionId !== prev.decision.decisionId || ev.sessionId !== prev.decision.sessionId)) return prev;
+      return { ...prev, decision: null, path: null, message: "已跳过该文件", ok: true };
     case "saved":
+      if (prev.decision && (ev.decisionId !== prev.decision.decisionId || ev.sessionId !== prev.decision.sessionId)) return prev;
       return {
         ...prev,
         decision: null,
@@ -149,6 +157,8 @@ export function reduce(prev: TransferView, ev: ZmodemProgress): TransferView {
         done: ev.done,
         total: ev.total ?? prev.total,
         decision: {
+          decisionId: ev.decisionId ?? "",
+          sessionId: ev.sessionId,
           name: ev.name || prev.name,
           suggestedDir: ev.suggestedDir ?? "",
           conflict: ev.conflict ?? false,

@@ -9,6 +9,7 @@ import { IDLE, formatBytes, progressText, ratioOf, reduce, type ZmodemProgress }
 
 const ev = (p: Partial<ZmodemProgress>): ZmodemProgress => ({
   sessionId: "s1",
+  decisionId: "test",
   phase: "receiving",
   name: "",
   path: null,
@@ -110,4 +111,19 @@ describe("zmodem 前端归约", () => {
     expect(formatBytes(-1)).toBe("—");
     expect(formatBytes(Number.NaN)).toBe("—");
   });
+});
+it("late saved/skip for A cannot clear B's decision", () => {
+  const b = reduce(IDLE, ev({phase: "needs-decision", name: "B", decisionId: "B"} as Partial<ZmodemProgress>));
+  for (const phase of ["saved", "skipped"] as const) {
+    expect(reduce(b, ev({phase, name: "A", decisionId: "A"} as Partial<ZmodemProgress>))).toEqual(b);
+  }
+});
+
+it("matching skip closes its decision without a reveal path", () => {
+  const a = reduce(IDLE, ev({phase: "needs-decision", decisionId: "A"}));
+  const skipped = reduce(a, ev({phase: "skipped", decisionId: "A", path: "/must-not-reveal"}));
+  expect(skipped.decision).toBeNull();
+  expect(skipped.path).toBeNull();
+  expect(skipped.message).toContain("跳过");
+  expect(reduce(a, ev({phase: "saved", decisionId: "A", sessionId: "old-connection"}))).toEqual(a);
 });

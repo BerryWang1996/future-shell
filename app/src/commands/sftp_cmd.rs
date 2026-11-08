@@ -49,6 +49,52 @@ pub fn resolve_upload_source(raw: &str) -> Result<PathBuf, String> {
     ensure_within(&browse_root(), raw)
 }
 
+/// 下载选择器返回 HOME 相对目录；绝对目录保留用户原有权限范围。
+pub fn resolve_download_dir(raw: &str) -> Result<PathBuf, String> {
+    resolve_download_dir_at(raw, dirs::home_dir().as_deref())
+}
+
+fn resolve_download_dir_at(raw: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if raw.contains('\0') {
+        return Err("下载目录含 NUL".into());
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let root = home.ok_or("无法确认用户主目录")?;
+    if !root.is_absolute() {
+        return Err("用户主目录不是绝对路径".into());
+    }
+    let mut target = ensure_within(root, "")?;
+    if !target.is_dir() {
+        return Err("用户主目录不是目录".into());
+    }
+    let mut missing = false;
+    for part in path.components() {
+        let Component::Normal(part) = part else {
+            return Err("下载目录必须是安全的 HOME 相对路径".into());
+        };
+        target.push(part);
+        if missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => {
+                // lstat 成功后 canonicalize 失败（包括悬空软链）必须报错。
+                target = ensure_within(root, &target.to_string_lossy())?;
+                if !target.is_dir() {
+                    return Err("下载路径不是目录".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(target)
+}
+
 /// 远端目录列表。`exclude` 是排除过滤器串（M4a），语法见
 /// [`fs_sshengine::filter::ExcludeFilter`]——**同一个匹配器**也用于目录递归传输，
 /// 不许在前端再写一份：两份匹配器一旦分叉，界面上看不见的文件会被传走（或反过来，
@@ -1082,6 +1128,57 @@ mod tests {
 
     /// P2 排队态可见：提交事件必须自带 `state: "Queued"`。
     /// 前端据此把新行初始化为排队而非 Running；引擎真正开跑时的第一条 `Running` 进度事件覆盖它。
+    #[test]
+    fn download_directory_uses_home_and_preserves_picker_names() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        for raw in ["", "new/multilevel", "空 格/  spaced  ", "~", " "] {
+            assert_eq!(
+                super::resolve_download_dir_at(raw, Some(&root)).unwrap(),
+                root.join(raw)
+            );
+        }
+        assert!(super::resolve_download_dir_at("", None).is_err());
+        for raw in ["../escape", "new/../escape", "bad\0dir"] {
+            assert!(super::resolve_download_dir_at(raw, Some(&root)).is_err());
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let absolute = outside.path().join("new/deep");
+        assert_eq!(
+            super::resolve_download_dir_at(absolute.to_str().unwrap(), None).unwrap(),
+            absolute
+        );
+        assert!(!absolute.exists());
+        std::fs::write(root.join("file"), b"x").unwrap();
+        assert!(super::resolve_download_dir_at("file/child", Some(&root)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_directory_rejects_symlinks_and_permission_errors() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.join("outside")).unwrap();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        symlink(root.join("real"), root.join("inside")).unwrap();
+        for raw in ["outside/new", "dangling/new"] {
+            assert!(super::resolve_download_dir_at(raw, Some(&root)).is_err());
+        }
+        assert_eq!(
+            super::resolve_download_dir_at("inside/new", Some(&root)).unwrap(),
+            root.join("real/new")
+        );
+        let denied = root.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = super::resolve_download_dir_at("denied/new", Some(&root));
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+    }
+
     #[test]
     fn submitted_payload_marks_queued() {
         let v = submitted_payload(7, "s1", "down", "C:/sbx/a.bin", "/srv/a.bin");

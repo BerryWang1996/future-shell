@@ -230,6 +230,7 @@ fn cancellation_actions(
 /// 一次待归置的下载。
 #[derive(Clone)]
 struct PendingFinalize {
+    decision_id: String,
     /// spool 文件（sandbox/.incoming/recv-<纳秒>.part）
     spool: PathBuf,
     /// 对端 ZFILE 声明的原始文件名（尚未清洗——清洗在 finalize 时做，
@@ -371,6 +372,7 @@ impl ZmodemTap {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -443,20 +445,25 @@ impl ZmodemTap {
     /// 而本方法保持纯文件操作，便于单测。
     pub fn finalize_from_ipc(
         &self,
+        expected_decision_id: &str,
         dir: &str,
         name: Option<&str>,
         on_conflict: &str,
     ) -> Result<Option<(String, PathBuf, u64)>, String> {
-        let dir = dir.trim();
-        if dir.is_empty() {
-            return Err("目标目录为空".into());
-        }
-        finalize_download(self, &self.session_id, Path::new(dir), name, on_conflict)
+        finalize_download(
+            self,
+            &self.session_id,
+            expected_decision_id,
+            Path::new(dir),
+            name,
+            on_conflict,
+        )
     }
 
     /// 仅展示恢复队首；调用方须先发前一项 saved，再发下一项提示。
     pub fn present_pending_download(&self) {
-        let Some(pending) = self.pending_finalize.lock().unwrap().front().cloned() else {
+        let pending_guard = self.pending_finalize.lock().unwrap();
+        let Some(pending) = pending_guard.front() else {
             return;
         };
         let dir = self
@@ -480,6 +487,7 @@ impl ZmodemTap {
             Some(&display_path(&dir)),
             Some(&display_path(&pending.spool)),
             None,
+            Some(&pending.decision_id),
         );
     }
 
@@ -556,6 +564,7 @@ fn emit_progress(
 ) {
     emit_progress_full(
         app, session_id, phase, name, path, done, total, message, None, None, None, None, None,
+        None,
     )
 }
 
@@ -579,6 +588,7 @@ fn emit_progress_full(
     suggested_dir: Option<&str>,
     spool_path: Option<&str>,
     conflict: Option<bool>,
+    decision_id: Option<&str>,
 ) {
     let _ = app.emit(
         "zmodem:progress",
@@ -595,6 +605,7 @@ fn emit_progress_full(
             "suggestedDir": suggested_dir,
             "spoolPath": spool_path,
             "conflict": conflict,
+            "decisionId": decision_id,
         }),
     );
 }
@@ -968,6 +979,7 @@ async fn drive(
                     &tap.finalized,
                     &session_id,
                     PendingFinalize {
+                        decision_id: uuid::Uuid::new_v4().to_string(),
                         spool,
                         orig_name,
                         bytes,
@@ -975,7 +987,7 @@ async fn drive(
                     &dir,
                 );
                 match result {
-                    Ok(Some((name, path, bytes))) => emit_progress(
+                    Ok(Some((name, path, bytes, decision_id))) => emit_progress_full(
                         &app,
                         &session_id,
                         "saved",
@@ -984,6 +996,12 @@ async fn drive(
                         bytes,
                         Some(bytes),
                         "",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&decision_id),
                     ),
                     Ok(None) => {}
                     Err(error) => {
@@ -1030,6 +1048,7 @@ async fn drive(
                                 "",
                                 Some(t.file_index),
                                 Some(t.file_count),
+                                None,
                                 None,
                                 None,
                                 None,
@@ -1149,7 +1168,7 @@ async fn drive(
 /// `\\?\C:\Users\...`。那个前缀是给 Win32 API 看的（绕过 260 字符与路径规范化），
 /// 直接摆到界面上用户只会以为程序出错了，复制去资源管理器地址栏也不一定认。
 /// 落盘仍用原始 `PathBuf`（前缀有其用处，长路径要靠它），只有显示走这里剥掉。
-fn display_path(p: &Path) -> String {
+pub(crate) fn display_path(p: &Path) -> String {
     let s = p.to_string_lossy();
     match s.strip_prefix(r"\\?\") {
         // UNC 的 verbatim 形式是 `\\?\UNC\server\share`，剥掉前缀后要把
@@ -1310,6 +1329,154 @@ mod tests {
             .is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn download_finalize_home_does_not_depend_on_app_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            let cwd = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "zmodem_bridge::tests::download_finalize_child",
+                    "--nocapture",
+                ])
+                .env("HOME", home.path())
+                .env("FS111_TEST_HOME", home.path())
+                .current_dir(cwd.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            assert_eq!(std::fs::read_dir(cwd.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_finalize_child() {
+        let Some(home) = std::env::var_os("FS111_TEST_HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home).canonicalize().unwrap();
+        for raw in ["", "new/deep", "空 格/  spaced  ", "~"] {
+            let spool = home.join("fixture.part");
+            std::fs::write(&spool, b"HOME payload").unwrap();
+            let pending = PendingFinalize {
+                decision_id: uuid::Uuid::new_v4().to_string(),
+                spool,
+                orig_name: "payload.bin".into(),
+                bytes: 12,
+            };
+            let id = pending.decision_id.clone();
+            let mut slot = std::collections::VecDeque::from([pending]);
+            let selected = Mutex::new(None);
+            let finalized = Mutex::new(Default::default());
+            let (_, path, _) = finalize_pending(
+                &mut slot,
+                &selected,
+                &finalized,
+                "s",
+                &id,
+                Path::new(raw),
+                None,
+                "keep-both",
+            )
+            .unwrap()
+            .unwrap();
+            let expected = home.join(raw);
+            assert_eq!(path.parent().unwrap(), expected);
+            assert_eq!(std::fs::read(path).unwrap(), b"HOME payload");
+            assert_eq!(*selected.lock().unwrap(), Some(expected.clone()));
+            assert_eq!(
+                crate::commands::sftp_cmd::resolve_download_dir(raw).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn decision_identity_survives_both_finalize_lock_orders() {
+        for ipc_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let selected = Mutex::new(None);
+            let finalized = Mutex::new(Default::default());
+            let make = |name: &str| {
+                let spool = root.path().join(format!("{name}.part"));
+                std::fs::write(&spool, name).unwrap();
+                PendingFinalize {
+                    decision_id: uuid::Uuid::new_v4().to_string(),
+                    spool,
+                    orig_name: name.into(),
+                    bytes: 1,
+                }
+            };
+            let a = make("A");
+            let b = make("B");
+            let a_id = a.decision_id.clone();
+            let b_id = b.decision_id.clone();
+            let b_spool = b.spool.clone();
+            let out = root.path().join("out");
+            let mut slot = std::collections::VecDeque::from([a]);
+            if ipc_first {
+                finalize_pending(
+                    &mut slot,
+                    &selected,
+                    &finalized,
+                    "s",
+                    &a_id,
+                    &out,
+                    None,
+                    "keep-both",
+                )
+                .unwrap()
+                .unwrap();
+            }
+            retain_received(&mut slot, &selected, &finalized, "s", b, &out).unwrap();
+            assert_eq!(slot.front().unwrap().decision_id, b_id);
+            std::fs::write(out.join("B"), b"existing B").unwrap();
+            // A 的旧选择、重放、未知/旧连接代次 ID 不能改 B 或定格新目录。
+            let before = selected.lock().unwrap().clone();
+            for stale in [&a_id, "unknown", "old-connection-id"] {
+                for policy in ["skip", "overwrite", "keep-both"] {
+                    let forbidden = root.path().join("must-not-create");
+                    assert!(finalize_pending(
+                        &mut slot, &selected, &finalized, "s", stale, &forbidden, None, policy
+                    )
+                    .unwrap()
+                    .is_none());
+                    assert!(!forbidden.exists());
+                    assert_eq!(*selected.lock().unwrap(), before);
+                    assert_eq!(std::fs::read(&b_spool).unwrap(), b"B");
+                    assert_eq!(std::fs::read(out.join("B")).unwrap(), b"existing B");
+                    assert_eq!(slot.len(), 1);
+                }
+            }
+            let saved = finalize_pending(
+                &mut slot,
+                &selected,
+                &finalized,
+                "s",
+                &b_id,
+                &out,
+                None,
+                "keep-both",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(std::fs::read(saved.1).unwrap(), b"B");
+            assert!(slot.is_empty());
+            assert!(finalize_pending(
+                &mut slot, &selected, &finalized, "s", &b_id, &out, None, "skip"
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
     #[test]
     fn failed_finalize_keeps_pending_for_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1318,17 +1485,20 @@ mod tests {
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
         let mut slot = std::collections::VecDeque::from([PendingFinalize {
+            decision_id: uuid::Uuid::new_v4().to_string(),
             spool: spool.clone(),
             orig_name: "payload".into(),
             bytes: 8,
         }]);
         let selected = Mutex::new(None);
         let finalized = Mutex::new(Default::default());
+        let id = slot.front().unwrap().decision_id.clone();
         assert!(finalize_pending(
             &mut slot,
             &selected,
             &finalized,
             "s",
+            &id,
             &blocked,
             None,
             "keep-both"
@@ -1343,6 +1513,7 @@ mod tests {
             &selected,
             &finalized,
             "s",
+            &id,
             &destination,
             None,
             "keep-both",
@@ -1373,6 +1544,7 @@ mod tests {
                 &finalized,
                 "s",
                 PendingFinalize {
+                    decision_id: uuid::Uuid::new_v4().to_string(),
                     spool,
                     orig_name: name.into(),
                     bytes: data.len() as u64,
@@ -1385,12 +1557,14 @@ mod tests {
                 assert!(result.is_err());
             }
         }
+        let id = pending.front().unwrap().decision_id.clone();
         // B 完成后，A 的 fallback 失败；终结传输也不能删除任一恢复归属。
         assert!(finalize_pending(
             &mut pending,
             &selected,
             &finalized,
             "s",
+            &id,
             &blocked,
             None,
             "keep-both"
@@ -1408,11 +1582,13 @@ mod tests {
             ("a.bin", b"first".as_slice()),
             ("b.bin", b"second".as_slice()),
         ] {
+            let id = pending.front().unwrap().decision_id.clone();
             let (saved_name, path, bytes) = finalize_pending(
                 &mut pending,
                 &selected,
                 &finalized,
                 "s",
+                &id,
                 &dir.path().join("out"),
                 None,
                 "keep-both",
@@ -1668,6 +1844,7 @@ mod tests {
             &fin,
             "t",
             PendingFinalize {
+                decision_id: uuid::Uuid::new_v4().to_string(),
                 spool: spool.clone(),
                 orig_name: "a.txt".into(),
                 bytes: 7,
@@ -1720,6 +1897,7 @@ mod tests {
             &fin,
             "t",
             PendingFinalize {
+                decision_id: uuid::Uuid::new_v4().to_string(),
                 spool,
                 orig_name: "rec.bin".into(),
                 bytes: 1,
@@ -1815,12 +1993,25 @@ async fn decide_and_maybe_finalize(
     let cfg = state.zmodem_config().await;
     // 优先级 ①②：本会话已定 > 设置的 fixed 模式。
     // 读取和定格在同一把锁内完成，不能在 match 临时守卫存活时再次取锁。
-    let from_setting = cfg.download.as_ref().and_then(|d| {
-        (d.mode == crate::state::ZmodemDownloadMode::Fixed).then(|| PathBuf::from(&d.dir))
-    });
+    let from_setting = match cfg
+        .download
+        .as_ref()
+        .filter(|d| d.mode == crate::state::ZmodemDownloadMode::Fixed)
+    {
+        Some(d) => match crate::commands::sftp_cmd::resolve_download_dir(&d.dir) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                emit_progress(app, session_id, "failed", "", None, 0, None, &error);
+                tap.present_pending_download();
+                return;
+            }
+        },
+        None => None,
+    };
     let dir = choose_download_dir(&tap.session_download_dir, from_setting);
 
-    let Some(pending) = tap.pending_finalize.lock().unwrap().front().cloned() else {
+    let pending_guard = tap.pending_finalize.lock().unwrap();
+    let Some(pending) = pending_guard.front().cloned() else {
         return;
     };
     // 展示名沿用旧避让逻辑的清洗（不改变盘上事实，只让文案里不出现裸控制字符）
@@ -1850,9 +2041,10 @@ async fn decide_and_maybe_finalize(
             reason,
             None,
             None,
-            Some(&suggested.display().to_string()),
-            Some(&pending.spool.display().to_string()),
+            Some(&display_path(&suggested)),
+            Some(&display_path(&pending.spool)),
             None,
+            Some(&pending.decision_id),
         );
         return;
     };
@@ -1861,9 +2053,16 @@ async fn decide_and_maybe_finalize(
     // 只是还没建出来，比如 Downloads/FutureShell 首次使用）。
     let target = dir.join(&display_name);
     if !target.exists() {
-        // 无冲突：直接归置，不打扰
-        let (name, path, bytes) = match finalize_download(tap, session_id, &dir, None, "keep-both")
-        {
+        // 无冲突：身份随调用传递，释放展示锁后也不消费别项。
+        drop(pending_guard);
+        let (name, path, bytes) = match finalize_download(
+            tap,
+            session_id,
+            &pending.decision_id,
+            &dir,
+            None,
+            "keep-both",
+        ) {
             Ok(Some((n, p, b))) => (n, p, b),
             Ok(None) => return,
             Err(e) => {
@@ -1873,7 +2072,7 @@ async fn decide_and_maybe_finalize(
                 return;
             }
         };
-        emit_progress(
+        emit_progress_full(
             app,
             session_id,
             "saved",
@@ -1882,6 +2081,12 @@ async fn decide_and_maybe_finalize(
             bytes,
             Some(bytes),
             "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&pending.decision_id),
         );
         return;
     }
@@ -1898,9 +2103,10 @@ async fn decide_and_maybe_finalize(
         "conflict",
         None,
         None,
-        Some(&dir.display().to_string()),
-        Some(&pending.spool.display().to_string()),
+        Some(&display_path(&dir)),
+        Some(&display_path(&pending.spool)),
         Some(true),
+        Some(&pending.decision_id),
     );
 }
 
@@ -1933,6 +2139,7 @@ impl ConflictPolicy {
 fn finalize_download(
     tap: &ZmodemTap,
     session_id: &str,
+    expected_decision_id: &str,
     dir: &Path,
     name_override: Option<&str>,
     policy: &str,
@@ -1943,6 +2150,7 @@ fn finalize_download(
         &tap.session_download_dir,
         &tap.finalized,
         session_id,
+        expected_decision_id,
         dir,
         name_override,
         policy,
@@ -1958,19 +2166,21 @@ fn retain_received(
     session_id: &str,
     received: PendingFinalize,
     fallback_dir: &Path,
-) -> Result<Option<(String, PathBuf, u64)>, String> {
-    let previous = !slot.is_empty();
+) -> Result<Option<(String, PathBuf, u64, String)>, String> {
+    let previous = slot.front().map(|p| p.decision_id.clone());
     slot.push_back(received);
-    if previous {
+    if let Some(id) = previous {
         finalize_pending(
             slot,
             session_dir,
             finalized,
             session_id,
+            &id,
             fallback_dir,
             None,
             "keep-both",
         )
+        .map(|result| result.map(|(n, p, b)| (n, p, b, id)))
     } else {
         Ok(None)
     }
@@ -1981,6 +2191,7 @@ fn finalize_pending(
     session_dir: &Mutex<Option<PathBuf>>,
     finalized: &Mutex<std::collections::HashSet<PathBuf>>,
     session_id: &str,
+    expected_decision_id: &str,
     dir: &Path,
     name_override: Option<&str>,
     policy: &str,
@@ -1988,12 +2199,16 @@ fn finalize_pending(
     let Some(pending) = slot.front() else {
         return Ok(None);
     };
+    if pending.decision_id != expected_decision_id {
+        return Ok(None);
+    }
+    let dir = crate::commands::sftp_cmd::resolve_download_dir(&dir.to_string_lossy())?;
     let result = run_finalize(
         session_dir,
         finalized,
         session_id,
         pending.clone(),
-        dir,
+        &dir,
         name_override,
         policy,
     )?;

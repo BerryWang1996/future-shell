@@ -33,6 +33,19 @@
   let dirPickerOpen = $state(false);
   /** 决策框里当前选定的目录。`null` = 未换过（用后端建议）；`""` = 用户主目录
    *  （目录选择器以相对家目录的路径回报，根就是空串——**与「未选」不是一个值**）。 */
+  let confirmDirectory = $state<(paths: string[]) => void>(() => {});
+  function openDirectoryPicker() {
+    const id = sessionId;
+    const decisionId = view.decision?.decisionId;
+    confirmDirectory = (paths) => {
+      if (sessionId !== id || view.decision?.decisionId !== decisionId) return;
+      dirPickerOpen = false;
+      if (paths[0] !== undefined) decisionDir = paths[0];
+    };
+    dirPickerOpen = true;
+  }
+  let lastDecisionId = "";
+  let lastDecisionSession = "";
   let decisionDir = $state<string | null>(null);
   /** 首次引导的「记住选择」：null=未选（不让确认），"fixed"/"ask"。 */
   let rememberChoice = $state<"fixed" | "ask" | null>(null);
@@ -72,7 +85,18 @@
   // 问去向（first-run/choose-dir）→ 复位记忆单选（目录保持 null=跟随建议）。
   $effect(() => {
     const d = view.decision;
+    if (lastDecisionSession !== sessionId) {
+      lastDecisionSession = sessionId;
+      applyPolicy = null;
+      applyToRest = false;
+    }
     if (!d) return;
+    if (lastDecisionId !== d.decisionId) {
+      lastDecisionId = d.decisionId;
+      decisionDir = null;
+      rememberChoice = null;
+      dirPickerOpen = false;
+    }
     if (d.conflict && applyPolicy) {
       void finalize(effDir(), applyPolicy, null);
       return;
@@ -144,16 +168,24 @@
     onConflict: "overwrite" | "keep-both" | "skip",
     remember: "fixed" | "ask" | null,
   ) {
+    const d = view.decision;
+    const id = sessionId;
+    if (!d || !d.decisionId || d.sessionId !== id) return false;
+    const current = () => sessionId === id && (!view.decision || view.decision.decisionId === d.decisionId);
     try {
-      await invoke("zmodem_finalize", {
-        sessionId,
+      const applied = await invoke<boolean>("zmodem_finalize", {
+        sessionId: id,
+        expectedDecisionId: d.decisionId,
         dir,
         onConflict,
         remember: remember === null ? null : remember === "fixed",
       });
+      if (!applied || !current()) return false;
       if (onConflict === "skip") toast.info("已跳过该文件");
+      return true;
     } catch (e) {
-      toast.error(`保存失败：${e}`);
+      if (current()) toast.error(`保存失败：${e}`);
+      return false;
     }
   }
 
@@ -169,8 +201,8 @@
   async function dismissDecision() {
     const d = view.decision;
     if (!d) return;
-    await finalize(effDir(), "keep-both", null);
-    toast.info(`已保存到 ${dirLabel()}`);
+    const label = dirLabel();
+    if (await finalize(effDir(), "keep-both", null)) toast.info(`已保存到 ${label}`);
   }
 
   async function cancel() {
@@ -253,10 +285,7 @@
     title="选择保存位置"
     mode="directory"
     confirmLabel="用这个目录"
-    onConfirm={(paths) => {
-      dirPickerOpen = false;
-      if (paths[0] !== undefined) decisionDir = paths[0];
-    }}
+    onConfirm={confirmDirectory}
     onCancel={() => (dirPickerOpen = false)}
   />
 {/if}
@@ -302,7 +331,7 @@
         </p>
         <p class="dirline">
           <code data-testid="zm-dec-dir">{dirLabel()}</code>
-          <button data-testid="zm-dec-change" onclick={() => (dirPickerOpen = true)}>更改…</button>
+          <button data-testid="zm-dec-change" onclick={openDirectoryPicker}>更改…</button>
         </p>
         {#if view.decision.reason === "first-run"}
           <fieldset class="remember">
