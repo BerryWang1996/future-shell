@@ -29,6 +29,9 @@ pub const SUBPACKET_BYTES: usize = 1024;
 /// 4 GiB 远超终端里手动 sz 的合理用量；更大的文件应该走 SFTP 面板。
 pub const MAX_RECV_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+// 1 MiB 容纳 GNU 常见 1/8 KiB 子包及最坏转义的充足余量；只约束未解析字节。
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+
 /// 状态机产出的动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -209,25 +212,57 @@ impl ZmodemSession {
 
     /// 喂入对端字节，推进状态机。
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Action> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let mut remaining = chunk;
+        while !remaining.is_empty() {
+            if self.is_finished() {
+                self.buf.extend_from_slice(remaining); // 已完成后的 shell 尾部交还终端。
+                break;
+            }
+            let room = MAX_PENDING_BYTES - self.buf.len();
+            if room == 0 {
+                self.fail_budget("未解析协议缓存超过上限", &mut out);
+                break;
+            }
+            let n = room.min(remaining.len());
+            self.buf.extend_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            self.parse_pending(&mut out);
+            if self.cancel_sent {
+                break;
+            }
+        }
+        out
+    }
+
+    fn fail_budget(&mut self, message: &str, out: &mut Vec<Action>) {
+        self.buf = Vec::new();
+        out.extend(self.cancel());
+        if let Some(Action::Done {
+            message: reason, ..
+        }) = out.last_mut()
+        {
+            *reason = format!("{message}，已取消");
+        }
+    }
+
+    fn parse_pending(&mut self, out: &mut Vec<Action>) {
         loop {
             if self.phase == Phase::Finished {
                 break;
             }
             let before = self.buf.len();
             match self.phase {
-                Phase::AwaitOverAndOut => self.step_over_and_out(&mut out),
-                Phase::Receiving => self.step_receiving(&mut out),
-                Phase::AwaitFileInfo => self.step_file_info(&mut out),
-                _ => self.step_frames(&mut out),
+                Phase::AwaitOverAndOut => self.step_over_and_out(out),
+                Phase::Receiving => self.step_receiving(out),
+                Phase::AwaitFileInfo => self.step_file_info(out),
+                _ => self.step_frames(out),
             }
             // 没有消耗任何字节 = 需要更多输入，退出循环等下一块
             if self.buf.len() == before {
                 break;
             }
         }
-        out
     }
 
     /// 发送侧：app 层把读到的文件块喂进来（对应 [`Action::NeedChunk`]）。
@@ -633,7 +668,15 @@ impl ZmodemSession {
             }
             Parsed2::Subpacket(data, end, used) => {
                 self.buf.drain(..used);
-                self.offset += data.len() as u64;
+                let Some(next) = self
+                    .offset
+                    .checked_add(data.len() as u64)
+                    .filter(|n| *n <= MAX_RECV_BYTES)
+                else {
+                    self.fail_budget("实际接收文件大小超过上限", out);
+                    return;
+                };
+                self.offset = next;
                 if !data.is_empty() {
                     out.push(Action::Write(data));
                 }
@@ -1418,6 +1461,65 @@ mod tests {
                 .any(|w| w.iter().all(|&b| b == ZDLE)),
             "须发取消序列"
         );
+    }
+
+    #[test]
+    fn actual_receive_limit_covers_unknown_and_false_declarations() {
+        for declared in [None, Some(1), Some(MAX_RECV_BYTES)] {
+            let mut s = ZmodemSession::new_receive();
+            s.phase = Phase::Receiving;
+            s.declared = declared;
+            s.offset = MAX_RECV_BYTES - 1;
+            let one = encode_subpacket(b"x", SubpacketEnd::NoAck, true);
+            assert_eq!(writes(&s.feed(&one)), b"x");
+            let actions = s.feed(&one);
+            assert!(writes(&actions).is_empty());
+            assert!(actions.iter().any(|a| matches!(a,
+                Action::Done { ok: false, message } if message.contains("上限"))));
+            assert!(s.is_finished());
+            assert!(s.buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn actual_receive_counter_cannot_wrap() {
+        let mut s = ZmodemSession::new_receive();
+        s.phase = Phase::Receiving;
+        s.offset = u64::MAX;
+        let actions = s.feed(&encode_subpacket(b"x", SubpacketEnd::NoAck, true));
+        assert!(writes(&actions).is_empty());
+        assert!(s.is_finished());
+    }
+
+    #[test]
+    fn large_valid_read_is_parsed_incrementally_without_cache_rejection() {
+        let mut s = ZmodemSession::new_receive();
+        s.phase = Phase::Receiving;
+        let payload = vec![b'x'; 1024];
+        let packet = encode_subpacket(&payload, SubpacketEnd::NoAck, true);
+        let stream = packet.repeat(2048);
+        assert!(stream.len() > 1024 * 1024);
+        let actions = s.feed(&stream);
+        assert_eq!(writes(&actions).len(), 2048 * 1024);
+        assert!(!s.is_finished());
+        assert!(s.buf.is_empty());
+    }
+
+    #[test]
+    fn incomplete_protocol_packet_is_bounded_and_released() {
+        for phase in [Phase::Receiving, Phase::AwaitFileInfo] {
+            let mut s = ZmodemSession::new_receive();
+            s.phase = phase;
+            for _ in 0..16 {
+                assert!(s.feed(&vec![b'x'; 65536]).is_empty());
+            }
+            let actions = s.feed(b"x");
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::Done { ok: false, .. })));
+            assert!(s.is_finished());
+            assert!(s.buf.is_empty());
+        }
     }
 
     /// S334：超上限的声明大小直接取消（防「对端声称 8 EiB」把盘写满）。

@@ -11,7 +11,7 @@
 //! 屏），传完之后整块屏幕都是废的。所以 [`ZmodemTap::filter`] 必须当场决定吞或放。
 //!
 //! 但吞下去之后要做的事全是异步的（往 SSH 写字节要拿会话写锁）。于是状态机在
-//! 拦截器里**同步**推进（纯字节逻辑，纳秒级），产出的副作用投进无界队列，由驱动
+//! 拦截器里**同步**推进（纯字节逻辑，纳秒级），产出的副作用投进有界队列，由驱动
 //! 任务串行执行。队列保序，所以「开文件 → 写数据 → 关文件」的次序天然正确。
 //!
 //! ## 沙箱路径在装配时定格
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 /// 检测滑窗长度：帧头可能被 SSH 读块切开，需带上一块的尾巴一起嗅探。
 ///
@@ -125,6 +125,145 @@ struct QueuedEffect {
     effect: Effect,
 }
 
+// 常见 1 KiB 包积压约 1 MiB 时先触及 1024 项；8 MiB 另限制非标准大包。
+// 只预算排队载荷：不包括当前执行的一个效果和本次 feed 已产出的动作。
+const MAX_QUEUED_EFFECTS: usize = 1024;
+const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+// 控制槽额外最多一个 CAN 和 4 KiB UTF-8 原因，不受普通队列挤占。
+const MAX_CONTROL_MESSAGE_BYTES: usize = 4096;
+const QUEUE_OVERFLOW: &str = "终端传输效果队列超过上限，已取消；对端退出状态未知";
+
+impl Effect {
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Send(b) | Self::Write(b) => b.len(),
+            Self::Begin { name, .. } => name.len(),
+            Self::Done { message, .. } | Self::CancelDone { message } => message.len(),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EffectQueue {
+    round: u64,
+    data: std::collections::VecDeque<QueuedEffect>,
+    bytes: usize,
+    failed: bool,
+    // 独立的两个控制槽，数据满时仍可取消和终结；归属 round。
+    cancel: bool,
+    terminal: Option<Effect>,
+    closed: bool,
+}
+
+impl EffectQueue {
+    fn reset(&mut self, round: u64) {
+        let closed = self.closed;
+        *self = Self {
+            round,
+            closed,
+            ..Self::default()
+        };
+    }
+
+    fn push(&mut self, transfer_id: u64, effect: Effect) -> Result<(), String> {
+        if transfer_id != self.round {
+            return Ok(());
+        }
+        if self.closed {
+            return Err("终端传输驱动不可用，结果未知".into());
+        }
+        if self.failed {
+            return if matches!(effect, Effect::Cancel | Effect::CancelDone { .. }) {
+                Ok(()) // 已保留唯一 CAN/失败终态，不重复通知或覆盖原因。
+            } else {
+                Err(QUEUE_OVERFLOW.into())
+            };
+        }
+        match effect {
+            Effect::Cancel => {
+                self.cancel = true;
+                return Ok(());
+            }
+            Effect::CancelDone { mut message } => {
+                let mut end = message.len().min(MAX_CONTROL_MESSAGE_BYTES);
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                message.truncate(end);
+                self.terminal = Some(Effect::CancelDone { message });
+                return Ok(());
+            }
+            _ => {}
+        }
+        let bytes = effect.payload_bytes();
+        if self.data.len() >= MAX_QUEUED_EFFECTS
+            || bytes > MAX_QUEUED_BYTES.saturating_sub(self.bytes)
+        {
+            self.failed = true;
+            self.data.clear();
+            self.bytes = 0;
+            self.cancel = true;
+            self.terminal = Some(Effect::CancelDone {
+                message: QUEUE_OVERFLOW.into(),
+            });
+            return Err(QUEUE_OVERFLOW.into());
+        }
+        self.bytes += bytes;
+        self.data.push_back(QueuedEffect {
+            transfer_id,
+            effect,
+        });
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<QueuedEffect> {
+        let control = if std::mem::take(&mut self.cancel) {
+            Some(Effect::Cancel)
+        } else {
+            self.terminal.take()
+        };
+        if let Some(effect) = control {
+            return Some(QueuedEffect {
+                transfer_id: self.round,
+                effect,
+            });
+        }
+        let queued = self.data.pop_front()?;
+        self.bytes -= queued.effect.payload_bytes();
+        Some(queued)
+    }
+}
+
+#[derive(Default)]
+struct EffectChannel {
+    queue: Mutex<EffectQueue>,
+    ready: Notify,
+}
+
+impl EffectChannel {
+    async fn recv(&self) -> QueuedEffect {
+        loop {
+            let notified = self.ready.notified();
+            if let Some(queued) = self.queue.lock().unwrap().pop() {
+                return queued;
+            }
+            notified.await;
+        }
+    }
+}
+
+// 保留旧通道的断开语义；drive 返回后同步生产者明确失败。
+struct EffectReceiver(Arc<EffectChannel>);
+impl Drop for EffectReceiver {
+    fn drop(&mut self) {
+        let mut queue = self.0.queue.lock().unwrap();
+        let round = queue.round;
+        queue.reset(round);
+        queue.closed = true;
+    }
+}
+
 /// 多文件上传的队列项。句柄在入队时打开（begin_send 全量校验的产物），
 /// 排队期间一直持有——排队时再开，文件可能已经被人挪走，而那要等到
 /// 轮到它才发现，报错时用户已经忘了当初选了什么。
@@ -199,7 +338,7 @@ pub struct ZmodemTap {
     pending_finalize: Mutex<std::collections::VecDeque<PendingFinalize>>,
     /// 本会话真正落地的最终路径集合（reveal 的白名单，见 [`Self::resolve_received`]）。
     finalized: Mutex<std::collections::HashSet<PathBuf>>,
-    tx: mpsc::UnboundedSender<QueuedEffect>,
+    effects: Arc<EffectChannel>,
 }
 
 fn cancellation_actions(
@@ -254,7 +393,8 @@ impl ZmodemTap {
         sandbox: PathBuf,
         auto: bool,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let effects = Arc::new(EffectChannel::default());
+        let rx = EffectReceiver(effects.clone());
         let tap = Arc::new(Self {
             session_id: session_id.clone(),
             app: app.clone(),
@@ -271,7 +411,7 @@ impl ZmodemTap {
             session_download_dir: Mutex::new(None),
             pending_finalize: Mutex::new(Default::default()),
             finalized: Mutex::new(Default::default()),
-            tx,
+            effects,
         });
         tokio::spawn(drive(app, state, session_id, Arc::downgrade(&tap), rx));
         tap
@@ -313,6 +453,7 @@ impl ZmodemTap {
             return Err("请先保存已接收的文件，再开始新传输".into());
         }
         let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reset_effects(transfer_id);
         *self.failure.lock().unwrap() = None;
         let (first_path, first_size, first_file) = opened.remove(0);
         let name = first_path
@@ -483,12 +624,27 @@ impl ZmodemTap {
 
     /// 把状态机动作翻译成副作用并投递。
     fn queue(&self, transfer_id: u64, effect: Effect) -> Result<(), String> {
-        self.tx
-            .send(QueuedEffect {
-                transfer_id,
-                effect,
-            })
-            .map_err(|_| "终端传输驱动不可用，结果未知".to_string())
+        let mut queue = self.effects.queue.lock().unwrap();
+        let was_failed = queue.failed;
+        let result = queue.push(transfer_id, effect);
+        let overflow = !was_failed && queue.failed;
+        if overflow {
+            // queue 入口也用于持 cur 的同步 filter；这里决不递归 cancel/获取 cur。
+            let mut failure = self.failure.lock().unwrap();
+            if transfer_id == self.transfer_id.load(Ordering::SeqCst) {
+                failure.get_or_insert_with(|| QUEUE_OVERFLOW.into());
+                self.cancelling.store(true, Ordering::SeqCst);
+            }
+        }
+        // 后续失败数据不产生 ready 风暴；timer 始终位于 select 的优先分支。
+        if !was_failed && (result.is_ok() || overflow) {
+            self.effects.ready.notify_one();
+        }
+        result
+    }
+
+    fn reset_effects(&self, round: u64) {
+        self.effects.queue.lock().unwrap().reset(round);
     }
 
     fn dispatch(&self, transfer_id: u64, acts: Vec<Action>) -> Result<(), String> {
@@ -612,6 +768,9 @@ impl ByteTap for ZmodemTap {
         }
         if let Some(t) = cur.as_mut() {
             // 终态效果仍在队列中时保留资源供驱动消费；后续 shell 字节直接透传。
+            if self.cancelling.load(Ordering::SeqCst) {
+                return Cow::Borrowed(&[]);
+            }
             if t.session.is_finished() {
                 return Cow::Borrowed(chunk);
             }
@@ -688,7 +847,8 @@ impl ByteTap for ZmodemTap {
                     sniff.clear();
                     let first = !self.need_file_announced.swap(true, Ordering::SeqCst);
                     if first {
-                        self.transfer_id.fetch_add(1, Ordering::SeqCst);
+                        let round = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.reset_effects(round);
                         *self.failure.lock().unwrap() = None;
                     }
                     drop(sniff);
@@ -710,6 +870,7 @@ impl ByteTap for ZmodemTap {
                     let acts = session.feed(&probe[at..]);
                     let (done, total) = (session.transferred(), session.declared_size());
                     let transfer_id = self.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.reset_effects(transfer_id);
                     *self.failure.lock().unwrap() = None;
                     *cur = Some(Transfer {
                         id: transfer_id,
@@ -812,7 +973,7 @@ async fn drive(
     state: Arc<crate::state::AppState>,
     session_id: String,
     tap: std::sync::Weak<ZmodemTap>,
-    mut rx: mpsc::UnboundedReceiver<QueuedEffect>,
+    rx: EffectReceiver,
 ) {
     let mut close_timer = tokio::time::interval(std::time::Duration::from_millis(100));
     close_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -830,7 +991,7 @@ async fn drive(
                 }
                 continue;
             }
-            queued = rx.recv() => match queued { Some(queued) => queued, None => return },
+            queued = rx.0.recv() => queued,
         };
         let Some(tap) = tap.upgrade() else { return };
         let transfer_id = queued.transfer_id;
@@ -1135,7 +1296,8 @@ async fn drive(
                 });
                 *cur = None;
                 // 关闭本轮：已排队的迟到 Done/数据不得复活它。
-                tap.transfer_id.fetch_add(1, Ordering::SeqCst);
+                let round = tap.transfer_id.fetch_add(1, Ordering::SeqCst) + 1;
+                tap.reset_effects(round);
                 tap.busy.store(false, Ordering::SeqCst);
                 tap.cancelling.store(false, Ordering::SeqCst);
                 tap.sniff.lock().unwrap().clear();
@@ -1244,6 +1406,208 @@ mod tests {
             file_index: 1,
             file_count: 1,
         }
+    }
+
+    #[test]
+    fn paused_consumer_count_and_payload_overflow_keep_control_reachable() {
+        for payload_limit in [false, true] {
+            let mut queue = EffectQueue::default();
+            queue.reset(7);
+            if payload_limit {
+                queue
+                    .push(7, Effect::Write(vec![1; MAX_QUEUED_BYTES]))
+                    .unwrap();
+            } else {
+                for _ in 0..MAX_QUEUED_EFFECTS {
+                    queue.push(7, Effect::Write(vec![1; 1024])).unwrap();
+                }
+            }
+            assert!(queue
+                .push(7, Effect::Write(vec![2]))
+                .unwrap_err()
+                .contains("上限"));
+            assert!(queue.failed);
+            assert_eq!(queue.bytes, 0);
+            assert!(queue.data.is_empty());
+            queue.push(7, Effect::Cancel).unwrap();
+            queue
+                .push(
+                    7,
+                    Effect::CancelDone {
+                        message: "user cancel".into(),
+                    },
+                )
+                .unwrap();
+            assert!(queue
+                .push(
+                    7,
+                    Effect::Done {
+                        ok: true,
+                        message: "late".into()
+                    }
+                )
+                .is_err());
+            assert!(matches!(queue.pop().unwrap().effect, Effect::Cancel));
+            assert!(matches!(queue.pop().unwrap().effect,
+                Effect::CancelDone { message } if message == QUEUE_OVERFLOW));
+            assert!(queue.pop().is_none());
+            // 消费完控制通知后仍粘滞，不能被新数据重新填充。
+            assert!(queue.push(7, Effect::FileSent).is_err());
+            assert!(queue.pop().is_none());
+            queue.reset(9);
+            queue.push(7, Effect::Cancel).unwrap();
+            queue
+                .push(
+                    7,
+                    Effect::CancelDone {
+                        message: "old".into(),
+                    },
+                )
+                .unwrap();
+            queue
+                .push(
+                    7,
+                    Effect::Done {
+                        ok: true,
+                        message: "old".into(),
+                    },
+                )
+                .unwrap();
+            queue
+                .push(
+                    9,
+                    Effect::Begin {
+                        name: "empty".into(),
+                        size: Some(0),
+                    },
+                )
+                .unwrap();
+            queue.push(9, Effect::Finish { bytes: 0 }).unwrap();
+            queue
+                .push(
+                    9,
+                    Effect::Done {
+                        ok: true,
+                        message: "new".into(),
+                    },
+                )
+                .unwrap();
+            for _ in 0..3 {
+                assert_eq!(queue.pop().unwrap().transfer_id, 9);
+            }
+            assert_eq!(queue.bytes, 0);
+            assert!(queue.pop().is_none());
+        }
+    }
+
+    #[test]
+    fn draining_regular_chunks_preserves_empty_and_four_mib_batch_order() {
+        let mut queue = EffectQueue::default();
+        queue.reset(1);
+        let mut written = 0;
+        for size in [0, 4 * 1024 * 1024] {
+            queue
+                .push(
+                    1,
+                    Effect::Begin {
+                        name: "batch".into(),
+                        size: Some(size),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(queue.pop().unwrap().effect, Effect::Begin { .. }));
+            // 模拟每次 64 KiB 读块，消费者在下一读块之前可排空。
+            for _ in 0..size / 65536 {
+                for _ in 0..64 {
+                    queue.push(1, Effect::Write(vec![1; 1024])).unwrap();
+                }
+                while let Some(queued) = queue.pop() {
+                    if let Effect::Write(data) = queued.effect {
+                        written += data.len();
+                    } else {
+                        panic!("batch write order changed");
+                    }
+                }
+                assert_eq!(queue.bytes, 0);
+            }
+            queue.push(1, Effect::Finish { bytes: size }).unwrap();
+            assert!(
+                matches!(queue.pop().unwrap().effect, Effect::Finish { bytes } if bytes == size)
+            );
+        }
+        queue
+            .push(
+                1,
+                Effect::Done {
+                    ok: true,
+                    message: "done".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            queue.pop().unwrap().effect,
+            Effect::Done { ok: true, .. }
+        ));
+        assert_eq!(written, 4 * 1024 * 1024);
+        assert!(!queue.failed);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn control_payload_is_bounded_at_utf8_boundary() {
+        let mut queue = EffectQueue::default();
+        queue
+            .push(
+                0,
+                Effect::CancelDone {
+                    message: "中".repeat(4096),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(queue.pop().unwrap().effect, Effect::CancelDone { message }
+            if message.len() <= MAX_CONTROL_MESSAGE_BYTES && message.ends_with('中'))
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_wakes_once_for_overflow_and_receiver_drop_releases_payload() {
+        let channel = Arc::new(EffectChannel::default());
+        let receiver = EffectReceiver(channel.clone());
+        channel.queue.lock().unwrap().reset(3);
+        {
+            let mut queue = channel.queue.lock().unwrap();
+            queue
+                .push(3, Effect::Write(vec![0; MAX_QUEUED_BYTES]))
+                .unwrap();
+            assert!(queue.push(3, Effect::Write(vec![1])).is_err());
+        }
+        channel.ready.notify_one();
+        assert!(matches!(receiver.0.recv().await.effect, Effect::Cancel));
+        assert!(matches!(
+            receiver.0.recv().await.effect,
+            Effect::CancelDone { .. }
+        ));
+        // 有限控制槽耗尽后无 ready 风暴；调用真正 recv，验证会休眠。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.0.recv())
+                .await
+                .is_err()
+        );
+        channel.queue.lock().unwrap().reset(4);
+        channel
+            .queue
+            .lock()
+            .unwrap()
+            .push(4, Effect::Write(vec![1; 100]))
+            .unwrap();
+        drop(receiver);
+        let mut queue = channel.queue.lock().unwrap();
+        assert!(queue.data.is_empty());
+        assert!(queue
+            .push(4, Effect::FileSent)
+            .unwrap_err()
+            .contains("驱动不可用"));
     }
 
     #[tokio::test]
