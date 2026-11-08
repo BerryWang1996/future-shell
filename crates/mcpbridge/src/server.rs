@@ -416,11 +416,12 @@ async fn dispatch_after_gate(
                     result = execute(&tool, ports, binding) => Some(result),
                 };
                 // A cancellation already visible at completion wins over a ready result.
-                if request.ct.is_cancelled() || result.is_none() {
-                    cancellation_phase = Some("executing");
-                    Err("terminal.read 请求已取消".into())
-                } else {
-                    result.unwrap()
+                match result {
+                    Some(result) if !request.ct.is_cancelled() => result,
+                    _ => {
+                        cancellation_phase = Some("executing");
+                        Err("terminal.read 请求已取消".into())
+                    }
                 }
             }
         }
