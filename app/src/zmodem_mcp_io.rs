@@ -6,6 +6,39 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Only the application's own default root is provisioned. Explicit user roots
+/// retain their existing validation/permission semantics.
+pub(crate) fn prepare_default_download_root(
+    root: &Path,
+    data_dir: &Path,
+    profile_id: &str,
+) -> Result<PathBuf, String> {
+    if root != data_dir.join("downloads").join(profile_id) {
+        return Ok(root.to_path_buf());
+    }
+    uuid::Uuid::parse_str(profile_id).map_err(|_| "invalid profile id")?;
+    let mut directory = data_dir.canonicalize().map_err(|e| e.to_string())?;
+    for component in ["downloads", profile_id] {
+        directory.push(component);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(format!("create default download directory: {e}")),
+        }
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("default download root contains a link or non-directory".into());
+        }
+    }
+    Ok(directory)
+}
+
 fn validate_basename(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name != name.trim()
@@ -249,6 +282,42 @@ mod tests {
         let path = dir.path().canonicalize().unwrap();
         (dir, path)
     }
+    #[test]
+    fn default_download_root_is_created_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "00000000-0000-0000-0000-000000000001";
+        let root = dir.path().join("downloads").join(id);
+        let prepared = prepare_default_download_root(&root, dir.path(), id).unwrap();
+        assert!(prepared.is_dir());
+        assert!(DownloadSink::new(&prepared, "new", "new").is_ok());
+        assert_eq!(
+            prepare_default_download_root(&root, dir.path(), id).unwrap(),
+            prepared
+        );
+        let user = dir.path().join("user-not-created");
+        assert_eq!(
+            prepare_default_download_root(&user, dir.path(), id).unwrap(),
+            user
+        );
+        assert!(!user.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_download_root_rejects_symlink_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("downloads")).unwrap();
+        let id = "00000000-0000-0000-0000-000000000001";
+        assert!(prepare_default_download_root(
+            &dir.path().join("downloads").join(id),
+            dir.path(),
+            id
+        )
+        .is_err());
+        assert!(!outside.path().join(id).exists());
+    }
+
     #[test]
     fn upload_reads_open_handle_after_path_replacement_and_bounds_growth() {
         let (_dir, root) = root();

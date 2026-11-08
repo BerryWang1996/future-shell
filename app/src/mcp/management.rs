@@ -327,6 +327,12 @@ impl McpManagement {
                 let plan = download_command(remote_path)
                     .map_err(|e| ManagementError::new("FS_MCP_PATH_DENIED", e))?;
                 let root = self.state.download_sandbox_for(sid).await.map_err(failed)?;
+                let root = crate::zmodem_mcp_io::prepare_default_download_root(
+                    &root,
+                    &self.state.data_dir,
+                    &live.profile_id,
+                )
+                .map_err(failed)?;
                 let sink = DownloadSink::new(&root, &plan.basename, &plan.local_basename)
                     .map_err(failed)?;
                 (

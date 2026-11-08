@@ -106,11 +106,30 @@ fn parse_error_output(e: ParseError) -> CallOutput {
     CallOutput::err(ToolError::forbidden(e.to_string()))
 }
 
+const MAX_TERMINAL_TEXT_BYTES: usize = 64 * 1024;
+
+fn bound_terminal_text(text: &mut String) -> bool {
+    if text.len() <= MAX_TERMINAL_TEXT_BYTES {
+        return false;
+    }
+    let mut at = text.len() - MAX_TERMINAL_TEXT_BYTES;
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    text.drain(..at);
+    true
+}
+
 /// 会话不可用。
 fn no_such_session() -> CallOutput {
-    CallOutput::err(ToolError::forbidden(
-        "指定的会话不可用。请通过 sessions.list 查找会话；若需新建，请先用 profiles.list 获取已允许的配置，再调用 sessions.open。",
-    ))
+    CallOutput::err(ToolError {
+        is_error: true,
+        code: "FS_MCP_TARGET_UNAVAILABLE",
+        tier: None,
+        confirmation_required: false,
+        message: "指定的会话不可用。请通过 sessions.list 查找会话；若需新建，请先用 profiles.list 获取已允许的配置，再调用 sessions.open。".into(),
+        details: None,
+    })
 }
 
 /// 给人看的一行话：「工具名: 要做什么」。进确认框与审计。
@@ -714,7 +733,7 @@ async fn execute(
             max_lines,
             wait_ms,
         } => {
-            let snapshot = ports
+            let mut snapshot = ports
                 .terminal
                 .read_text(session_id, *source, *max_lines, *wait_ms, binding)
                 .await?;
@@ -723,8 +742,11 @@ async fn execute(
                 ReadSource::Scrollback => "scrollback",
                 ReadSource::All => "all",
             };
+            // A logical terminal line may contain megabytes after a malformed stream.
+            // Bound UTF-8 text before redaction, audit and JSON serialization.
+            let truncated = bound_terminal_text(&mut snapshot.text);
             let empty = snapshot.text.is_empty();
-            let structured = serde_json::json!({"session_id":session_id,"source":source,"text":snapshot.text,"empty":empty,"timed_out":snapshot.timed_out,"connection_state":snapshot.connection_state});
+            let structured = serde_json::json!({"session_id":session_id,"source":source,"text":snapshot.text,"truncated":truncated,"max_bytes":MAX_TERMINAL_TEXT_BYTES,"empty":empty,"timed_out":snapshot.timed_out,"connection_state":snapshot.connection_state});
             Ok(Executed {
                 text: snapshot.text,
                 structured: Some(structured),
@@ -1474,6 +1496,57 @@ mod tests {
     }
 
     // ══ ① 顺序：解析 → 授权 → 会话 → 分类 → 裁决 ═══════════════════════
+
+    #[test]
+    fn terminal_text_is_byte_bounded_and_keeps_utf8_tail() {
+        let mut text = "中".repeat(100_000) + "latest prompt$ ";
+        assert!(bound_terminal_text(&mut text));
+        assert!(text.len() <= MAX_TERMINAL_TEXT_BYTES);
+        assert!(text.ends_with("latest prompt$ "));
+        assert!(!bound_terminal_text(&mut text));
+    }
+
+    #[tokio::test]
+    async fn terminal_read_bounds_a_single_long_line_and_reports_truncation() {
+        let mut r = Rig::new();
+        r.term.text = "中".repeat(100_000) + "latest$ ";
+        let output = r
+            .call(
+                "terminal.read",
+                r#"{"session_id":"s1","source":"all","max_lines":1}"#,
+            )
+            .await;
+        match output {
+            CallOutput::Ok {
+                text,
+                structured: Some(value),
+                ..
+            } => {
+                assert!(text.len() <= MAX_TERMINAL_TEXT_BYTES);
+                assert!(text.ends_with("latest$ "));
+                assert_eq!(value["truncated"], true);
+                assert_eq!(value["max_bytes"], MAX_TERMINAL_TEXT_BYTES);
+                assert_eq!(value["text"], text);
+            }
+            _ => panic!("read must return bounded structured output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_session_is_unavailable_not_forbidden() {
+        let mut r = Rig::new();
+        r.dir.alive_until = 0;
+        assert_eq!(
+            r.call(
+                "terminal.read",
+                r#"{"session_id":"gone","source":"screen"}"#
+            )
+            .await
+            .error_code(),
+            Some("FS_MCP_TARGET_UNAVAILABLE")
+        );
+        assert_eq!(r.calls.executed(), 0);
+    }
 
     #[tokio::test]
     async fn legacy_session_tools_reject_disallowed_or_revoked_profiles() {

@@ -401,7 +401,7 @@ pub(crate) fn mcp_terminal_busy(state: &crate::state::AppState, session_id: &str
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(session_id)
-        .is_some_and(|tap| owner_slot_busy(&tap.mcp))
+        .is_some_and(|tap| tap.active() || owner_slot_busy(&tap.mcp))
 }
 
 fn owner_slot_busy(slot: &Mutex<Option<McpOwner>>) -> bool {
@@ -716,6 +716,40 @@ impl McpOwner {
 }
 
 /// 终端字节拦截器 + 传输态持有者。
+// Aborting a local state machine does not revoke bytes already in SSH/PTY
+// buffers. Keep discarding them until the stream has been quiet; do not replay
+// a guessed text suffix from arbitrary binary data or claim verified peer exit.
+const ABORT_QUIET: Duration = Duration::from_millis(500);
+#[derive(Default)]
+struct AbortDrain(Option<Instant>);
+impl AbortDrain {
+    fn begin(&mut self, now: Instant) {
+        self.0 = Some(now);
+    }
+    fn suppress(&mut self, now: Instant) -> bool {
+        if let Some(last) = self.0.as_mut() {
+            *last = now;
+            true
+        } else {
+            false
+        }
+    }
+    fn finish_if_quiet(&mut self, now: Instant) -> bool {
+        if self
+            .0
+            .is_some_and(|last| now.saturating_duration_since(last) >= ABORT_QUIET)
+        {
+            self.0 = None;
+            true
+        } else {
+            false
+        }
+    }
+    fn active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 pub struct ZmodemTap {
     session_id: String,
     app: AppHandle,
@@ -740,6 +774,7 @@ pub struct ZmodemTap {
     transfer_id: AtomicU64,
     /// 取消已受理，等待驱动处理终态；重复取消幂等。
     cancelling: AtomicBool,
+    abort_drain: Mutex<AbortDrain>,
     /// 首次有效登记的 SSH 连接代次；0 表示尚未登记。
     connection_generation: AtomicU64,
     /// 通道/驱动失败，不得被后续成功状态覆盖。
@@ -828,6 +863,7 @@ impl ZmodemTap {
             need_file_announced: AtomicBool::new(false),
             transfer_id: AtomicU64::new(0),
             cancelling: AtomicBool::new(false),
+            abort_drain: Mutex::new(AbortDrain::default()),
             connection_generation: AtomicU64::new(0),
             failure: Mutex::new(None),
             tail: Arc::new(TailOutput::default()),
@@ -990,6 +1026,9 @@ impl ZmodemTap {
 
     fn stop_mcp(&self, cur: &mut Option<Transfer>, owner: &mut McpOwner) -> Result<(), String> {
         self.tail.reclaim(owner); // 先于 cancelling；fresh 不能越过旧前缀。
+        if owner.attempted {
+            self.abort_drain.lock().unwrap().begin(Instant::now());
+        }
         if self.cancelling.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -1038,7 +1077,11 @@ impl ZmodemTap {
         }
         let total = opened.len() as u32;
         let mut cur = self.cur.lock().unwrap();
-        if cur.is_some() || self.mcp_busy() || self.cancelling.load(Ordering::SeqCst) {
+        if cur.is_some()
+            || self.active()
+            || self.mcp_busy()
+            || self.cancelling.load(Ordering::SeqCst)
+        {
             return Err("该会话已有传输在进行或正在取消".into());
         }
         if !self.pending_finalize.lock().unwrap().is_empty() {
@@ -1129,6 +1172,7 @@ impl ZmodemTap {
             return Ok(());
         }
         self.busy.store(true, Ordering::SeqCst);
+        self.abort_drain.lock().unwrap().begin(Instant::now());
         self.sniff.lock().unwrap().clear();
         if let Err(error) = self.dispatch(transfer_id, acts) {
             *self.failure.lock().unwrap() = Some(error.clone());
@@ -1386,12 +1430,20 @@ impl ByteTap for ZmodemTap {
         {
             return Cow::Borrowed(chunk);
         }
+        // Drain even when auto detection is disabled or the owner was settled.
+        // No buffering: a cancelled binary stream cannot grow terminal text.
+        if self.abort_drain.lock().unwrap().suppress(Instant::now()) {
+            return Cow::Borrowed(&[]);
+        }
         // 空闲且不自动检测：整条链路零成本透传
         if !self.auto && !self.busy.load(Ordering::SeqCst) {
             return Cow::Borrowed(chunk);
         }
         let mut cur = self.cur.lock().unwrap_or_else(|p| p.into_inner());
         let mut mcp = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+        if self.abort_drain.lock().unwrap().suppress(Instant::now()) {
+            return Cow::Borrowed(&[]);
+        }
         if self
             .effects
             .queue
@@ -1680,6 +1732,14 @@ async fn drive(
             _ = close_timer.tick() => {
                 let Some(tap) = tap.upgrade() else { return };
                 let mut cur = tap.cur.lock().unwrap();
+                if cur.is_none()
+                    && !tap.cancelling.load(Ordering::SeqCst)
+                    && !tap.mcp_busy()
+                    && tap.abort_drain.lock().unwrap().finish_if_quiet(Instant::now())
+                {
+                    tap.busy.store(false, Ordering::SeqCst);
+                    tap.tail.publish("\r\n[FutureShell] 已停止接收取消传输的尾部数据；按 Enter 刷新提示符。\r\n".as_bytes().to_vec());
+                }
                 if let Some(owner) = tap.mcp.lock().unwrap().as_mut() {
                     if owner.poll_stop(Instant::now()) {
                         let _ = tap.stop_mcp(&mut cur, owner);
@@ -2072,10 +2132,14 @@ async fn drive(
                     }
                     t.sink_path.clone()
                 });
+                if cancellation_terminal && !tap.abort_drain.lock().unwrap().active() {
+                    tap.abort_drain.lock().unwrap().begin(Instant::now());
+                }
                 *cur = None;
                 // 关闭本轮：已排队的迟到 Done/数据不得复活它。
                 tap.next_round();
-                tap.busy.store(false, Ordering::SeqCst);
+                tap.busy
+                    .store(tap.abort_drain.lock().unwrap().active(), Ordering::SeqCst);
                 tap.cancelling.store(false, Ordering::SeqCst);
                 tap.sniff.lock().unwrap().clear();
                 // 复位「已通知」闩：下一次 rz 要能再弹一次选择框
@@ -2192,6 +2256,20 @@ mod tests {
             file_index: 1,
             file_count: 1,
         }
+    }
+
+    #[test]
+    fn abort_drain_discards_delayed_chunks_until_a_full_quiet_interval() {
+        let mut drain = AbortDrain::default();
+        let start = Instant::now();
+        assert!(!drain.suppress(start));
+        drain.begin(start);
+        assert!(drain.suppress(start + Duration::from_millis(450)));
+        assert!(!drain.finish_if_quiet(start + Duration::from_millis(500)));
+        assert!(drain.suppress(start + Duration::from_millis(900)));
+        assert!(!drain.finish_if_quiet(start + Duration::from_millis(1399)));
+        assert!(drain.finish_if_quiet(start + Duration::from_millis(1400)));
+        assert!(!drain.suppress(start + Duration::from_millis(1401)));
     }
 
     #[test]

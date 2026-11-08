@@ -164,6 +164,7 @@ pub struct ZmodemSession {
     crc32_mode: bool,
     close_deadline: Option<std::time::Instant>,
     cancel_sent: bool,
+    close_error: Option<&'static str>,
     recv_open: bool,
     recv_complete: bool,
     single_receive: Option<SingleReceive>,
@@ -187,6 +188,7 @@ impl ZmodemSession {
             crc32_mode: true,
             close_deadline: None,
             cancel_sent: false,
+            close_error: None,
             recv_open: false,
             recv_complete: false,
             single_receive: None,
@@ -234,6 +236,7 @@ impl ZmodemSession {
             crc32_mode: true,
             close_deadline: None,
             cancel_sent: false,
+            close_error: None,
             recv_open: false,
             recv_complete: false,
             single_receive: None,
@@ -589,8 +592,8 @@ impl ZmodemSession {
                 self.phase = Phase::Finished;
                 out.push(Action::Send(b"OO".to_vec()));
                 out.push(Action::Done {
-                    ok: true,
-                    message: "发送完成".into(),
+                    ok: self.close_error.is_none(),
+                    message: self.close_error.unwrap_or("发送完成").into(),
                 });
             }
             return;
@@ -720,14 +723,24 @@ impl ZmodemSession {
                     message: "对端中止了传输".into(),
                 });
             }
+            (Direction::Send, FrameKind::ZSKIP) => {
+                // ZSKIP is a file decision, not a cancelled transport. Close normally:
+                // older lrzsz receivers can abort while processing CAN after a skip.
+                self.close_error = Some("对端跳过了该文件");
+                self.begin_close(Phase::Closing);
+                out.push(Action::Send(
+                    FrameHeader {
+                        kind: FrameKind::ZFIN,
+                        flags: [0; 4],
+                    }
+                    .to_hex(),
+                ));
+            }
             (_, FrameKind::ZSKIP) => {
-                self.phase = Phase::Finished;
-                self.cancel_sent = true;
-                out.push(Action::Send(cancel_sequence()));
-                out.push(Action::Done {
-                    ok: false,
-                    message: "对端跳过了该文件".into(),
-                });
+                out.extend(self.cancel());
+                if let Some(Action::Done { message, .. }) = out.last_mut() {
+                    *message = "对端跳过了该文件".into();
+                }
             }
             // 其余帧忽略（ZACK/ZSINIT 等在本主干流程里无需响应）
             _ => {}
@@ -1583,10 +1596,13 @@ mod tests {
     }
 
     #[test]
-    fn skip_aborts_remote_before_done() {
+    fn skip_closes_normally_but_reports_failure_after_peer_fin() {
         let mut session = ZmodemSession::new_send("x", 1);
         assert!(matches!(&session.feed(&hdr(FrameKind::ZSKIP, 0))[..],
-            [Action::Send(bytes), Action::Done { ok: false, .. }] if *bytes == cancel_sequence()));
+            [Action::Send(bytes)] if *bytes == hdr(FrameKind::ZFIN, 0)));
+        assert!(!session.is_finished());
+        assert!(matches!(&session.feed(&hdr(FrameKind::ZFIN, 0))[..],
+            [Action::Send(bytes), Action::Done { ok: false, message }] if bytes == b"OO" && message.contains("跳过")));
     }
 
     /// S336：ZFIN 之后同一读块里的 shell 字节要能交还终端。
