@@ -331,9 +331,9 @@ PR [#20](https://github.com/BerryWang1996/future-shell/pull/20) 的十项必需�
 
 | 卡 | 范围与顺序 | 验收及状态 |
 | --- | --- | --- |
-| A / L3 | 终端管道、SSH装配/重连、MCP terminal.read 契约及回归；与B0不同文件集时并行 | 已实施a343abd/27a88d3/452f65b；MCP headless不等GUI ACK、重连保持模式；wait_ms默认0且0..10000，仅为空快照等待预算，不含授权/门锁/审计耗时；max_lines须正数；旧text保留并补结构化状态，返回前复核授权/代次。独审代码已核，专项补证中。 |
-| B0 / L3 | 既有ZMODEM桥接、rz/sz取消与前端传输面板；先于新传输工具 | D1放行；B0a c27acea已修等待选文件取消及保存目录重锁，先红后绿；独审要求取消幂等回修，B0b正在修排队效果/收尾归属。真实协议、远端退出与后续回显仍待验，不将关闭弹框等同远端已取消。 |
-| B1/B2 / L3 | 复用ZMODEM增补显式MCP上传、下载、状态/取消及逐项授权；共享MCP文件在A整合后再接线 | 不偷偷切换SFTP目标，不猜提示符/主机身份，不静默降级base64；源文件使用已授权根和已打开句柄，下载使用确定沙箱与不覆盖；绑定session代次，区分协议确认/取消/断线未知结果，不冒称远端路径和SHA已验。具体接口与分阶段文件集待设计/D1。 |
+| A / L3 | 终端管道、SSH装配/重连、MCP terminal.read 契约及回归；与B0不同文件集时并行 | 全部本地合入1685499并独立D2放行，具体真实SSH及等价边界见下方READ条目。MCP headless不等GUI ACK；wait_ms是空快照输出等待预算，max_lines须正数；保留旧text并补结构化状态，返回前复核授权/代次。 |
+| B0 / L3 | 既有ZMODEM桥接、rz/sz取消与前端传输面板；先于新传输工具 | 取消、IO/归属、保存身份/目录/展示及协议收尾分轮回修已本地整合且分别独审；当前08205fa统一源码真实GUI及驱动负测在途，未放行总体完成。不将关闭弹框等同远端已取消。 |
+| B1/B2 / L3 | 复用ZMODEM增补显式MCP上传、下载、状态/取消及逐项授权；共享MCP文件在A整合后再接线 | 双向设计及分卡D1已核，等待B0统一补验后实施。源使用授权根和稳定句柄，下载确定沙箱不覆盖；绑定代次、区分协议确认/取消/未知，不猜PTY主机身份或自动切SFTP/base64。具体执行卡见末节。 |
 | V / L1 | 实现和独审后准备1.1.1版本、说明及统一开发候选验证 | 复用现有版本校验脚本；范围覆盖真实隔离SSH、双方协议和原生界面。本批当前是开发授权，正式发布/安装另按用户当时要求核。 |
 
 前提：MCP sessions.open 已建立后台网格，不依赖GUI标签；首次输出异步到达。代码还允许max_lines=0，并存在无GUI ACK的渲染背压机制；截图实际命中哪项未确证。PTY/shell请求拒绝是待实测反例，不直接改want_reply假装修复。本机现有MCP工具连接返回Transport closed，未据此推断远端故障，也未重试生产连接。既有标准SSH跳板可复用，但堡垒机交互菜单不保证提供direct-tcpip或目标凭据。ZMODEM远端需rz/sz，实际截图已显示rz握手；sz能力仍待隔离和获授权现场核实。
@@ -383,3 +383,16 @@ B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和
 当前集成工作区fix-mcp-revocation源码为08205fa；协议独立工作区fix-sftp-unknown-size的codex/1.1.1-zmodem-end固定33297ef，继续补验而不改生产源码。B1/B2尚未实施，须底座协议/总体GUI闭合后再接；两新终端工具已裁Dangerous/readOnlyHint=false，沿既有免确认但不绕过Deny，不冒充SFTP原端点语义。
 
 协议收尾D2独立结论：固定ef3216c..33297ef两文件，未发现阻断本地整合的高/中问题；取消幂等、迟到帧不重开、失败不被成功覆盖、timer弱Arc及锁生命周期和保存决策身份链保持。核原始日志terminal248、bridge27，以及GNU0.13.1双向0/96KiB/4MiB/批量hash和protect哨兵/真实退出；初版夹具重复ZRINIT失败已保留并归因夹具，未当产品缺陷。放行仅本地整合/构建，未放行总体验收/发布安装。10秒是协议收尾截止，100ms是驱动空闲检查周期；共享驱动中既有锁/写预算及接收文件操作可能延迟终态，不能称10.1秒端到端硬上限。真实GUI活动取消、同TTY下一传输、实际bridge静默timer及末写失败注入、GNU0.12.21兼容分别补验，不将纯状态机测试冒充整条桥接。
+
+### B1/B2 执行卡（08205fa只读D1）
+
+首卡须等B0当前真实GUI/驱动补验放行；现在只做分解。军师核实现状：begin_send立即hello、效果通道无界、接收仅检查声明大小、Task直接绑定SFTP；下列待建能力不能冒称已有。
+
+| 卡 | 实施边界 | 验收/依赖 |
+| --- | --- | --- |
+| B1a 接收/队列预算 | zsession与bridge两个生产文件，默认≤400生产行。Write前checked实际累计≤4GiB，未知/虚报同样限制；未完成协议缓存、效果数量/字节硬限。同步filter不等队列，不持cur递归cancel；溢出所属轮次粘滞失败，取消/终结独立可达。常量给理由，不新增配置系统。 | 受控状态测实际边界而不分配4GiB；不完整包超限；暂停消费者压满队列；迟到Done/旧轮不得成功；正常空/分块/CRC/GUI批量和定向真GNU帧不误伤。无新工具/任务/远端命令。 |
+| B1b 被动预约/owner/IO | reserve_mcp接稳定FD或固定沙箱，预约零协议输出且回显透传，方向匹配才激活；session/gen/handle归属，MCP单文件（辨合法ZFILE重传）与完整性，create_new归置，独立GUI保存策略。实现窄busy guard及握手/空闲期限。 | 在gate内原子预约，guard在拿gate前后复核。忙期拒普通GUI输入/广播、MCP send、command.run、长持gate文件操作/新任务及MCP close/reconnect；snapshot/status/cancel仍可达。GUI正常拆除允许，并终结任务未知；不为此造全局框架。 |
+| B1c 复用任务backend | tasks窄SFTP/ZMODEM enum、原SFTP注册点及management取消；按handle/gen更新，流结束不能误结其他backend。 | 保留SFTP输出/撤权隐藏；旧owner取消不影响新任务；teardown/IO失联终结未知，取消受理不声称远端退出。暂不暴露工具。 |
+| B2 两工具及真链路 | managed/tool/gate/server、management和授权UI接两项默认off Dangerous/readOnlyHint=false工具。固定POSIX命令与路径引用；原免确认规则保留Deny。 | 双向真实PTY及嵌套目标、任务查询/取消、无GUI手工会话、引用/中文/冲突/超时/断线/撤权及旧SFTP回归，最终统一候选集中验收。 |
+
+B1b—B2由同一新应用/MCP实现上下文串行接续，避免共享文件并行覆盖；实现者不自审。单文件MCP完整性需明确检查ZDATA/ZEOF位置与预期大小，不能只看ZFIN就成功；协议确认仍不是远端SHA/主机/路径认证。各卡独立可编译、按新风险验证，若真实耦合超默认范围先给证据调整，不删取消出口凑行数。
