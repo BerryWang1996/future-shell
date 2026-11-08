@@ -127,7 +127,7 @@ impl ServerHandler for McpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // rmcp 的 arguments 是 Option<Map>；`server::call` 要 JSON 字符串。
         // 缺省按空对象处理（无参工具客户端常不发 arguments）。
@@ -151,13 +151,14 @@ impl ServerHandler for McpServer {
                 confirm: &*self.confirm,
                 audit: &*self.audit,
             };
-            crate::server::call(
+            crate::server::call_with_read_cancellation(
                 &request.name,
                 &args_json,
                 &ctx,
                 &self.authz,
                 &mut ledger,
                 &ports,
+                Some(&context),
             )
             .await
         };
