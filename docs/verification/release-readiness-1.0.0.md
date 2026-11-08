@@ -257,3 +257,6 @@ artifact、不生成 Release）。前两次都没有跑通，三处问题此前�
 - 真实隔离loopback SSH验证MCP4/128MiB下载hash、五类文件双向、冲突保护、busy/撤权/路径/旧句柄与原SFTP回归；macOS GNU0.13 GUI rz/sz等待/活动取消有预置原shell退出标记，保存路径/文案及缺OO实际timer通过。GNU0.12 nonTTY容器innerPTY补证双向128MiB活动取消，一次CAN完整抵达、独立进程自然exit128后同TTY新marker通过。活动上传首次新GUI输入未证，旧-it链不冒充复现；精确范围和原始证据索引见开发记录。
 - 两轮自建app/sshd/agent/容器/秘密DB/token与合成文件均精确清理。GUI全选反选持久化、故意握手超时、活动重连代次等未原生穷举边界继续保留。
 - PR三平台完整CI、正式tag构建、安装/覆盖重装/卸载smoke、附件校验和与来源证明将在对应run实际完成后核实；此处尚不记为通过。macOS通用DMG不等同本地arm64开发二进制，须另核主程序/helper双架构及隔离安装启动。
+
+
+1.1.1候选发布门禁补记：PR #21首轮42477824216的Clippy失败已按原强度回修，c8767ef/f21e141/d136c36分别为取消结果match、测试循环整理及三个内部参数struct；独立D2放行，未改变外部契约/默认值/锁序。经理固定d136亲跑主/helper锁定all-targets Clippy、锁定app454、fmt/版本/文档、新嵌入资源构建均通过，源exe SHA256 `697909324106312540a94376d918413f2010e2a701226ef43a471fc252dcf8f0`。此前7808exe的完整原生矩阵仅按逐调用等价审查限定复用；远端新完整CI、tag制品与安装smoke仍待核，最终DMG额外做隔离启动/最小MCP映射烟测。

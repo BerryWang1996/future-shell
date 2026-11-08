@@ -496,3 +496,12 @@ D3预审未发现需回退源码的契约矛盾，要求三处必要文案修正
 ### 1.1.1 发布阶段续接（2026-11-08）
 
 用户在本地交付后明确要求“要发布的”，此前仅本地开发的授权限制由本次新请求扩展为push/PR合main/tag/正式Release；本机安装替换未纳入此请求。复用现有release/版本门禁/三平台完整CI和安装smoke，不降低原门禁。当前release/1.1.1从7efebe9准备，源码不变，更新CHANGELOG日期、工具指南及既有发版/人工记录；远端main核为73ed9eff，尚无v1.1.1。正式构建、附件、SHA及来源证明以对应远端实际结果为准。
+
+
+### 发布门禁回修（PR #21）
+
+release/1.1.1 的be4cfa0已推送，PR #21完整CI（42477824216；push同源42477719523）实际停在Clippy，不能将后续跳过项记通过。c8767ef将read取消结果的先is_none后unwrap改显式match，保None/取消优先与原Intent/Settled事实，独立D2关闭；原取消11和MCP139+21通过。f21e141只清理发送closing测试的单元素循环，所有deadline/CAN/unknown/重复expire/cancel断言保持，terminal267与独立D2通过，生产0变化。
+
+完整Clippy继续检出app三处8/7参数签名。经D1，d136c36限定三个文件、112生产变更行：SessionSetup归组rows/cols/headless，TerminalUpdate归组进度/结果/路径，SaveChoice归组dir/name_override/policy；expected_generation、handle/generation与expected_decision_id均保独立显式参数。独立D2亲核22调用原值与求值顺序，函数体/锁/await/身份早返不变，测试不减弱，放行纯参数映射限定等价；不加allow、不降全局阈值。旧GUI/真传输证据按影响引用，不能把旧exe7808当新源码产物。
+
+作者454及appClippy命令未加locked，仅计非锁定本地结果。经理在固定d136c36亲跑：全workspace all-targets Clippy --locked --offline -D warnings通过（13.43s），helper同强度通过（26.31s），app --lib --locked --offline 454通过/0ignored（5.09s）。fmt/版本v1.1.1/文档96目标链接与diffcheck通过；新custom-protocol锁定离线构建通过（15.03s），源exe SHA256 `697909324106312540a94376d918413f2010e2a701226ef43a471fc252dcf8f0`。原始日志 `/tmp/fs111-release-{clippy-final,helper-clippy,app-locked,native-build}.log`。这不是三平台CI或最终安装包结果；后续将重推候选完整CI，并对tag构建DMG做隔离校验/最小映射烟测。
