@@ -93,12 +93,18 @@ mod tests {
     #[test]
     fn rejects_protocol_name_changes_and_line_editor_controls() {
         for bad in [
-            "", ".", "..", "/", "dir/", "dir/.", "dir/..", " x", "x ", "dir/a\\b", "a\0b", "a\rb",
-            "a\nb", "a\tb", "a\u{1b}b", "a\u{7f}b",
+            "", ".", "..", "/", "dir/", "dir/.", "dir/..", " x", "x ", "a\0b", "a\rb", "a\nb",
+            "a\tb", "a\u{1b}b", "a\u{7f}b",
         ] {
             assert!(download_command(bad).is_err(), "{bad:?}");
             assert!(upload_basename(Path::new(bad)).is_err(), "{bad:?}");
         }
+        // 远端路径按 POSIX 解释；本地 Path 使用宿主平台的分隔符语义。
+        assert!(download_command("dir/a\\b").is_err());
+        #[cfg(not(windows))]
+        assert!(upload_basename(Path::new("dir/a\\b")).is_err());
+        #[cfg(windows)]
+        assert_eq!(upload_basename(Path::new("dir/a\\b")).unwrap(), "b");
         for bad in ["", "a\0b", "a\rb", "a\nb", "a\tb", "a\u{1b}b", "a\u{7f}b"] {
             assert!(upload_command(bad).is_err(), "{bad:?}");
         }
