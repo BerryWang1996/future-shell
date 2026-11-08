@@ -376,7 +376,7 @@ B1/B2已获独立设计D1：terminal.upload(session_id,local_path,remote_dir)和
 | ZM-END-1 / 747真GUI protect skip卡远端 | 33297ef独立D2放行本地整合为08205fa，真实GUI及驱动补验在途 | 原始哨兵实际28B，未覆盖；ZSKIP先CAN再失败，发送等ZFIN后OO，接收增量消费OO并保留shell尾部，静默closing有期限。GNU0.13.1真PTY双向/批量hash、protect原进程exit128和marker通过；不能据此断言普通上传首复合输入丢失已定因。 |
 | ZM-INPUT-OBS / 同原生fixture观察 | 仅观察、未定因，不计已修 | 普通上传后首条复合输入两次无回显，稍后短哨兵可用；未用换触发器冒充原复合场景通过。 |
 | SAVE-STATUS-1 / a1a8e04真GUI | b3fccdc一生产行修复，独审在途 | saved仅在原ok=true更新当前文件已保存文案，null不提前宣称协议完成、false保留失败，ID/session防线不变。定向19通过，先红2项；真实新界面待最终候选。 |
-| ZM-LINUX-OO-OBS / GNU0.12.21rc容器PTY | 新兼容边界，独立军师复核收尾策略 | send全矩阵、recv空文件/protect及同TTY下一传输通过；纯管道+容器内部真PTY96KiB见OO且hash/DONE正确，但4MiB仍hash正确、peer exit0而未见OO。不能全归旧双PTY或宣称完整兼容。GNU receiver缺OO可正常返回的源码事实已核，TCIOFLUSH丢OO仅假设；停动态同义重试，先裁契约。 |
+| ZM-LINUX-OO-OBS / GNU0.12.21rc容器PTY | 独立军师D1已裁GNU兼容接收策略，另卡在途 | send全矩阵、recv空文件/protect及同TTY下一传输通过；纯管道+容器内部真PTY96KiB见OO且hash/DONE正确，但4MiB仍hash正确、peer exit0而未见OO。不能全归旧双PTY或宣称完整兼容，TCIOFLUSH丢OO仅假设。接收完整文件/ZFIN应答成功与OO有限尾清理分离；发送确认不放宽。 |
 
 第三轮军师保护目标：用户对A的保存/覆盖/跳过只作用A，每个已收文件有稳定恢复身份，目录对应HOME。原互斥锁不足，改为UUID决策和统一目录链；没有缩双向范围或新增用户逐次授权。747第三轮原P1/PATH停止线已满足，新增展示P2单独分诊，不以其否定已关闭安全反例，也不带已知新P2发布。默认范围偏离已明确批准：P2多纳组件1文件以保持同ID本地radio，生产151行较150多1行，不删注释凑数；以固定diff和独立完整复审替代机械压行，保护不降级。
 
@@ -404,3 +404,11 @@ B1b—B2由同一新应用/MCP实现上下文串行接续，避免共享文件�
 上述a1a8e04真实GUI证据已冻结为`/tmp/fs111-zmodem-public-a1a8e04.json`，源exe SHA256 `04fe1185f9c1015e18e5e4d5c979d51bbb291ee43337a27166bcd9da5dfa418c`，唯一bundle重签后`a659daf104ba365eb53fefeffb8ecd8b0cd617842adcc25176ff2a7250198200`；QA逐项核owned进程、DB/秘密、socket及合成文件清理完成。新候选所测首条复合命令未复现旧观察，但不由此倒推旧根因。空/4MiB GUI矩阵沿用747和协议PTY原证据，不声称每版全重跑。
 
 GNU源码依据：[lrz.c ackbibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lrz.c/#L2289)最多三次等OO、超时自然返回且调用方返回ZCOMPL；[lsz.c saybibi](https://sources.debian.org/src/lrzsz/0.12.21rc-0.2/src/lsz.c/#L2398)收到ZFIN发送OO，超时/ZCAN也直接返回。它们是实现事实，不冒充通用标准。原始GNU/innerPTY日志和无秘密脚本保存在协议工作区`.cache/1.1.1-protocol-end/`，容器及数据fixture均已清理，无额外依赖或业务环境改动。
+
+B1a197f8d（生产249行）独审发现新P2：CAN提控制槽优先后未统一置cancelling，可能再发送积压普通帧。9650300单点回修（生产66行）已独立D2关闭：同queue锁核轮次、置取消及代次reset，配对失败走控制终态；真实状态机ZSKIP/超限/期限动作经生产映射的暂停消费者回归先红后绿，bridge33通过。原预算terminal252通过；1MiB未解析、1024效果/8MiB及控制原因4KiB是局部准入预算，不能称整个进程内存上限。基线primitive红仅证明原无界通道不拒超量，不是真drive溢出；新SHA真实GNU大文件/GUI留最终候选。
+
+SAVE-STATUS-1 b3fccdc已独立D2放行一行文案修复，19项原日志核过；共享CAN/ZFIN/OO writer故障链获“静态同路由＋局部单测”限定等价本地放行，不称真russh逐点Err/五秒timeout注入。实际断线可补证但不为覆盖率另造生产泛型接口。
+
+B1c-0依赖顺序调整为先窄backend基础，ec93fc2生产93行/三文件已独立D2放行；不碰在途协议文件，不暴露工具。SFTP事件/核验/结束限定SFTP，ZMODEM取消用原handle/gen/watch channel，失联落failed/unverified/settled，不回查当前tap。23绿/两次红为实现者原工具结果转述，无落盘原日志复核；经理将亲跑核心补证。重复watch通知只保证状态/目标幂等，driver必须自闩一次CAN，并在registry/await前释放watch借用。单个term_input忙检查不足：GUI输入还须与预约共享原子边界，后续占用卡按gate协调。另B2-path仅纯引用/命名契约与真实sh参数oracle并行，不提前创建新入口。
+
+OO兼容卡允许第三生产文件pipe.rs的窄tap通知/排空（必要偏离“两文件”估算，默认400生产行仍保留），避免单O/partial tail静默或EOF后永久不进用户网格。只有原pipe读取任务消费，与filter串行并走decoder/录屏/grid/ring/render，原始log不重记；发布尾与释放cur排序，旧尾先于新read，不建任意注入API。完整批次且ZFIN应答/IO成功时缺OO有限结束，精确披露未见OO而不因此CAN；零文件/缺EOF/写错/取消/断线不提升成功。旧完整file缺OO假peer测试验证了当时严格策略的timer可达性，修后预期须改为一次有界成功无CAN，并另保sender缺ZFIN/incompletefile失败，不能把旧预期直接作新契约验收。
