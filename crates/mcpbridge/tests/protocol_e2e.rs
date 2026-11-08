@@ -138,13 +138,20 @@ impl TerminalPort for Term {
         _session_id: &str,
         _source: ReadSource,
         _max_lines: Option<usize>,
+        _wait_ms: u64,
         _generation: Option<u64>,
-    ) -> Fut<'_, PortResult<String>> {
+    ) -> Fut<'_, PortResult<fs_mcpbridge::ports::TerminalSnapshot>> {
         // 故意回吐一个已知机密：脱敏必须发生在字节**离开本进程之前**。
         // 端口自己不脱敏（ports.rs 明写脱敏统一在 server.rs 做，
         // 那样只有一个脱敏点可以被守卫钉住）——所以这里裸着回，
         // 由协议对面收到的东西来判断那个唯一的脱敏点在不在。
-        Box::pin(async { Ok("$ echo hunter2\nhunter2\n".to_string()) })
+        Box::pin(async {
+            Ok(fs_mcpbridge::ports::TerminalSnapshot {
+                text: "$ echo hunter2\nhunter2\n".to_string(),
+                timed_out: false,
+                connection_state: "connected".into(),
+            })
+        })
     }
     fn send(
         &self,
@@ -454,10 +461,15 @@ async fn known_secrets_are_redacted_before_the_bytes_leave_the_process() {
     )
     .await;
     assert!(!is_err, "terminal.read 是只读，不该被拒：{text}");
-    let all = format!(
-        "{text}{}",
-        structured.map(|v| v.to_string()).unwrap_or_default()
-    );
+    let structured = structured.expect("terminal.read supplies structured status");
+    assert_eq!(structured["session_id"], "s-1");
+    assert_eq!(structured["source"], "screen");
+    assert_eq!(structured["empty"], false);
+    assert_eq!(structured["timed_out"], false);
+    assert_eq!(structured["connection_state"], "connected");
+    assert_eq!(structured["text"], text);
+    assert!(text.starts_with("$ echo "));
+    let all = format!("{text}{structured}");
     assert!(!all.contains("hunter2"), "已知机密经协议流出了：{all}");
     // 反向对照：不是整段被吞掉了——非机密部分要照常到达。
     assert!(all.contains("echo"), "脱敏把正文也吃掉了：{all}");

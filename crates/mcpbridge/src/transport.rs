@@ -164,7 +164,7 @@ impl ServerHandler for McpServer {
         // 服务器在打开成功后即记账，即使后续 settled 审计失败也必须合并。
         // 若此处拿锁前请求被取消，可能丢失记账，下次只会多一次首次确认；不重开会话。
         self.ledger.lock().await.merge(ledger);
-        Ok(to_response(out))
+        Ok(to_response(out, request.name.as_ref() == "terminal.read"))
     }
 }
 
@@ -174,9 +174,14 @@ impl ServerHandler for McpServer {
 /// ——它把脱敏后的整个值同时放进 `content`（给模型读的 JSON 文本）与
 /// `structured_content`（给程序读的），exit_code/truncated/timed_out 一个不丢。
 /// 纯文本工具用 `success` 走显式脱敏文本。
-fn to_response(out: CallOutput) -> CallToolResponse {
+fn to_response(out: CallOutput, terminal_read: bool) -> CallToolResponse {
     match out {
         CallOutput::Ok { text, structured } => match structured {
+            Some(value) if terminal_read => {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                result.structured_content = Some(value);
+                result.into()
+            }
             Some(value) => CallToolResult::structured(value).into(),
             None => CallToolResult::success(vec![ContentBlock::text(text)]).into(),
         },
@@ -262,7 +267,7 @@ mod tests {
     #[test]
     fn a_rejection_becomes_a_tool_level_structured_error_not_a_protocol_error() {
         let e = ToolError::denied_by_gate(Tier::Dangerous, "只读档");
-        let resp = to_response(CallOutput::Err(e));
+        let resp = to_response(CallOutput::Err(e), false);
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(true), "拒绝必须 isError=true");
@@ -279,10 +284,13 @@ mod tests {
     #[test]
     fn a_structured_success_carries_the_value_in_both_channels() {
         let value = serde_json::json!({"stdout":"ok","stderr":"","exit_code":0,"truncated":false,"timed_out":false});
-        let resp = to_response(CallOutput::Ok {
-            text: "ok".into(),
-            structured: Some(value.clone()),
-        });
+        let resp = to_response(
+            CallOutput::Ok {
+                text: "ok".into(),
+                structured: Some(value.clone()),
+            },
+            false,
+        );
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(false));
@@ -297,10 +305,13 @@ mod tests {
     /// 成功无结构化（纯文本工具）⇒ 走显式文本。
     #[test]
     fn a_plain_success_uses_the_explicit_text() {
-        let resp = to_response(CallOutput::Ok {
-            text: "file body".into(),
-            structured: None,
-        });
+        let resp = to_response(
+            CallOutput::Ok {
+                text: "file body".into(),
+                structured: None,
+            },
+            false,
+        );
         match resp {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(false));

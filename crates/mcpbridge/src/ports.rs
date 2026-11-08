@@ -83,6 +83,14 @@ pub trait SessionDirectory: Send + Sync {
     fn open(&self, profile_id: &str) -> Fut<'_, PortResult<String>>;
 }
 
+/// Snapshot returned by the terminal adapter before unified redaction.
+#[derive(Debug, Clone)]
+pub struct TerminalSnapshot {
+    pub text: String,
+    pub timed_out: bool,
+    pub connection_state: String,
+}
+
 /// 终端网格的读写。
 pub trait TerminalPort: Send + Sync {
     /// 读 headless 网格的**纯文本**（不含转义序列）。
@@ -94,8 +102,9 @@ pub trait TerminalPort: Send + Sync {
         session_id: &str,
         source: ReadSource,
         max_lines: Option<usize>,
+        wait_ms: u64,
         generation: Option<u64>,
-    ) -> Fut<'_, PortResult<String>>;
+    ) -> Fut<'_, PortResult<TerminalSnapshot>>;
 
     /// 往终端写 payload（像用户敲进去一样）。
     fn send(

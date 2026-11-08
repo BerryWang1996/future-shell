@@ -32,6 +32,7 @@
 //! 纯逻辑层不认识端口，端口不认识闸门。两者只在这里相遇，于是「绕过闸门
 //! 直接调端口」这件事只可能发生在这一个文件里——而这一个文件有守卫。
 
+use crate::tool::ReadSource;
 use fs_policy::{AiMode, Decision};
 
 use crate::authz::{authorize_open, Authorization, OpenAuthz, OpenLedger};
@@ -606,11 +607,25 @@ async fn execute(
             session_id,
             source,
             max_lines,
-        } => ports
-            .terminal
-            .read_text(session_id, *source, *max_lines, binding)
-            .await
-            .map(plain),
+            wait_ms,
+        } => {
+            let snapshot = ports
+                .terminal
+                .read_text(session_id, *source, *max_lines, *wait_ms, binding)
+                .await?;
+            let source = match source {
+                ReadSource::Screen => "screen",
+                ReadSource::Scrollback => "scrollback",
+                ReadSource::All => "all",
+            };
+            let empty = snapshot.text.is_empty();
+            let structured = serde_json::json!({"session_id":session_id,"source":source,"text":snapshot.text,"empty":empty,"timed_out":snapshot.timed_out,"connection_state":snapshot.connection_state});
+            Ok(Executed {
+                text: snapshot.text,
+                structured: Some(structured),
+                exit_code: None,
+            })
+        }
         McpTool::TerminalSend {
             session_id,
             payload,
@@ -716,7 +731,6 @@ async fn settle(
 mod tests {
     use super::*;
     use crate::ports::{ConfirmReply, PortResult, ProfileSummary, SessionSummary};
-    use crate::tool::ReadSource;
     use fs_ai::exec::Observation;
     use std::future::Future;
     use std::pin::Pin;
@@ -912,8 +926,9 @@ mod tests {
             _s: &str,
             _src: ReadSource,
             _m: Option<usize>,
+            _wait_ms: u64,
             generation: Option<u64>,
-        ) -> F<'_, PortResult<String>> {
+        ) -> F<'_, PortResult<crate::ports::TerminalSnapshot>> {
             assert_eq!(
                 generation,
                 Some(1),
@@ -934,7 +949,11 @@ mod tests {
                 } else if denied {
                     Err(crate::ports::SESSION_FORBIDDEN.into())
                 } else {
-                    Ok(t)
+                    Ok(crate::ports::TerminalSnapshot {
+                        text: t,
+                        timed_out: false,
+                        connection_state: "connected".into(),
+                    })
                 }
             })
         }

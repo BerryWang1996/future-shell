@@ -412,6 +412,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::All,
                 max_lines: None,
+                wait_ms: 0,
             },
         ] {
             let g = classify_for_mcp(&t, "test");
@@ -507,6 +508,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::Screen,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::TerminalSend {
                 session_id: "s".into(),
@@ -573,6 +575,7 @@ mod tests {
                         session_id: "s".into(),
                         source,
                         max_lines: Some(999_999),
+                        wait_ms: 0,
                     })
                     .collect(),
             ),

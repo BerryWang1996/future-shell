@@ -35,6 +35,7 @@ pub enum McpTool {
         session_id: String,
         source: ReadSource,
         max_lines: Option<usize>,
+        wait_ms: u64,
     },
     /// ⚠ 向终端发送 payload。分类目标 = **完整 payload 字符串**，基线至少 `Write`；
     /// 含控制/不可打印字符或超阈值 → `Dangerous`（§4.5，实现见 `gate.rs`）。
@@ -234,8 +235,8 @@ pub const MCP_MANIFEST: &[ManifestEntry] = &[
     },
     ManifestEntry {
         name: "terminal.read",
-        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines。查看提示符或回显后再决定输入。",
-        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer"}},"required":["session_id","source"],"additionalProperties":false}"#,
+        description: "读取会话终端的纯文本内容（已脱敏）。source=screen 为当前可见屏；all/scrollback 读取最新尾部，可设 max_lines（正数）；空屏可设置 wait_ms（0-10000，推荐 1000），仅等待可见内容。查看提示符或回显后再决定输入。",
+        schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","enum":["screen","scrollback","all"]},"max_lines":{"type":"integer","minimum":1},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0}},"required":["session_id","source"],"additionalProperties":false}"#,
         gated: false,
         vault_class: false,
     },
@@ -375,6 +376,8 @@ struct ReadArgs {
     source: ReadSource,
     #[serde(default)]
     max_lines: Option<usize>,
+    #[serde(default)]
+    wait_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -494,7 +497,14 @@ pub fn parse_tool(name: &str, args_json: &str) -> Result<McpTool, ParseError> {
         }
         "terminal.read" => {
             let a: ReadArgs = serde_json::from_str(args_json).map_err(bad)?;
+            if a.max_lines == Some(0) || a.wait_ms > 10_000 {
+                return Err(ParseError::BadArgs {
+                    tool: name.to_string(),
+                    detail: "max_lines 必须大于 0，wait_ms 必须在 0..=10000".into(),
+                });
+            }
             McpTool::TerminalRead {
+                wait_ms: a.wait_ms,
                 session_id: a.session_id,
                 source: a.source,
                 max_lines: a.max_lines,
@@ -709,6 +719,7 @@ mod tests {
                 session_id: "s".into(),
                 source: ReadSource::Screen,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::TerminalSend {
                 session_id: "s".into(),
@@ -826,6 +837,25 @@ mod tests {
     }
 
     #[test]
+    fn read_wait_and_line_bounds_are_validated() {
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","wait_ms":10000,"max_lines":1}"#
+        )
+        .is_ok());
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","wait_ms":10001}"#
+        )
+        .is_err());
+        assert!(parse_tool(
+            "terminal.read",
+            r#"{"session_id":"s","source":"screen","max_lines":0}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn read_source_is_a_closed_set() {
         assert!(parse_tool("terminal.read", r#"{"session_id":"s","source":"screen"}"#).is_ok());
         assert!(parse_tool(
@@ -842,6 +872,7 @@ mod tests {
                 session_id: "s1".into(),
                 source: ReadSource::All,
                 max_lines: None,
+                wait_ms: 0,
             },
             McpTool::CommandRun {
                 session_id: "s2".into(),
