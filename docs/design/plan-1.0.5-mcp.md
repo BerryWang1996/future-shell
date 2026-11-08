@@ -2,7 +2,7 @@
 
 本文沿用 1.0.5 计划作为开发与审计记录，后续版本按时间续记；下文“当前”“未实施”等历史表述只适用于其所在阶段。原始基线为 `v1.0.4`（`e0a69bf`），1.0.5 已发布。
 
-**最新状态（2026-11-08）：1.1.1 本地开发中，未发布或安装。** 集成分支为 `codex/1.1.1-mcp-endpoints`。终端读取、rz/sz 取消与保存、MCP 双向终端文件传输均已实现并经过分卡独立复审；最终真实验收仍有停止线，不能据单元测试通过判定完成。`a4a2cd7` 已关闭真实 zsh 上传目录误落反例，空文件与 96 KiB 双向哈希通过；4 MiB 下载触发效果队列数量上限，正在补接收背压。后续须固定新源码与二进制再验大文件、取消后同终端恢复及剩余矩阵。仅使用隔离 loopback SSH、便携测试应用和合成文件；本机安装版与真实服务器未改动。
+**最新状态（2026-11-08）：1.1.1 本地开发中，未发布或安装。** 集成分支为 `codex/1.1.1-mcp-endpoints`。终端读取、rz/sz 取消与保存、MCP 双向终端文件传输均已实现并经过分卡独立复审；最终真实验收仍有停止线，不能据单元测试通过判定完成。`a4a2cd7` 已关闭真实 zsh 上传目录误落反例，空文件与 96 KiB 双向哈希通过；4 MiB 下载触发的效果队列数量上限已通过接收背压修复并独审；统一候选所列真实验收已完成，终审与清理核验待收口。原生 GNU 0.13 的大文件及 GUI 双向取消、GNU 0.12 innerPTY 的 MCP 双向活动取消均取得真实证据；工具本地取消终态仍不保证任意对端已经退出。仅使用隔离 loopback SSH、便携测试应用和合成文件；本机安装版与真实服务器未改动。
 
 ## 一、现状与交付目标
 
@@ -456,3 +456,31 @@ a4a2cd7 代码同 79363f7，原生嵌入资源候选 exe SHA-256 为 `78613d1174
 
 
 91548ba 已实现上述背压卡，仅两源码文件、90 生产变更行，4 项新测试。独立 D2 固定 a4a2cd7..91548ba，无新增高中发现，放行仅本地候选/真实 QA；软水位允许一个读块超调，不保证任意异常输入不触发硬限。原始 terminal267/bridge53 日志及旧 pipe 暂停仍读的红例已复核；受控真实 SessionPipe+EffectQueue 的 4/128 MiB 连续流不是 GNU/AppState 验收。经理另亲跑 core427 通过、0 ignored，fmt/diffcheck/文档链接通过，custom-protocol 原生构建成功，exe SHA-256 `7808ba6f864b4a8c91010bca8d642fa148480dd7acef19e5bb6eb3a6dfed808b`，dist index `0ed746aac0e014014ddae86b80f6b0b7ef7597034c5af24c07ab15c7bce812fc`。日志 `/tmp/fs111-b1flow-root-core.log`、`/tmp/fs111-b1flow-native-build.log`；开始绑定新候选实际 QA，尚未解除最终停止线。
+
+
+### b9af4e0 统一候选在途结果与 D3 文案修正
+
+候选 b9af4e0 代码同 91548ba，源 exe `7808ba6f864b4a8c91010bca8d642fa148480dd7acef19e5bb6eb3a6dfed808b`，独立 fixture 重签 exe `42b8d0c66804493c3f19960dda58c799208d0366f71fe3560b09ef497f5e4c8e`；公开证据 `/tmp/fs111-final-public-b9af4e06dff4.json`。经理另亲跑 app bridge53，日志 `/tmp/fs111-b1flow-root-bridge.log`。以下仅记录已实际观察，最终清理和 Linux 取消定位尚在途。
+
+- macOS 原生 GNU 0.13：嵌套 SSH 的 headless MCP 下载 4 MiB/128 MiB 实际字节、SHA 一致，128 MiB 约16秒；活动下载取消后原 TTY exit128、哨兵和下一空文件任务完成。五类名称/大小（空、96 KiB、4 MiB、引号中文、前导横线）双向 hash 通过；已存在目标不覆盖。
+- 新候选 GUI：手动 sz 4 MiB hash/HOME 落点/关框和“文件已保存”正确。rz 等待选择取消 exit128；活动 rz128 MiB 在1.6 MiB取消、活动 sz128 MiB 在24.2 MiB取消，原触发复合命令的退出标记均为128，同 TTY 后续命令可用。这些是 GNU0.13 的真实 GUI 结果，不冒充 Linux0.12。
+- optional OO：实际 app 静默完成尾清理约10.084733秒，一次成功披露“未观察到 OO”，peer静默12.05秒未收到CAN、exit0；两个时间分别属于 app 与 peer，不混作硬耗时承诺。
+- 真实 MCP 边界：忙期同sid新任务 CONFLICT，读屏/状态与另sid可用；撤权后已知任务仍可查公开进度但隐藏全部路径/partial和error，新上传FORBIDDEN，恢复自建clone许可后原任务完成。旧句柄取消不影响新任务/4 MiB hash；上传../越界PATH_DENIED；旧 SFTP96 KiB双向sha256_match且无terminal metadata。autoReceive=false显式MCP96 KiB下载通过；globalenabled=false明确UNSUPPORTED，自建设置已恢复。GUI27项勾选计数、intentional超时和重连代次未在本次原生穷举，仍以已有受控/同core证据限定。
+- Linux GNU0.12：正常4 MiB真实传输/hash及peer同形CAN基线分别通过。旧 docker-it 多PTY取消只得本地cancelled、残流和首printf无回显；新 nonTTY hexplain+innerPTY 产品适配确认一次CAN完整write-all，无短写，但20秒未见独立sz退出文件。两反例保留，不能推断自然退出，也不能凭未见退出就把wrapper/termios/排水差异认定为产品根因；仅追加一张定量观测卡，不无证重刷参数。
+- 原生 MCP 上传活动取消的首printf同样在本地终态后即注入，见rz removed及新prompt但无该printf，不能据此判卡死或证明退出码；GUI预置退出标记和后续命令证据另列。取消状态仍明确unverified/对端未知，没有把本地busy释放伪称远端就绪。
+
+D3预审未发现需回退源码的契约矛盾，要求三处必要文案修正已纳入工作树：顶部状态同步背压已实现；guide明确错误若仍含transfer_id/observe_with必须先查原任务不得重交；local_relative_path未完成时只是计划落点，不能据字段存在宣称文件已交付。最终独立复核待固定文案与新观测结果。未push/发布/安装，安装版及真实服务器未改。
+
+
+### GNU0.12 取消最终补证与探针纠正
+
+经理对同一 image 只读核实：`python3` 为 `/usr/local/bin/python3`，`/usr/bin/python3` 不存在。此前退出 wrapper 使用后者，且从未生成start记录；“20秒无exit文件”是退出oracle未建立，不能作为peer仍存活/卡tcdrain的证据。TTY观测已核CAN时noncanonical、无ISIG，relay排空且输出停止增长，也不足以反推独立退出；原-it链具体影响仍未复原，不据此宣称旧夹具已通过或产品缺陷已证。未因该误判修改应用源码。
+
+仅修自管测试wrapper为已证路径，fresh同 b9af/同源exe，随机fixture BID `dd2b8bf74c`、重签exe `b471ef09a7a81779654cc6f330a0667afb93f659600583b2b1d8dbff427a068c`；新汇总 `/tmp/fs111-peerexit-public-b9af4e06dff4-dd2b8bf74c.json`，原b9公共记录未覆盖。每向先经wrapper --version生成start/exit0，再确认真实GNU PID活着且为原TTY前台进程组，唯一CAN写入后独立wait记录exit128，之后才发同TTY命令。
+
+| GNU0.12 产品链场景 | 取消前进度 / 134217728字节 | 已核结果 |
+| --- | --- | --- |
+| MCP terminal.download / sz | 189440字节 | cancelled/unverified；16B CAN完整write-all无短写，独立自然exit128，随后同TTY marker；inner shell自然exit0。 |
+| MCP terminal.upload / rz | 146432字节 | cancelled/unverified；16B CAN完整write-all无短写，独立自然exit128，随后同TTY marker；inner shell自然exit0。 |
+
+经理亲读两个原始JSON核 source/fixture hash、preflight/live/cancel/peer/marker/cleanup，不仅转述passed字段。报告位于协议工作区 `.cache/1.1.1-protocol-end/cancel-probe/product-oracle-fixed-sz-f10fa32452.json` 和 `product-oracle-fixed-rz-e64142ddf4.json`。两任务仍诚实返回本地取消/对端未知；测试借独立peer观测取得退出证据，未把该特定结果推广为协议普遍保证。范围为真实loopback SSH→raw relay→nonTTY Docker→GNU0.12 innerPTY，不冒充真实137服务器或原-it故障链复现。自管sid/container/目录均已核回收，全局fixture清理由独立QA最终核对；总体D3尚待固定本文与完整汇总。

@@ -47,14 +47,16 @@
 下载使用 `terminal.download` 的 `session_id` 和 `remote_path`，其中 `remote_path` 是单个远端文件路径。
 路径中的空格、中文和引号作为字面值处理；`~`、变量及通配符不展开。控制字符和协议不能保真的文件名会被拒绝。
 
-下载保存到对应连接的本机下载沙箱，不覆盖已有文件；结果通过 `local_relative_path` 给出最终相对路径。
-安全编码可能将冒号等字符转义，不要用远端原名猜测本机落点。失败时可能保留 partial，按返回的恢复信息检查。
+下载保存到对应连接的本机下载沙箱，不覆盖已有文件。`local_relative_path` 在任务完成后表示交付路径；
+未完成或失败时也可能只是计划落点，字段存在不证明文件已经创建。安全编码可能将冒号等字符转义，
+不要用远端原名猜测本机落点。失败时检查 `partial_relative_path` 和错误中的恢复信息。
 预约被明确拒绝时，错误可包含 `accepted:false` 和临时文件的相对路径；这类请求没有已受理任务 ID，不要对它查询不存在的任务。
 
 ## 进度、取消和结果
 
 提交返回 `transfer_id`、`accepted` 和 `observe_with`；`accepted=true` 表示已受理。
-用 `transfer.status` 查询，或用 `transfer.list` 查找本次运行的任务。提交响应丢失时先查任务，避免重复上传。
+用 `transfer.status` 查询，或用 `transfer.list` 查找本次运行的任务。错误回包若仍带有 `transfer_id` 或
+`observe_with`，也必须先查原任务，不要重新提交。提交响应丢失时先查任务，避免重复上传。
 
 终端传输标识为 `terminal_zmodem`、`interactive_terminal`，`peer_identity_verified=false`。
 `remote_path` 表示请求意图；完成时的 `protocol_confirmed` 表示协议及本地 IO 完成，不是远端 SHA-256 或主机身份核验。
