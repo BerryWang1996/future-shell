@@ -548,6 +548,20 @@ async fn dispatch_after_gate(
     if ran
         .as_ref()
         .err()
+        .is_some_and(|e| e == crate::ports::SESSION_BUSY)
+    {
+        return CallOutput::err(ToolError {
+            is_error: true,
+            code: "FS_MCP_CONFLICT",
+            tier: Some(gated.tier().as_str()),
+            confirmation_required: false,
+            message: crate::ports::SESSION_BUSY.into(),
+            details: None,
+        });
+    }
+    if ran
+        .as_ref()
+        .err()
         .is_some_and(|e| e == crate::ports::SESSION_UNAVAILABLE)
     {
         return CallOutput::err(ToolError {
@@ -1007,6 +1021,7 @@ mod tests {
         calls: std::sync::Arc<Calls>,
         text: String,
         deny_at_execution: bool,
+        send_error: Option<String>,
         current_generation: Option<std::sync::Arc<AtomicUsize>>,
         read_delay: Duration,
         read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -1060,7 +1075,8 @@ mod tests {
                 "original session generation must reach the port"
             );
             self.calls.send.fetch_add(1, SeqCst);
-            Box::pin(async move { Ok(()) })
+            let error = self.send_error.clone();
+            Box::pin(async move { error.map_or(Ok(()), Err) })
         }
     }
 
@@ -1316,6 +1332,7 @@ mod tests {
                     calls: calls.clone(),
                     text: "screen text".into(),
                     deny_at_execution: false,
+                    send_error: None,
                     current_generation: None,
                     read_delay: Duration::ZERO,
                     read_hook: Mutex::new(None),
@@ -2643,5 +2660,41 @@ mod tests {
     #[tokio::test]
     async fn rmcp_cancel_during_failed_settled_preserves_known_redacted_result() {
         protocol_cancel_case(false, false, 2, false, Some(RecordPhase::Settled)).await;
+    }
+    #[tokio::test]
+    async fn terminal_busy_maps_conflict_while_reads_and_cancel_keep_dispatching() {
+        for (name, args) in [
+            (
+                "terminal.send",
+                r#"{"session_id":"s1","payload":"echo synthetic"}"#,
+            ),
+            (
+                "terminal.send_raw",
+                r#"{"session_id":"s1","payload":"\u0003"}"#,
+            ),
+        ] {
+            let mut rig = Rig::new();
+            rig.term.send_error = Some(crate::ports::SESSION_BUSY.into());
+            let result = rig.call(name, args).await;
+            assert_eq!(result.error_code(), Some("FS_MCP_CONFLICT"), "{name}");
+            assert!(rig
+                .call("terminal.read", r#"{"session_id":"s1","source":"screen"}"#)
+                .await
+                .error_code()
+                .is_none());
+            assert!(rig
+                .call("transfer.cancel", r#"{"transfer_id":"known-handle"}"#)
+                .await
+                .error_code()
+                .is_none());
+            assert_eq!(rig.calls.read_text.load(SeqCst), 1);
+            assert!(rig
+                .management
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(tool, _)| matches!(tool, crate::managed::ManagedTool::Cancel { .. })));
+        }
     }
 }

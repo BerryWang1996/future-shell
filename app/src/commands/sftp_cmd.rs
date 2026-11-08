@@ -639,7 +639,10 @@ pub(crate) async fn submit_core(
         .registry
         .get_with_generation(&session_id)
         .ok_or("no session")?;
-    let _operation = live.operation_gate.lock().await;
+    let _operation = crate::zmodem_bridge::idle_operation_gate(live.operation_gate.clone(), || {
+        crate::zmodem_bridge::mcp_terminal_busy(state, &session_id)
+    })
+    .await?;
     if state.registry.generation_of(&session_id) != Some(generation)
         || registration
             .as_ref()

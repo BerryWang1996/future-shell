@@ -20,6 +20,14 @@ fn failed(error: impl std::fmt::Display) -> ManagementError {
     ManagementError::new("FS_MCP_OPERATION_FAILED", error.to_string())
 }
 
+fn operation_failed(error: String) -> ManagementError {
+    if error == fs_mcpbridge::ports::SESSION_BUSY {
+        ManagementError::new("FS_MCP_CONFLICT", error)
+    } else {
+        failed(error)
+    }
+}
+
 fn session_failed(error: crate::commands::session_cmd::SessionControlError) -> ManagementError {
     use crate::commands::session_cmd::SessionControlError;
     let code = match &error {
@@ -204,7 +212,7 @@ impl McpManagement {
             &self.state,
         )
         .await
-        .map_err(failed)?;
+        .map_err(operation_failed)?;
         Ok(json!({"transfer_id":handle,"accepted":true,"observe_with":"transfer.status"}))
     }
 
@@ -290,6 +298,11 @@ impl McpManagement {
                 "该 SSH 连接未允许 MCP 操作，请在连接编辑器核对授权",
             ));
         }
+        if !matches!(tool, ManagedTool::Details { .. })
+            && crate::zmodem_bridge::mcp_terminal_busy(&self.state, sid)
+        {
+            return Err(operation_failed(fs_mcpbridge::ports::SESSION_BUSY.into()));
+        }
         match tool {
             ManagedTool::Upload { .. } | ManagedTool::Download { .. } => {
                 return self.submit(tool, generation).await
@@ -315,7 +328,15 @@ impl McpManagement {
             }
             _ => {}
         }
-        let _guard = live.operation_gate.lock().await;
+        let _guard = if matches!(tool, ManagedTool::Details { .. }) {
+            live.operation_gate.clone().lock_owned().await
+        } else {
+            crate::zmodem_bridge::idle_operation_gate(live.operation_gate.clone(), || {
+                crate::zmodem_bridge::mcp_terminal_busy(&self.state, sid)
+            })
+            .await
+            .map_err(operation_failed)?
+        };
         if self.state.registry.generation_of(sid) != Some(generation) {
             return Err(unavailable());
         }
@@ -501,5 +522,20 @@ mod tests {
             fs_sshengine::sandbox::prepare_destination(root.path(), Path::new("a/b/file")).unwrap();
         assert!(good.parent().unwrap().is_dir());
         assert!(good.starts_with(root.path().canonicalize().unwrap()));
+    }
+    #[test]
+    fn occupied_terminal_is_conflict_not_unavailable_or_forbidden() {
+        assert_eq!(
+            operation_failed(fs_mcpbridge::ports::SESSION_BUSY.into()).code,
+            "FS_MCP_CONFLICT"
+        );
+        assert_eq!(
+            session_failed(crate::commands::session_cmd::SessionControlError::Busy).code,
+            "FS_MCP_CONFLICT"
+        );
+        assert_eq!(
+            operation_failed("unrelated IO failure".into()).code,
+            "FS_MCP_OPERATION_FAILED"
+        );
     }
 }

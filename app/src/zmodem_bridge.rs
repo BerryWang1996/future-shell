@@ -326,6 +326,39 @@ struct Transfer {
     file_count: u32,
 }
 
+pub(crate) fn mcp_terminal_busy(state: &crate::state::AppState, session_id: &str) -> bool {
+    state
+        .zmodem
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(session_id)
+        .is_some_and(|tap| owner_slot_busy(&tap.mcp))
+}
+
+fn owner_slot_busy(slot: &Mutex<Option<McpOwner>>) -> bool {
+    // finish 可持 owner 同步落盘；拒忙不能反过来等待该 IO，也不能阻塞取消请求。
+    match slot.try_lock() {
+        Ok(owner) => owner.is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(owner)) => owner.into_inner().is_some(),
+    }
+}
+
+/// 所有普通输入与长操作共用原 gate；predicate 只查询当前 MCP owner，不持锁 await。
+pub(crate) async fn idle_operation_gate(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    busy: impl Fn() -> bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if busy() {
+        return Err(fs_mcpbridge::ports::SESSION_BUSY.into());
+    }
+    let guard = gate.lock_owned().await;
+    if busy() {
+        return Err(fs_mcpbridge::ports::SESSION_BUSY.into());
+    }
+    Ok(guard)
+}
+
 pub(crate) enum McpTransferIo {
     Upload(UploadSource),
     Download {
@@ -3790,6 +3823,101 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Done { ok: true, .. })));
+    }
+    #[tokio::test]
+    async fn busy_gate_rechecks_owner_reserved_after_precheck_before_acquisition() {
+        use std::sync::atomic::AtomicBool;
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let reserved = Arc::new(AtomicBool::new(false));
+        let prior = gate.clone().lock_owned().await;
+        let checked = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            let reserved = reserved.clone();
+            let checked = checked.clone();
+            async move {
+                idle_operation_gate(gate, || {
+                    checked.notify_one();
+                    reserved.load(Ordering::SeqCst)
+                })
+                .await
+            }
+        });
+        checked.notified().await; // actual helper 的前检已完成，但旧长操作仍持 gate。
+        reserved.store(true, Ordering::SeqCst); // 先前持 gate 的提交在释放前原子登记预约。
+        drop(prior);
+        let result = waiter.await.unwrap();
+        assert!(matches!(result, Err(ref error) if error == fs_mcpbridge::ports::SESSION_BUSY));
+    }
+    #[tokio::test]
+    async fn busy_gate_fast_rejection_writes_nothing_and_other_session_remains_usable() {
+        let blocked = Arc::new(tokio::sync::Mutex::new(()));
+        let _holder = blocked.clone().lock_owned().await;
+        let writes = AtomicU64::new(0);
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            let _guard = idle_operation_gate(blocked, || true).await?;
+            writes.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result,Err(error) if error==fs_mcpbridge::ports::SESSION_BUSY));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        let other = Arc::new(tokio::sync::Mutex::new(()));
+        let _usable = idle_operation_gate(other, || false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_reservation_waits_for_prior_long_operation_gate() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let ordinary = idle_operation_gate(gate.clone(), || false).await.unwrap();
+        let reserved = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
+        let mut reserve = tokio::spawn({
+            let gate = gate.clone();
+            let reserved = reserved.clone();
+            let started = started.clone();
+            async move {
+                started.notify_one();
+                let guard = gate.lock_owned().await; // reserve_mcp 实际使用同一原 gate。
+                reserved.store(true, Ordering::SeqCst);
+                guard
+            }
+        });
+        started.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut reserve)
+                .await
+                .is_err()
+        );
+        assert!(!reserved.load(Ordering::SeqCst));
+        drop(ordinary);
+        let reservation = reserve.await.unwrap();
+        assert!(reserved.load(Ordering::SeqCst));
+        let result = idle_operation_gate(gate, || reserved.load(Ordering::SeqCst)).await;
+        assert!(matches!(result,Err(error) if error==fs_mcpbridge::ports::SESSION_BUSY));
+        drop(reservation);
+    }
+    #[test]
+    fn busy_query_does_not_wait_for_owner_io_and_recovers_empty_poison() {
+        let (owner, _sender, _dir) = upload_owner();
+        let slot = Mutex::new(Some(owner));
+        let held = slot.lock().unwrap();
+        assert!(
+            owner_slot_busy(&slot),
+            "same-thread held owner must not deadlock on busy query"
+        );
+        drop(held);
+        assert!(owner_slot_busy(&slot));
+        slot.lock().unwrap().take();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = slot.lock().unwrap();
+            panic!("controlled empty slot poison");
+        }));
+        assert!(
+            !owner_slot_busy(&slot),
+            "closed driver empty poison must not block ordinary input forever"
+        );
     }
 }
 

@@ -27,6 +27,7 @@ use crate::tool::ReadSource;
 pub type PortResult<T> = Result<T, String>;
 pub const SESSION_FORBIDDEN: &str = "该会话不可通过 MCP 使用";
 pub const SESSION_UNAVAILABLE: &str = "会话不可用或已变化";
+pub const SESSION_BUSY: &str = "终端正被 MCP 文件传输占用，请等待或取消该任务";
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

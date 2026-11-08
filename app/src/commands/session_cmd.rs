@@ -431,11 +431,27 @@ pub async fn term_input(
             return sp.link.write(bytes).await;
         }
     }
-    let session = state.registry.get(&session_id).ok_or("no session")?;
+    let (generation, session) = state
+        .registry
+        .get_with_generation(&session_id)
+        .ok_or("no session")?;
+    // operation_gate 与写锁共用原 3 秒锁预算；预约和普通输入不能交错插入字节。
+    let lock_deadline = tokio::time::Instant::now() + WRITE_LOCK_TIMEOUT;
+    let _operation = tokio::time::timeout_at(
+        lock_deadline,
+        crate::zmodem_bridge::idle_operation_gate(session.operation_gate.clone(), || {
+            crate::zmodem_bridge::mcp_terminal_busy(&state, &session_id)
+        }),
+    )
+    .await
+    .map_err(|_| "会话操作锁等待超时".to_string())??;
+    if state.registry.generation_of(&session_id) != Some(generation) {
+        return Err("会话已变化，未发送输入".into());
+    }
     // 写半部 Mutex 串行化保证输入字节顺序；data_bytes 收 impl Into<Bytes>（Vec<u8> 可入；F5）
     // S289：guard 具名绑定——链式临时量在块尾与 session 的 drop 次序冲突（E0597）
     // 审计2 #39：锁与写入各带等待预算（见常量注释），超时如实报错。
-    let guard = tokio::time::timeout(WRITE_LOCK_TIMEOUT, session.write.lock())
+    let guard = tokio::time::timeout_at(lock_deadline, session.write.lock())
         .await
         .map_err(|_| format!("写锁等待超时（{} 秒）", WRITE_LOCK_TIMEOUT.as_secs()))?;
     tokio::time::timeout(DATA_BYTES_TIMEOUT, guard.data_bytes(bytes))
@@ -592,7 +608,14 @@ pub(crate) async fn close_core(
         .as_ref()
         .map(|(_, session)| session.operation_gate.clone());
     let _guard = match &lock {
-        Some(lock) => Some(lock.lock().await),
+        Some(lock) if reject_busy => Some(
+            crate::zmodem_bridge::idle_operation_gate(lock.clone(), || {
+                crate::zmodem_bridge::mcp_terminal_busy(state, session_id)
+            })
+            .await
+            .map_err(|_| SessionControlError::Busy)?,
+        ),
+        Some(lock) => Some(lock.clone().lock_owned().await),
         None => None,
     };
     if bound.as_ref().is_some_and(|(generation, _)| {
@@ -683,7 +706,15 @@ pub(crate) async fn reconnect_core(
         .get_with_generation(session_id)
         .ok_or(SessionControlError::Unavailable)?;
     let gate = session.operation_gate.clone();
-    let _guard = gate.lock().await;
+    let _guard = if mcp {
+        crate::zmodem_bridge::idle_operation_gate(gate, || {
+            crate::zmodem_bridge::mcp_terminal_busy(state, session_id)
+        })
+        .await
+        .map_err(|_| SessionControlError::Busy)?
+    } else {
+        gate.lock_owned().await
+    };
     if expected.is_some_and(|g| g != generation)
         || state.registry.generation_of(session_id) != Some(generation)
     {
@@ -1425,8 +1456,13 @@ mod tests {
         // 两处写锁等待：term_input 一处、term_resize 一处（同一缺陷类别的同源修复）
         assert_eq!(
             line_eq("let guard = tokio::time::timeout(WRITE_LOCK_TIMEOUT, session.write.lock())"),
-            2,
-            "term_input 与 term_resize 都必须带写锁等待预算"
+            1,
+            "term_resize 保留写锁等待预算"
+        );
+        assert_eq!(
+            line_eq("let guard = tokio::time::timeout_at(lock_deadline, session.write.lock())"),
+            1,
+            "term_input 的操作门锁与写锁共用同一锁截止时间"
         );
     }
 
