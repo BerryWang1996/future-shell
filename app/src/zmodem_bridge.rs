@@ -72,22 +72,52 @@ fn classify_start(kind: fs_terminal::zmodem::FrameKind) -> Option<Detected> {
 enum Effect {
     /// 回写 SSH 通道
     Send(Vec<u8>),
+    /// 取消控制字节：失败后仍须给对端一次退出机会。
+    Cancel,
+    CancelDone {
+        message: String,
+    },
     /// 开始接收：在沙箱里定名并建文件
-    Begin { name: String, size: Option<u64> },
+    Begin {
+        name: String,
+        size: Option<u64>,
+    },
     /// 追加落盘
     Write(Vec<u8>),
     /// 当前文件收完
-    Finish { bytes: u64 },
+    Finish {
+        bytes: u64,
+    },
     /// 索要待发文件在该偏移处的一块。
     ///
     /// 偏移必须带着走、不能假定顺序读：ZRPOS 是 ZMODEM 的重传机制，对端校验出错
     /// 就会要求**回退**到某个偏移重发。顺序读会从上次读到的地方继续，于是重发的
     /// 内容错位——落地文件长度正确、内容从错位点起全错，且不报任何错。
-    NeedChunk { offset: u64 },
+    NeedChunk {
+        offset: u64,
+    },
     /// 发送侧：当前文件被对端收妥。驱动任务据此出队下一个或 finish。
     FileSent,
     /// 会话终结
-    Done { ok: bool, message: String },
+    Done {
+        ok: bool,
+        message: String,
+    },
+}
+
+const EFFECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn effect_admitted(effect: &Effect, cancelling: bool, failed: bool) -> bool {
+    if cancelling {
+        matches!(effect, Effect::Cancel | Effect::CancelDone { .. })
+    } else if failed {
+        matches!(
+            effect,
+            Effect::Cancel | Effect::Done { .. } | Effect::CancelDone { .. }
+        )
+    } else {
+        true
+    }
 }
 
 struct QueuedEffect {
@@ -180,9 +210,6 @@ fn cancellation_actions(
         return Ok(Vec::new());
     }
     if let Some(transfer) = cur.as_mut() {
-        if transfer.session.is_finished() {
-            return Err("传输正在收尾".into());
-        }
         cancelling.store(true, Ordering::SeqCst);
         return Ok(transfer.session.cancel());
     }
@@ -436,6 +463,7 @@ impl ZmodemTap {
     fn dispatch(&self, transfer_id: u64, acts: Vec<Action>) -> Result<(), String> {
         for a in acts {
             let eff = match a {
+                Action::Send(b) if b == fs_terminal::zmodem::cancel_sequence() => Effect::Cancel,
                 Action::Send(b) => Effect::Send(b),
                 Action::BeginRecv(info) => Effect::Begin {
                     name: info.name,
@@ -445,6 +473,9 @@ impl ZmodemTap {
                 Action::FinishRecv { bytes } => Effect::Finish { bytes },
                 Action::NeedChunk { offset } => Effect::NeedChunk { offset },
                 Action::FileSent => Effect::FileSent,
+                Action::Done { ok: false, message } if self.cancelling.load(Ordering::SeqCst) => {
+                    Effect::CancelDone { message }
+                }
                 Action::Done { ok, message } => Effect::Done { ok, message },
             };
             self.queue(transfer_id, eff)?;
@@ -678,6 +709,15 @@ impl ByteTap for ZmodemTap {
     }
 }
 
+async fn acquire_operation_gate(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    tokio::time::timeout_at(deadline, gate.lock_owned())
+        .await
+        .map_err(|_| "终端传输登记/操作锁超时，结果未知".to_string())
+}
+
 /// 等待本 tap 首次登记，并固定其 SSH 连接代次。
 /// 仅首次登记可等待；已经绑定的 tap 一旦失效决不能绑定新连接。
 async fn bound_session(
@@ -691,7 +731,7 @@ async fn bound_session(
     ),
     String,
 > {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + EFFECT_BUDGET;
     loop {
         let bound = tap.connection_generation.load(Ordering::SeqCst);
         if let Some((generation, session)) = state.registry.get_with_generation(session_id) {
@@ -699,14 +739,7 @@ async fn bound_session(
                 return Err("终端连接已变化，传输结果未知".into());
             }
             let gate = session.operation_gate.clone();
-            let guard = if bound == 0 {
-                match tokio::time::timeout_at(deadline, gate.lock_owned()).await {
-                    Ok(guard) => guard,
-                    Err(_) => return Err("终端传输首次登记超时，结果未知".into()),
-                }
-            } else {
-                gate.lock_owned().await
-            };
+            let guard = acquire_operation_gate(gate, deadline).await?;
             let same_generation = state.registry.generation_of(session_id) == Some(generation);
             let same_tap = state
                 .zmodem
@@ -771,28 +804,42 @@ async fn drive(
         if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
             continue;
         }
-        if tap.failure_message().is_some() && !matches!(queued.effect, Effect::Done { .. }) {
+        if !effect_admitted(
+            &queued.effect,
+            tap.cancelling.load(Ordering::SeqCst),
+            tap.failure_message().is_some(),
+        ) {
             continue;
         }
         match queued.effect {
-            Effect::Send(bytes) => {
-                let guard = session.write.lock().await;
-                if let Err(e) = guard.data_bytes(bytes).await {
+            effect @ (Effect::Send(_) | Effect::Cancel) => {
+                let is_cancel = matches!(effect, Effect::Cancel);
+                let bytes = match effect {
+                    Effect::Send(bytes) => bytes,
+                    Effect::Cancel => fs_terminal::zmodem::cancel_sequence(),
+                    _ => unreachable!(),
+                };
+                // 写锁与通道背压共用预算。超时后的写入结果未知，绝不重发。
+                let result = tokio::time::timeout(EFFECT_BUDGET, async {
+                    let guard = session.write.lock().await;
+                    if !is_cancel && tap.cancelling.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    guard.data_bytes(bytes).await.map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|_| Err("写锁/通道写入超时".into()));
+                if let Err(e) = result {
                     let error = format!("ZMODEM 写入失败，传输结果未知：{e}");
                     tracing::warn!(%session_id, %error);
                     *tap.failure.lock().unwrap() = Some(error.clone());
                     emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
                     let mut cur = tap.cur.lock().unwrap();
                     if let Some(t) = cur.as_mut() {
-                        let actions = t
-                            .session
-                            .cancel()
-                            .into_iter()
-                            .filter(|a| matches!(a, Action::Done { .. }))
-                            .collect();
-                        tap.cancelling.store(true, Ordering::SeqCst);
-                        let _ = tap.dispatch(transfer_id, actions);
+                        let _ = t.session.cancel();
                     }
+                    tap.cancelling.store(true, Ordering::SeqCst);
+                    let _ = tap.queue(transfer_id, Effect::CancelDone { message: error });
                 }
             }
             Effect::Begin { name, size } => {
@@ -873,24 +920,15 @@ async fn drive(
                 // 按兜底策略先归置它——建议目录 + keep-both。**不能直接覆盖**，
                 // 覆盖会让它的 spool 成为 .incoming 里再没人引用的孤儿，
                 // 而用户那边看起来是「少了一个文件」。
-                if let Some(stale) = tap.pending_finalize.lock().unwrap().take() {
+                if tap.pending_finalize.lock().unwrap().is_some() {
                     let dir = tap
                         .session_download_dir
                         .lock()
                         .unwrap()
                         .clone()
                         .unwrap_or_else(|| default_download_dir(&tap.sandbox));
-                    let _ = std::fs::create_dir_all(&dir);
-                    if let Ok(Some((name, path, bytes))) = run_finalize(
-                        &tap.session_download_dir,
-                        &tap.finalized,
-                        &session_id,
-                        stale.clone(),
-                        &dir,
-                        None,
-                        "keep-both",
-                    ) {
-                        emit_progress(
+                    match finalize_download(&tap, &session_id, &dir, None, "keep-both") {
+                        Ok(Some((name, path, bytes))) => emit_progress(
                             &app,
                             &session_id,
                             "saved",
@@ -899,10 +937,13 @@ async fn drive(
                             bytes,
                             Some(bytes),
                             "",
-                        );
-                    } else {
-                        // 归置失败至少留痕；spool 还在 .incoming，可手工找回
-                        tracing::warn!(%session_id, spool = %stale.spool.display(), "未决下载兜底归置失败");
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            emit_progress(&app, &session_id, "failed", "", None, 0, None, &error);
+                            let _ = tap.cancel();
+                            continue;
+                        }
                     }
                 }
                 *tap.pending_finalize.lock().unwrap() = Some(PendingFinalize {
@@ -919,6 +960,9 @@ async fn drive(
                 // 喂数据——喂的还是上一个文件的内容。
                 let acts = {
                     let mut cur = tap.cur.lock().unwrap();
+                    if tap.cancelling.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     let Some(t) = cur.as_mut() else { continue };
                     match t.pending.pop_front() {
                         Some(next) => {
@@ -959,6 +1003,9 @@ async fn drive(
                 let mut buf = vec![0u8; fs_terminal::zsession::SUBPACKET_BYTES];
                 let result = {
                     let mut cur = tap.cur.lock().unwrap();
+                    if tap.cancelling.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     let Some(t) = cur.as_mut() else { continue };
                     match t.source.as_mut() {
                         None => Err("待发文件不可用".to_string()),
@@ -995,18 +1042,31 @@ async fn drive(
                 };
                 let _ = tap.dispatch(transfer_id, acts);
             }
-            Effect::Done { ok, message } => {
+            effect @ (Effect::Done { .. } | Effect::CancelDone { .. }) => {
+                let cancellation_terminal = matches!(effect, Effect::CancelDone { .. });
+                let (ok, message) = match effect {
+                    Effect::Done { ok, message } => (ok, message),
+                    Effect::CancelDone { message } => (false, message),
+                    _ => unreachable!(),
+                };
                 let mut cur = tap.cur.lock().unwrap();
-                if transfer_id != tap.transfer_id.load(Ordering::SeqCst) {
+                if transfer_id != tap.transfer_id.load(Ordering::SeqCst)
+                    || (tap.cancelling.load(Ordering::SeqCst) && !cancellation_terminal)
+                {
                     continue;
                 }
                 let path = cur.as_mut().and_then(|t| {
                     if let Some(mut sink) = t.sink.take() {
-                        let _ = sink.flush();
+                        if let Err(error) = sink.flush() {
+                            *tap.failure.lock().unwrap() =
+                                Some(format!("ZMODEM 收尾刷新失败：{error}"));
+                        }
                     }
                     t.sink_path.clone()
                 });
                 *cur = None;
+                // 关闭本轮：已排队的迟到 Done/数据不得复活它。
+                tap.transfer_id.fetch_add(1, Ordering::SeqCst);
                 tap.busy.store(false, Ordering::SeqCst);
                 tap.cancelling.store(false, Ordering::SeqCst);
                 tap.sniff.lock().unwrap().clear();
@@ -1014,7 +1074,13 @@ async fn drive(
                 tap.need_file_announced.store(false, Ordering::SeqCst);
                 let failure = tap.failure_message();
                 let ok = ok && failure.is_none();
-                let message = failure.unwrap_or(message);
+                let message = failure.unwrap_or_else(|| {
+                    if ok && tap.pending_finalize.lock().unwrap().is_some() {
+                        "协议传输完成，文件等待保存".into()
+                    } else {
+                        message
+                    }
+                });
                 tracing::info!(%session_id, ok, message, "ZMODEM 传输结束");
                 emit_progress(
                     &app,
@@ -1092,6 +1158,155 @@ fn open_spool(sandbox: &Path) -> Result<(std::fs::File, PathBuf), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transfer(session: ZmodemSession) -> Transfer {
+        Transfer {
+            id: 1,
+            session,
+            sink: None,
+            sink_path: None,
+            source: None,
+            recv_name: None,
+            reported: 0,
+            pending: Default::default(),
+            file_index: 1,
+            file_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_operation_gate_times_out_and_later_close_can_acquire() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let result = acquire_operation_gate(
+            gate.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("结果未知"));
+        drop(held);
+        let acquired = acquire_operation_gate(
+            gate.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        drop(acquired);
+        assert!(gate.try_lock().is_ok(), "超时任务不得留下操作锁");
+    }
+
+    #[test]
+    fn cancellation_blocks_queued_file_sent_and_late_success() {
+        // 审查反例：FileSent 已排队，用户 cancel 先于驱动消费它。
+        let queue = [
+            Effect::FileSent,
+            Effect::Cancel,
+            Effect::CancelDone {
+                message: "cancelled".into(),
+            },
+            Effect::Send(b"ZFIN".to_vec()),
+            Effect::Done {
+                ok: true,
+                message: "success".into(),
+            },
+        ];
+        let admitted: Vec<_> = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, effect)| effect_admitted(effect, true, false))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(admitted, vec![1, 2], "取消后只能发CAN和取消终态");
+        assert!(!effect_admitted(
+            &Effect::NeedChunk { offset: 0 },
+            true,
+            false
+        ));
+        assert!(!effect_admitted(&Effect::Write(vec![1]), true, false));
+    }
+
+    #[test]
+    fn io_failure_still_allows_cancel_control() {
+        assert!(
+            effect_admitted(&Effect::Cancel, true, true),
+            "文件失败也必须发送CAN"
+        );
+        assert!(effect_admitted(
+            &Effect::CancelDone {
+                message: "io failed".into()
+            },
+            true,
+            true
+        ));
+        assert!(!effect_admitted(
+            &Effect::Send(b"data".to_vec()),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn io_failure_after_protocol_finished_can_cancel_once() {
+        let mut session = ZmodemSession::new_receive();
+        session.cancel(); // 协议终态先到达，文件效果尚在驱动队列。
+        let mut cur = Some(transfer(session));
+        let waiting = AtomicBool::new(false);
+        let cancelling = AtomicBool::new(false);
+        let first = cancellation_actions(&mut cur, &waiting, &cancelling).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|a| matches!(a, Action::Send(_)))
+                .count(),
+            1
+        );
+        assert!(cancellation_actions(&mut cur, &waiting, &cancelling)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_finalize_keeps_pending_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        std::fs::write(&spool, b"received").unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let mut slot = Some(PendingFinalize {
+            spool: spool.clone(),
+            orig_name: "payload".into(),
+            bytes: 8,
+        });
+        let selected = Mutex::new(None);
+        let finalized = Mutex::new(Default::default());
+        assert!(finalize_pending(
+            &mut slot,
+            &selected,
+            &finalized,
+            "s",
+            &blocked,
+            None,
+            "keep-both"
+        )
+        .is_err());
+        assert_eq!(slot.as_ref().unwrap().spool, spool);
+        assert_eq!(std::fs::read(&spool).unwrap(), b"received");
+        assert!(finalized.lock().unwrap().is_empty());
+        let destination = dir.path().join("out");
+        let saved = finalize_pending(
+            &mut slot,
+            &selected,
+            &finalized,
+            "s",
+            &destination,
+            None,
+            "keep-both",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(slot.is_none());
+        assert_eq!(std::fs::read(saved.1).unwrap(), b"received");
+    }
 
     #[test]
     fn waiting_for_local_file_cancel_sends_can_and_reports_terminal() {
@@ -1535,6 +1750,7 @@ async fn decide_and_maybe_finalize(
             Err(e) => {
                 tracing::warn!(%session_id, error = %e, "ZMODEM 直接归置失败");
                 emit_progress(app, session_id, "failed", &display_name, None, 0, None, &e);
+                let _ = tap.cancel();
                 return;
             }
         };
@@ -1602,18 +1818,42 @@ fn finalize_download(
     name_override: Option<&str>,
     policy: &str,
 ) -> Result<Option<(String, PathBuf, u64)>, String> {
-    let Some(pending) = tap.pending_finalize.lock().unwrap().take() else {
-        return Ok(None);
-    };
-    run_finalize(
+    let mut slot = tap.pending_finalize.lock().unwrap();
+    finalize_pending(
+        &mut slot,
         &tap.session_download_dir,
         &tap.finalized,
         session_id,
-        pending,
         dir,
         name_override,
         policy,
     )
+    .inspect_err(|error| *tap.failure.lock().unwrap() = Some(error.clone()))
+}
+
+fn finalize_pending(
+    slot: &mut Option<PendingFinalize>,
+    session_dir: &Mutex<Option<PathBuf>>,
+    finalized: &Mutex<std::collections::HashSet<PathBuf>>,
+    session_id: &str,
+    dir: &Path,
+    name_override: Option<&str>,
+    policy: &str,
+) -> Result<Option<(String, PathBuf, u64)>, String> {
+    let Some(pending) = slot.as_ref() else {
+        return Ok(None);
+    };
+    let result = run_finalize(
+        session_dir,
+        finalized,
+        session_id,
+        pending.clone(),
+        dir,
+        name_override,
+        policy,
+    )?;
+    *slot = None;
+    Ok(result)
 }
 
 /// [`finalize_download`] 的核心：归置一个**显式给定**的待决下载。
@@ -1652,7 +1892,7 @@ fn run_finalize(
     match policy {
         ConflictPolicy::Skip => {
             // 跳过 = 删 spool。用户明确不要这个文件；留着只是 .incoming 里的垃圾。
-            let _ = std::fs::remove_file(&pending.spool);
+            std::fs::remove_file(&pending.spool).map_err(|e| format!("清理暂存失败：{e}"))?;
             tracing::info!(%session_id, name = %safe, "ZMODEM 下载被跳过，暂存已清理");
             let p = dir.join(&safe);
             Ok(Some((safe, p, 0)))
