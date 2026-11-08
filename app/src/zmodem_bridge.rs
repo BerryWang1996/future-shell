@@ -151,6 +151,11 @@ struct QueuedEffect {
 // 只预算排队载荷：不包括当前执行的一个效果和本次 feed 已产出的动作。
 const MAX_QUEUED_EFFECTS: usize = 1024;
 const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+// 留一半硬预算给已读的 16 KiB 及尚未解析完的单包；排到双低水位才恢复。
+const READ_HIGH_EFFECTS: usize = 512;
+const READ_LOW_EFFECTS: usize = 256;
+const READ_HIGH_BYTES: usize = 4 * 1024 * 1024;
+const READ_LOW_BYTES: usize = 2 * 1024 * 1024;
 // 控制槽额外最多一个 CAN 和 4 KiB UTF-8 原因，不受普通队列挤占。
 const MAX_CONTROL_MESSAGE_BYTES: usize = 4096;
 const QUEUE_OVERFLOW: &str = "终端传输效果队列超过上限，已取消；对端退出状态未知";
@@ -176,16 +181,47 @@ struct EffectQueue {
     cancel: bool,
     terminal: Option<Effect>,
     closed: bool,
+    read_paused: bool,
+    read_stopped: bool,
+    read_ready: Arc<Notify>,
 }
 
 impl EffectQueue {
     fn reset(&mut self, round: u64) {
         let closed = self.closed;
+        let read_ready = self.read_ready.clone();
         *self = Self {
             round,
             closed,
+            read_ready,
             ..Self::default()
         };
+        self.read_ready.notify_one(); // 旧轮等待者须醒来重查新轮状态。
+    }
+
+    fn release_read(&mut self) {
+        self.read_stopped = true;
+        self.read_paused = false;
+        self.read_ready.notify_one();
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        self.release_read();
+    }
+
+    fn update_read_pressure(&mut self) {
+        if self.read_stopped || self.closed || self.failed {
+            return;
+        }
+        if self.read_paused {
+            if self.data.len() <= READ_LOW_EFFECTS && self.bytes <= READ_LOW_BYTES {
+                self.read_paused = false;
+                self.read_ready.notify_one();
+            }
+        } else if self.data.len() >= READ_HIGH_EFFECTS || self.bytes >= READ_HIGH_BYTES {
+            self.read_paused = true;
+        }
     }
 
     fn push(
@@ -211,10 +247,12 @@ impl EffectQueue {
             Effect::Cancel => {
                 // CAN 会抢先于普通队列；必须同时封住所有旧数据效果。
                 cancelling.store(true, Ordering::SeqCst);
+                self.release_read();
                 self.cancel = true;
                 return Ok(());
             }
             Effect::CancelDone { mut message } => {
+                self.release_read();
                 let mut end = message.len().min(MAX_CONTROL_MESSAGE_BYTES);
                 while !message.is_char_boundary(end) {
                     end -= 1;
@@ -230,6 +268,7 @@ impl EffectQueue {
             || bytes > MAX_QUEUED_BYTES.saturating_sub(self.bytes)
         {
             self.failed = true;
+            self.release_read();
             self.data.clear();
             self.bytes = 0;
             self.cancel = true;
@@ -238,11 +277,15 @@ impl EffectQueue {
             });
             return Err(QUEUE_OVERFLOW.into());
         }
+        if matches!(effect, Effect::Done { ok: false, .. }) {
+            self.release_read();
+        }
         self.bytes += bytes;
         self.data.push_back(QueuedEffect {
             transfer_id,
             effect,
         });
+        self.update_read_pressure();
         Ok(())
     }
 
@@ -260,17 +303,41 @@ impl EffectQueue {
         }
         let queued = self.data.pop_front()?;
         self.bytes -= queued.effect.payload_bytes();
+        self.update_read_pressure();
         Some(queued)
     }
 }
 
-#[derive(Default)]
 struct EffectChannel {
     queue: Mutex<EffectQueue>,
     ready: Notify,
+    // 原 pipe 唯一等待者；不能与 driver 的 ready 争抢通知。
+    read_ready: Arc<Notify>,
+}
+
+impl Default for EffectChannel {
+    fn default() -> Self {
+        let read_ready = Arc::new(Notify::new());
+        Self {
+            queue: Mutex::new(EffectQueue {
+                read_ready: read_ready.clone(),
+                ..Default::default()
+            }),
+            ready: Notify::new(),
+            read_ready,
+        }
+    }
 }
 
 impl EffectChannel {
+    fn read_backpressure(&self) -> Option<&Notify> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read_paused
+            .then_some(self.read_ready.as_ref())
+    }
+
     async fn recv(&self) -> QueuedEffect {
         loop {
             let notified = self.ready.notified();
@@ -289,7 +356,7 @@ impl Drop for EffectReceiver {
         let mut queue = self.0.queue.lock().unwrap();
         let round = queue.round;
         queue.reset(round);
-        queue.closed = true;
+        queue.close();
     }
 }
 
@@ -398,7 +465,7 @@ impl Drop for McpDriverGuard {
                 .queue
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .closed = true;
+                .close();
         }
         if let Some(mut slot) = owner {
             slot.take();
@@ -1269,6 +1336,9 @@ fn emit_progress_full(
 }
 
 impl ByteTap for ZmodemTap {
+    fn read_backpressure(&self) -> Option<&Notify> {
+        self.effects.read_backpressure()
+    }
     fn output_ready(&self) -> Option<&tokio::sync::Notify> {
         Some(&self.tail.ready)
     }
@@ -2115,6 +2185,240 @@ mod tests {
             pending: Default::default(),
             file_index: 1,
             file_count: 1,
+        }
+    }
+
+    #[test]
+    fn read_pressure_has_two_dimensional_hysteresis_and_keeps_hard_limits() {
+        let mut queue = EffectQueue::default();
+        for _ in 0..2 {
+            for _ in 0..READ_HIGH_EFFECTS {
+                queue.test_push(0, Effect::FileSent).unwrap();
+            }
+            assert!(queue.read_paused);
+            for _ in 0..READ_HIGH_EFFECTS - READ_LOW_EFFECTS - 1 {
+                queue.pop().unwrap();
+            }
+            assert!(queue.read_paused);
+            queue.pop().unwrap();
+            assert!(!queue.read_paused);
+            while queue.pop().is_some() {}
+        }
+        // 字节已低但项数未低，和项数已低但字节未低，两种都不能提前恢复。
+        for byte_first in [true, false] {
+            queue.reset(0);
+            if byte_first {
+                queue
+                    .test_push(0, Effect::Write(vec![0; READ_HIGH_BYTES]))
+                    .unwrap();
+            }
+            for _ in 0..READ_HIGH_EFFECTS - 1 {
+                queue.test_push(0, Effect::FileSent).unwrap();
+            }
+            if !byte_first {
+                queue
+                    .test_push(0, Effect::Write(vec![0; READ_HIGH_BYTES]))
+                    .unwrap();
+            }
+            assert!(queue.read_paused);
+            for _ in 0..READ_HIGH_EFFECTS - READ_LOW_EFFECTS - 1 {
+                queue.pop().unwrap();
+            }
+            assert!(queue.read_paused);
+            queue.pop().unwrap();
+            assert_eq!(queue.read_paused, !byte_first);
+            while queue.pop().is_some() {}
+            assert!(!queue.read_paused);
+        }
+        queue.reset(0);
+        for _ in 0..4 {
+            queue
+                .test_push(0, Effect::Write(vec![0; 1024 * 1024]))
+                .unwrap();
+        }
+        assert!(queue.read_paused);
+        queue.pop().unwrap();
+        assert!(queue.read_paused);
+        queue.pop().unwrap();
+        assert!(!queue.read_paused);
+        queue.reset(0);
+        assert!(queue
+            .test_push(0, Effect::Write(vec![0; MAX_QUEUED_BYTES + 1]))
+            .is_err());
+        assert!(queue.failed && !queue.read_paused);
+        assert!(matches!(queue.pop().unwrap().effect, Effect::Cancel));
+        assert!(matches!(
+            queue.pop().unwrap().effect,
+            Effect::CancelDone { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn paused_reader_wakes_on_low_water_cancel_failure_reset_and_close() {
+        for mode in 0..6 {
+            let channel = Arc::new(EffectChannel::default());
+            let receiver = EffectReceiver(channel.clone());
+            {
+                let mut queue = channel.queue.lock().unwrap();
+                for _ in 0..READ_HIGH_EFFECTS {
+                    queue.test_push(0, Effect::FileSent).unwrap();
+                }
+            }
+            let ready = channel.read_backpressure().unwrap();
+            // 唤醒发生在 notified 注册之前仍须保留；driver 的 ready 不得被读者消费。
+            channel.ready.notify_one();
+            match mode {
+                0 => {
+                    for _ in 0..READ_HIGH_EFFECTS - READ_LOW_EFFECTS {
+                        receiver.0.recv().await;
+                    }
+                }
+                1 => {
+                    channel
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .test_push(0, Effect::Cancel)
+                        .unwrap();
+                }
+                2 => {
+                    channel
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .test_push(
+                            0,
+                            Effect::CancelDone {
+                                message: "cancel".into(),
+                            },
+                        )
+                        .unwrap();
+                }
+                3 => {
+                    channel.queue.lock().unwrap().reset(1);
+                }
+                4 => {
+                    assert!(channel
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .test_push(0, Effect::Write(vec![0; MAX_QUEUED_BYTES + 1]))
+                        .is_err());
+                }
+                _ => {
+                    channel.queue.lock().unwrap().close();
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(1), ready.notified())
+                .await
+                .unwrap();
+            assert!(channel.read_backpressure().is_none());
+            tokio::time::timeout(Duration::from_secs(1), channel.ready.notified())
+                .await
+                .unwrap();
+            // reset 后新轮再暂停；旧轮控制效果不得误解除新轮水位。
+            channel.queue.lock().unwrap().reset(9);
+            {
+                let mut queue = channel.queue.lock().unwrap();
+                for _ in 0..READ_HIGH_EFFECTS {
+                    if !queue.closed {
+                        queue.test_push(9, Effect::FileSent).unwrap();
+                    }
+                }
+                if !queue.closed {
+                    queue.test_push(0, Effect::Cancel).unwrap();
+                    assert!(queue.read_paused);
+                }
+            }
+            drop(receiver);
+            assert!(channel.read_backpressure().is_none());
+            tokio::time::timeout(Duration::from_secs(1), channel.read_ready.notified())
+                .await
+                .unwrap();
+        }
+    }
+
+    struct BudgetPipeTap {
+        channel: Arc<EffectChannel>,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+    impl ByteTap for BudgetPipeTap {
+        fn read_backpressure(&self) -> Option<&Notify> {
+            self.channel.read_backpressure()
+        }
+        fn filter<'a>(&self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+            let mut queue = self.channel.queue.lock().unwrap();
+            for part in bytes.chunks(1024) {
+                queue.test_push(0, Effect::Write(part.to_vec())).unwrap();
+            }
+            self.peak.fetch_max(queue.data.len(), Ordering::SeqCst);
+            self.channel.ready.notify_one();
+            Cow::Borrowed(&[])
+        }
+    }
+
+    #[tokio::test]
+    async fn real_pipe_backpressures_four_and_128_mib_without_render_ack() {
+        use tokio::io::AsyncWriteExt;
+        for total in [4 * 1024 * 1024, 128 * 1024 * 1024] {
+            let channel = Arc::new(EffectChannel::default());
+            let tap = Arc::new(BudgetPipeTap {
+                channel: channel.clone(),
+                peak: Default::default(),
+            });
+            let (mut writer, reader) = tokio::io::duplex(65536);
+            let mut pipe = fs_terminal::pipe::SessionPipe::spawn(
+                reader,
+                fs_terminal::pipe::PipeOpts {
+                    grid_rows: 24,
+                    grid_cols: 80,
+                    scrollback_lines: 10,
+                    flow: Default::default(),
+                    ring_bytes: 1024,
+                    session_log: None,
+                    record: None,
+                    tap: Some(tap.clone()),
+                    decoder: Default::default(),
+                },
+            );
+            let mut rx = pipe.render_rx();
+            let producer = tokio::spawn(async move {
+                let chunk = vec![7; 16384];
+                for _ in 0..total / chunk.len() {
+                    writer.write_all(&chunk).await.unwrap();
+                }
+                writer.shutdown().await.unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while channel.read_backpressure().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // 消费者起步前，真正 pipe 已暂停；此后故意逐批让出调度，反复高低水位。
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut received = 0;
+                while received < total {
+                    match channel.recv().await.effect {
+                        Effect::Write(bytes) => {
+                            assert!(bytes.iter().all(|b| *b == 7));
+                            received += bytes.len();
+                        }
+                        _ => panic!("normal stream overflowed"),
+                    }
+                    if received % 16384 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                producer.await.unwrap();
+                assert!(rx.recv().await.is_none());
+            })
+            .await
+            .unwrap();
+            assert!(tap.peak.load(Ordering::SeqCst) <= READ_HIGH_EFFECTS + 16);
+            assert!(!channel.queue.lock().unwrap().failed);
+            assert_eq!(pipe.ring_snapshot_text(), "");
         }
     }
 

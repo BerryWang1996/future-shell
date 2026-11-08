@@ -91,6 +91,11 @@ pub trait ByteTap: Send + Sync {
     /// `Cow::Borrowed(&[])` 吞掉；传输刚结束的那一块可能返回 `Cow::Owned`
     /// （帧尾之后属于 shell 的残留字节）。
     fn filter<'a>(&self, chunk: &'a [u8]) -> std::borrow::Cow<'a, [u8]>;
+    /// 仅暂停下一次 source 读取；通知须独立于消费者通知，醒来后重新查询。
+    /// 返回前释放所有锁；默认不暂停，不影响普通 tap。
+    fn read_backpressure(&self) -> Option<&tokio::sync::Notify> {
+        None
+    }
     /// 有限协议尾字节就绪；只允许原读取任务消费。
     fn output_ready(&self) -> Option<&tokio::sync::Notify> {
         None
@@ -309,7 +314,14 @@ impl SessionPipe {
                         _ = stop_c.notified() => {
                             closing = true; draining = true; Ok(0)
                         }
-                        r = source.read(&mut buf) => r,
+                        r = async {
+                            // 只原读取任务等待；stop/tail 的外层 select 始终可唤醒。
+                            // 同步 filter 不等待消费者，也不把二进制送给渲染队列。
+                            while let Some(ready) = tap.as_ref().and_then(|t| t.read_backpressure()) {
+                                ready.notified().await;
+                            }
+                            source.read(&mut buf).await
+                        } => r,
                     }
                 };
                 let n = match read {
@@ -582,6 +594,98 @@ mod tail_tests {
             b
         }
     }
+    struct PausedTap {
+        paused: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+        drained: tokio::sync::Notify,
+        tail: TailTap,
+    }
+    impl ByteTap for PausedTap {
+        fn filter<'a>(&self, _bytes: &'a [u8]) -> Cow<'a, [u8]> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Cow::Borrowed(&[]) // headless：无渲染字节/ACK，仍须恢复读取。
+        }
+        fn read_backpressure(&self) -> Option<&tokio::sync::Notify> {
+            self.paused
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then_some(&self.drained)
+        }
+        fn output_ready(&self) -> Option<&tokio::sync::Notify> {
+            Some(&self.tail.ready)
+        }
+        fn drain_output(&self, eof: bool) -> Vec<u8> {
+            self.tail.drain_output(eof)
+        }
+    }
+
+    #[tokio::test]
+    async fn source_pause_keeps_tail_stop_and_eof_reachable_without_render_ack() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for stop_while_paused in [false, true] {
+            let tap = Arc::new(PausedTap {
+                paused: AtomicBool::new(true),
+                reads: AtomicUsize::new(0),
+                drained: Default::default(),
+                tail: TailTap {
+                    pending: Mutex::new(Vec::new()),
+                    eof: Mutex::new(Vec::new()),
+                    ready: Default::default(),
+                },
+            });
+            let (mut writer, reader) = tokio::io::duplex(128);
+            writer.write_all(b"binary").await.unwrap();
+            let mut pipe = SessionPipe::spawn(
+                reader,
+                PipeOpts {
+                    grid_rows: 24,
+                    grid_cols: 80,
+                    scrollback_lines: 10,
+                    flow: Default::default(),
+                    ring_bytes: 1024,
+                    session_log: None,
+                    record: None,
+                    tap: Some(tap.clone()),
+                    decoder: Default::default(),
+                },
+            );
+            let mut rx = pipe.render_rx();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert_eq!(
+                tap.reads.load(Ordering::SeqCst),
+                0,
+                "paused pipe must not read source"
+            );
+            *tap.tail.pending.lock().unwrap() = b"TAIL".to_vec();
+            tap.tail.ready.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while pipe.ring_snapshot_text() != "TAIL" {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(tap.reads.load(Ordering::SeqCst), 0);
+            if stop_while_paused {
+                pipe.shutdown();
+            } else {
+                // 提前存放一个通知模拟查询→await间排水，不能丢唤醒。
+                tap.paused.store(false, Ordering::SeqCst);
+                tap.drained.notify_one();
+                writer.shutdown().await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while rx.recv().await.is_some() {}
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                tap.reads.load(Ordering::SeqCst),
+                usize::from(!stop_while_paused)
+            );
+            assert_eq!(pipe.ring_snapshot_text(), "TAIL");
+        }
+    }
+
     #[tokio::test]
     async fn tail_wake_eof_and_simultaneous_read_use_normal_fanout_once() {
         for mode in 0..4 {
