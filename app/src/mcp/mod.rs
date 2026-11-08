@@ -15,6 +15,7 @@ pub(crate) mod management;
 mod ports;
 pub mod serve;
 pub(crate) mod tasks;
+pub(crate) mod terminal_command;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
