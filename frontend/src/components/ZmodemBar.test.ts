@@ -99,6 +99,13 @@ describe("ZmodemBar", () => {
     expect(screen.getByTestId("zm-cancel")).toBeTruthy();
   });
 
+  it("取消等待上传的选文件对话框时请求远端取消", async () => {
+    render(ZmodemBar, { props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) } });
+    await screen.findByTestId("file-picker");
+    await fireEvent.click(await screen.findByTestId("fp-cancel"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("zmodem_cancel", { sessionId: "s3" }));
+  });
+
   it("need-file 的跳变自动打开选择器一次", async () => {
     render(ZmodemBar, { props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) } });
     await screen.findByTestId("file-picker");
@@ -118,18 +125,6 @@ describe("ZmodemBar", () => {
     rerender({ sessionId: "s3", view: view({ needFile: true, direction: "send" }) });
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByTestId("file-picker")).toBeNull();
-  });
-
-  it("关闭后点「选择本地文件…」能重开（想继续有入口）", async () => {
-    const { rerender } = render(ZmodemBar, {
-      props: { sessionId: "s3", view: view({ needFile: true, direction: "send" }) },
-    });
-    await screen.findByTestId("file-picker");
-    await fireEvent.click(await screen.findByTestId("fp-cancel"));
-    await waitFor(() => expect(screen.queryByTestId("file-picker")).toBeNull());
-    await fireEvent.click(screen.getByTestId("zm-pick"));
-    await screen.findByTestId("file-picker");
-    expect(rerender).toBeTruthy();
   });
 
   it("选中的文件以**数组**提交给 zmodem_send（多文件上传的入口）", async () => {

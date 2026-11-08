@@ -157,6 +157,25 @@ pub struct ZmodemTap {
     tx: mpsc::UnboundedSender<Effect>,
 }
 
+fn cancellation_actions(
+    cur: &mut Option<Transfer>,
+    waiting: &AtomicBool,
+) -> Result<Vec<Action>, String> {
+    if let Some(transfer) = cur.as_mut() {
+        return Ok(transfer.session.cancel());
+    }
+    if waiting.swap(false, Ordering::SeqCst) {
+        return Ok(vec![
+            Action::Send(fs_terminal::zmodem::cancel_sequence()),
+            Action::Done {
+                ok: false,
+                message: "已请求取消；对端退出状态未知".into(),
+            },
+        ]);
+    }
+    Err("当前没有进行中的传输".into())
+}
+
 /// 一次待归置的下载。
 #[derive(Clone)]
 struct PendingFinalize {
@@ -292,9 +311,9 @@ impl ZmodemTap {
     /// 用户取消当前传输。
     pub fn cancel(&self) -> Result<(), String> {
         let mut cur = self.cur.lock().unwrap();
-        let t = cur.as_mut().ok_or("当前没有进行中的传输")?;
-        let acts = t.session.cancel();
+        let acts = cancellation_actions(&mut cur, &self.need_file_announced)?;
         drop(cur);
+        self.sniff.lock().unwrap().clear();
         self.dispatch(acts);
         Ok(())
     }
@@ -863,6 +882,40 @@ fn open_spool(sandbox: &Path) -> Result<(std::fs::File, PathBuf), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn waiting_for_local_file_cancel_sends_can_and_reports_terminal() {
+        let mut cur = None;
+        let waiting = AtomicBool::new(true);
+        let acts =
+            cancellation_actions(&mut cur, &waiting).expect("waiting rz must be cancellable");
+        assert!(acts.iter().any(
+            |a| matches!(a, Action::Send(bytes) if bytes == &fs_terminal::zmodem::cancel_sequence())
+        ));
+        assert!(acts
+            .iter()
+            .any(|a| matches!(a, Action::Done { ok: false, .. })));
+        assert!(!waiting.load(Ordering::SeqCst));
+        assert!(cancellation_actions(&mut cur, &waiting).is_err());
+    }
+
+    #[test]
+    fn first_download_directory_choice_does_not_deadlock() {
+        for setting in [None, Some(PathBuf::from("/tmp/fixture"))] {
+            let expected = setting.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let dir = Mutex::new(None);
+                let got = choose_download_dir(&dir, setting);
+                tx.send((got, dir.lock().unwrap().clone())).unwrap();
+            });
+            let (got, stored) = rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("directory choice deadlocked");
+            assert_eq!(got, expected);
+            assert_eq!(got, stored);
+        }
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "fs-zbridge-{tag}-{:?}",
@@ -1165,6 +1218,17 @@ fn default_download_dir(sandbox: &Path) -> PathBuf {
         .unwrap_or_else(|| sandbox.to_path_buf())
 }
 
+fn choose_download_dir(
+    session_dir: &Mutex<Option<PathBuf>>,
+    from_setting: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut selected = session_dir.lock().unwrap();
+    if selected.is_none() {
+        *selected = from_setting;
+    }
+    selected.clone()
+}
+
 /// 收完一个文件后的四路归置决策。
 ///
 /// 优先级：**本会话已定的目录 > 设置（fixed） > 引导/询问**。会话目录在第一次
@@ -1178,20 +1242,11 @@ async fn decide_and_maybe_finalize(
 ) {
     let cfg = state.zmodem_config().await;
     // 优先级 ①②：本会话已定 > 设置的 fixed 模式。
-    // 两步分开写而不是 `.clone().or_else(…再锁同一把锁…)`：后者的外层
-    // 临时守卫活到整条语句结束，or_else 里再锁同一把 std Mutex 就是自死锁。
+    // 读取和定格在同一把锁内完成，不能在 match 临时守卫存活时再次取锁。
     let from_setting = cfg.download.as_ref().and_then(|d| {
         (d.mode == crate::state::ZmodemDownloadMode::Fixed).then(|| PathBuf::from(&d.dir))
     });
-    let dir: Option<PathBuf> = match tap.session_download_dir.lock().unwrap().clone() {
-        Some(d) => Some(d),
-        None => {
-            // 定格为会话目录（取设置值；None 则保持 None = 要走引导/询问）
-            let next = from_setting.clone();
-            *tap.session_download_dir.lock().unwrap() = next.clone();
-            next
-        }
-    };
+    let dir = choose_download_dir(&tap.session_download_dir, from_setting);
 
     let Some(pending) = tap.pending_finalize.lock().unwrap().clone() else {
         return;

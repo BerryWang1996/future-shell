@@ -18,9 +18,8 @@
    * pickerOpen 设回 false，effect 重跑、条件又成立、弹窗立刻重开——关闭按钮
    * 形同虚设。
    *
-   * 现在的修法是**边沿触发**：只在 false→true 的跳变瞬间开一次。加上条上常驻的
-   * 「选择本地文件…」按钮（手动重开）与「取消」（通知远端退出），三件合起来
-   * 才算修完：能关、关了不弹回、想继续有入口。
+   * 现在只在 needFile 从 false 变为 true 时打开一次；关闭选择器即请求取消
+   * 远端传输。等待后端结果期间不得重新弹出选择器。
    */
   import { invoke } from "@tauri-apps/api/core";
   import { IDLE, formatBytes, progressText, type TransferView } from "../lib/zmodem";
@@ -127,7 +126,10 @@
 
   async function pick(paths: string[]) {
     pickerOpen = false;
-    if (paths.length === 0) return;
+    if (paths.length === 0) {
+      await cancel();
+      return;
+    }
     try {
       await invoke("zmodem_send", { sessionId, localPaths: paths });
     } catch (e) {
@@ -240,7 +242,7 @@
     multi={true}
     note={sandbox ? `收到的文件保存到：${sandbox}` : ""}
     onConfirm={(paths) => void pick(paths)}
-    onCancel={() => (pickerOpen = false)}
+    onCancel={() => { pickerOpen = false; void cancel(); }}
   />
 {/if}
 
