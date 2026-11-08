@@ -1,4 +1,4 @@
-//! B2 的固定 POSIX 命令与名称契约；当前尚未接线到工具或 PTY。
+//! 终端传输的固定命令与名称契约；上传须有 /bin/sh 与 rz。
 //! 返回值不含提交键；最终 writer 在被动预约成功后统一追加实际 CR。
 use fs_sshengine::{sandbox::escape_local_component, verify::shell_quote};
 use std::path::{Component, Path};
@@ -51,14 +51,16 @@ pub(crate) fn upload_basename(relative: &Path) -> Result<&str> {
 pub(crate) fn upload_command(remote_dir: &str) -> Result<String> {
     check_path(remote_dir)?;
     // ./ 同时防 cd 的选项解释及 CDPATH；不展开 ~、$ 或 glob。
-    // command cd 绕过交互 shell 的同名函数/alias，仍在子 shell 内执行。
+    // 固定 /bin/sh 子进程避开外层 zsh 的 command cd 差异及函数/alias；
+    // 目录仅经位置参数传入，不能成为脚本语法，外层工作目录保持不变。
     let dir = if remote_dir.starts_with('/') {
         remote_dir.into()
     } else {
         format!("./{remote_dir}")
     };
     Ok(format!(
-        "(command cd {} && command rz -b -e -p)",
+        "command /bin/sh -c {} fs-terminal-upload {}",
+        shell_quote("command cd \"$1\" && command rz -b -e -p"),
         shell_quote(&dir)
     ))
 }
@@ -143,7 +145,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn shell_stub(command: &str, root: &Path) -> (Vec<String>, String) {
+    fn shell_stub(shell: &str, command: &str, root: &Path) -> (Vec<String>, String) {
         use std::os::unix::fs::PermissionsExt;
         let bin = root.join("stub-bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -158,13 +160,14 @@ mod tests {
         }
         let argv = root.join("argv");
         let after = root.join("after");
-        let output = std::process::Command::new("/bin/sh")
+        let output = std::process::Command::new(shell)
+            .args(if shell.ends_with("zsh") { vec!["-f"] } else { vec![] })
             .arg("-c")
             .arg(format!(
                 "cd() {{ printf HOOK > \"$FS_CD_HOOK\"; }}\nalias cd=false\n{command}\nresult=$?\nprintf '%s' \"$PWD\" > \"$FS_AFTER\"\nexit \"$result\""
             ))
             .current_dir(root)
-            .env("PATH", &bin)
+            .env("PATH", std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap())
             .env("FS_ARGV", &argv)
             .env("FS_AFTER", &after)
             .env("CDPATH", root.join("cdpath-decoy"))
@@ -191,43 +194,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_posix_shell_preserves_argv_cwd_and_literal_metacharacters() {
-        let scratch = tempfile::tempdir().unwrap();
-        let root = scratch.path().canonicalize().unwrap();
-        let names = [
-            " dir with spaces ",
-            "中文",
-            "a'b",
-            "-leading",
-            "~",
-            "$HOME",
-            "[ab]*",
-            "$(printf HACK > pwned)",
-            "`printf HACK > pwned`",
-        ];
-        for name in names {
-            let dir = root.join(name);
-            std::fs::create_dir(&dir).unwrap();
-            std::fs::create_dir_all(root.join("cdpath-decoy").join(name)).unwrap();
-            let (argv, after) = shell_stub(&upload_command(name).unwrap(), &root);
-            assert_eq!(argv, [dir.to_str().unwrap(), "-b", "-e", "-p"]);
+    fn real_shells_preserve_target_argv_outer_cwd_and_literal_metacharacters() {
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            eprintln!("real shell oracle: {shell}");
+            let scratch = tempfile::tempdir().unwrap();
+            let root = scratch.path().canonicalize().unwrap();
+            let names = [
+                " dir with spaces ",
+                "中文",
+                "a'b",
+                "-leading",
+                "~",
+                "$HOME",
+                "[ab]*",
+                "$(printf HACK > pwned)",
+                "`printf HACK > pwned`",
+            ];
+            for name in names {
+                let dir = root.join(name);
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::create_dir_all(root.join("cdpath-decoy").join(name)).unwrap();
+                let (argv, after) = shell_stub(shell, &upload_command(name).unwrap(), &root);
+                assert_eq!(argv, [dir.to_str().unwrap(), "-b", "-e", "-p"]);
+                assert_eq!(after, root.to_str().unwrap());
+                assert!(!root.join("pwned").exists(), "upload executed {name:?}");
+                let remote = format!("{name}/file.txt");
+                let plan = download_command(&remote).unwrap();
+                let (argv, after) = shell_stub(shell, &plan.command, &root);
+                let expected = if remote.starts_with('-') {
+                    format!("./{remote}")
+                } else {
+                    remote
+                };
+                assert_eq!(argv, [root.to_str().unwrap(), "-b", "-e", "--", &expected]);
+                assert_eq!(after, root.to_str().unwrap());
+                assert!(!root.join("pwned").exists(), "download executed {name:?}");
+            }
+            let absolute = root.join("中文");
+            let (argv, after) = shell_stub(
+                shell,
+                &upload_command(absolute.to_str().unwrap()).unwrap(),
+                &root,
+            );
+            assert_eq!(argv[0], absolute.to_str().unwrap());
             assert_eq!(after, root.to_str().unwrap());
-            assert!(!root.join("pwned").exists(), "upload executed {name:?}");
-            let remote = format!("{name}/file.txt");
-            let plan = download_command(&remote).unwrap();
-            let (argv, after) = shell_stub(&plan.command, &root);
-            let expected = if remote.starts_with('-') {
-                format!("./{remote}")
-            } else {
-                remote
-            };
-            assert_eq!(argv, [root.to_str().unwrap(), "-b", "-e", "--", &expected]);
-            assert_eq!(after, root.to_str().unwrap());
-            assert!(!root.join("pwned").exists(), "download executed {name:?}");
         }
-        let absolute = root.join("中文");
-        let (argv, after) = shell_stub(&upload_command(absolute.to_str().unwrap()).unwrap(), &root);
-        assert_eq!(argv[0], absolute.to_str().unwrap());
-        assert_eq!(after, root.to_str().unwrap());
     }
 }

@@ -559,7 +559,11 @@ async fn an_approved_dangerous_call_executes_and_returns_over_the_wire() {
 
 #[tokio::test]
 async fn the_handshake_advertises_tools_and_the_server_identity() {
-    let peer = paired(&["sessions.list"], Some(true)).await;
+    let peer = paired(
+        &["sessions.list", "terminal.upload", "terminal.download"],
+        Some(true),
+    )
+    .await;
     let info = peer.peer_info().expect("握手后该有对端信息");
     assert!(
         info.capabilities.tools.is_some(),
@@ -578,8 +582,43 @@ async fn the_handshake_advertises_tools_and_the_server_identity() {
         "sessions.details",
         "all/scrollback",
         "不要自动重复执行",
+        "sh/bash/zsh 交互提示符",
+        "目标已有 /bin/sh 和 rz",
+        "固定 /bin/sh 子进程",
+        "无需手工切换 shell",
+        "下载需要目标已有 sz",
     ] {
         assert!(instructions.contains(expected), "缺少协议说明: {expected}");
+    }
+    let listed = peer
+        .list_all_tools()
+        .await
+        .expect("tools/list 应带当前 shell 前置");
+    for (name, required) in [
+        (
+            "terminal.upload",
+            vec![
+                "sh/bash/zsh 交互提示符",
+                "/bin/sh 和 rz",
+                "固定 /bin/sh 子进程",
+                "无需手工切换 shell",
+            ],
+        ),
+        (
+            "terminal.download",
+            vec!["sh/bash/zsh 交互提示符", "已安装 sz"],
+        ),
+    ] {
+        let tool = listed.iter().find(|tool| tool.name == name).unwrap();
+        let description = tool.description.as_deref().unwrap();
+        for expected in required {
+            assert!(description.contains(expected), "{name} 缺少 {expected}");
+        }
+        assert!(!description.contains("POSIX shell"));
+        assert_eq!(
+            tool.annotations.as_ref().unwrap().read_only_hint,
+            Some(false)
+        );
     }
 }
 

@@ -107,13 +107,13 @@ pub struct ManifestEntry {
 pub const MCP_MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
         name: "terminal.upload",
-        description: "通过当前交互终端的 ZMODEM 上传单个文件到 remote_dir 目录。先 terminal.read 核对目标与干净 POSIX shell，目标须已安装 rz/sz；不要猜主机、安装软件或用 SFTP/Base64 回退。相对本地源须在授权上传根内。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        description: "通过当前交互终端的 ZMODEM 上传单个文件到 remote_dir 目录。先 terminal.read 核对目标与干净的 sh/bash/zsh 交互提示符；目标须有 /bin/sh 和 rz，上传通过固定 /bin/sh 子进程切换目录后执行 rz，无需手工切换 shell；不要猜主机、安装软件或用 SFTP/Base64 回退。相对本地源须在授权上传根内。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"local_path":{"type":"string","description":"授权上传根内的相对文件路径"},"remote_dir":{"type":"string","description":"远端目标目录"}},"required":["session_id","local_path","remote_dir"],"additionalProperties":false}"#,
         gated: true, vault_class: false,
     },
     ManifestEntry {
         name: "terminal.download",
-        description: "通过当前交互终端的 ZMODEM 下载 remote_path 单个文件到固定下载沙箱。先 terminal.read 核对目标与干净 POSIX shell，目标须已安装 rz/sz；不要猜主机、安装软件或用 SFTP/Base64 回退。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
+        description: "通过当前交互终端的 ZMODEM 下载 remote_path 单个文件到固定下载沙箱。先 terminal.read 核对目标与干净的 sh/bash/zsh 交互提示符，目标须已安装 sz；不要猜主机、安装软件或用 SFTP/Base64 回退。返回 accepted 后用 transfer.status 查询；完成仅 protocol_confirmed，不验证主机、路径或 SHA。原 SFTP/exec 端点不随终端变化。",
         schema_json: r#"{"type":"object","properties":{"session_id":{"type":"string"},"remote_path":{"type":"string","description":"远端单个源文件路径"}},"required":["session_id","remote_path"],"additionalProperties":false}"#,
         gated: true, vault_class: false,
     },
