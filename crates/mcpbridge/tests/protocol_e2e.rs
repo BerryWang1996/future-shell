@@ -729,7 +729,7 @@ async fn session_guidance_is_discoverable_and_refusals_keep_generic_codes() {
     .await;
     assert!(missing_session.0);
     let err = missing_session.1.unwrap();
-    assert_eq!(err["code"], "FS_POLICY_FORBIDDEN");
+    assert_eq!(err["code"], "FS_MCP_TARGET_UNAVAILABLE");
     assert!(err["message"].as_str().unwrap().contains("profiles.list"));
     assert!(!err["message"].as_str().unwrap().contains("已断开"));
     let missing_managed = call(
