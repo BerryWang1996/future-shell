@@ -1754,7 +1754,7 @@ mod tests {
         r.conf = Conf::forbidden();
         r.dir.alive_until = 0; // 第一次问就说不在
         let out = r.run_cmd("rm -rf /").await;
-        assert_eq!(out.error_code(), Some("FS_POLICY_FORBIDDEN"));
+        assert_eq!(out.error_code(), Some("FS_MCP_TARGET_UNAVAILABLE"));
         r.calls.only(&[]);
         assert_eq!(r.calls.confirm.load(SeqCst), 0);
         assert!(r.audit.phases().is_empty());

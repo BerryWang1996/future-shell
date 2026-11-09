@@ -2869,6 +2869,15 @@ mod tests {
         }
         .to_hex();
         session.feed(&skip);
+        // A skip now closes with ZFIN/OO instead of cancelling the transport.
+        // Test cancellation after the failure has actually been queued.
+        session.feed(
+            &fs_terminal::zmodem::FrameHeader {
+                kind: fs_terminal::zmodem::FrameKind::ZFIN,
+                flags: [0; 4],
+            }
+            .to_hex(),
+        );
         let mut cur = Some(transfer(session));
         let waiting = AtomicBool::new(false);
         let cancelling = AtomicBool::new(false);

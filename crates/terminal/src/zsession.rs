@@ -536,7 +536,7 @@ impl ZmodemSession {
 
     /// 主动取消（用户点「取消」）。
     pub fn cancel(&mut self) -> Vec<Action> {
-        if self.cancel_sent {
+        if self.cancel_sent || (self.is_finished() && self.close_error.is_some()) {
             return Vec::new();
         }
         self.cancel_sent = true;
@@ -1603,6 +1603,21 @@ mod tests {
         assert!(!session.is_finished());
         assert!(matches!(&session.feed(&hdr(FrameKind::ZFIN, 0))[..],
             [Action::Send(bytes), Action::Done { ok: false, message }] if bytes == b"OO" && message.contains("跳过")));
+        assert!(
+            session.cancel().is_empty(),
+            "a settled skip must not send CAN into the restored shell"
+        );
+    }
+
+    #[test]
+    fn user_can_cancel_while_skip_close_still_waits_for_peer() {
+        let mut session = ZmodemSession::new_send("x", 1);
+        session.feed(&hdr(FrameKind::ZSKIP, 0));
+        let actions = session.cancel();
+        assert!(
+            matches!(&actions[..], [Action::Send(bytes), Action::Done { ok: false, .. }] if *bytes == cancel_sequence())
+        );
+        assert!(session.cancel().is_empty());
     }
 
     /// S336：ZFIN 之后同一读块里的 shell 字节要能交还终端。
