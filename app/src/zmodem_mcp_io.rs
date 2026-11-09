@@ -21,6 +21,7 @@ pub(crate) fn prepare_default_download_root(
     for component in ["downloads", profile_id] {
         directory.push(component);
         let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(false); // Each parent must be checked before creating its child.
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
